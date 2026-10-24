@@ -3833,8 +3833,9 @@ async fn test_unrepresentable_stream_execution_remains_pending_after_restart(
 #[rstest]
 #[tokio::test]
 async fn test_external_algo_status_requires_authoritative_child_executions(
-    #[values("held", "stream", "query")] recovery: &str,
+    #[values("held", "stream", "query", "malformed")] recovery: &str,
     #[values(false, true)] larger_earlier_history: bool,
+    #[values("", "ChildClient1")] child_client_order_id: &str,
 ) {
     use nautilus_common::messages::execution::{QueryOrder, TradingCommand};
 
@@ -3941,21 +3942,29 @@ async fn test_external_algo_status_requires_authoritative_child_executions(
             "-0.05",
             timestamp,
         );
-        child["data"][0]["clOrdId"] = json!("");
+        child["data"][0]["clOrdId"] = json!(child_client_order_id);
         child["data"][0]["algoClOrdId"] = json!(EXTERNAL_CID);
         child["data"][0]["ordId"] = json!(CHILD_VID);
 
         if recovery != "held" {
             *venue.report.lock().await = json!({"code":"0","msg":"","data":child["data"]});
             *venue.fills.lock().await = json!({"code":"0","msg":"","data":[{
-                "instType":"SPOT", "instId":"BTC-USD", "ordId":CHILD_VID, "clOrdId":"",
+                "instType":"SPOT", "instId":"BTC-USD", "ordId":CHILD_VID, "clOrdId":child_client_order_id,
                 "tradeId":"90001", "billId":"80001", "fillSz":"0.00100000", "fillPx":"50000.0",
                 "side":"buy", "posSide":"net", "execType":"T", "fee":"-0.05", "feeCcy":"USD",
                 "ts":(timestamp+5).to_string(), "fillTime":(timestamp+1).to_string()
             }]});
         }
 
-        if recovery == "query" {
+        if recovery == "malformed" {
+            let mut malformed = child.clone();
+            malformed["data"][0]["fillFee"] = json!("invalid");
+            venue.updates.send(malformed).unwrap();
+            sentinel(&venue, &cache, timestamp + 10).await;
+            assert!(external().unwrap().filled_qty().is_zero());
+        }
+
+        if matches!(recovery, "query" | "malformed" | "fills") {
             let order = external().unwrap();
             AsyncRunner::handle_exec_command(TradingCommand::QueryOrder(QueryOrder::new(
                 order.trader_id(),
@@ -3975,7 +3984,15 @@ async fn test_external_algo_status_requires_authoritative_child_executions(
 
         if recovery != "held" {
             wait_until(|| external().unwrap().status() == OrderStatus::Filled).await;
-            wait_until(|| *observed.borrow() >= if recovery == "query" { 4 } else { 5 }).await;
+            wait_until(|| {
+                *observed.borrow()
+                    >= if matches!(recovery, "query" | "malformed" | "fills") {
+                        4
+                    } else {
+                        5
+                    }
+            })
+            .await;
             assert_eq!(
                 external().unwrap().trade_ids(),
                 vec![&TradeId::from("90001")]
@@ -4070,6 +4087,7 @@ async fn test_external_algo_status_requires_authoritative_child_executions(
 async fn test_partial_rest_observations_survive_later_history_and_restart(
     #[case] first_result: &str,
     #[case] recover: bool,
+    #[values(false, true)] algo_child: bool,
 ) {
     let store = tempfile::TempDir::new().unwrap();
     let (addr, venue, server) = start_venue().await;
@@ -4114,7 +4132,7 @@ async fn test_partial_rest_observations_survive_later_history_and_restart(
             .send(wire_order("live", "0", "0", "", "0", "0", timestamp))
             .unwrap();
         wait_until(|| cached(&cache).status() == OrderStatus::Accepted).await;
-        let full = wire_order(
+        let mut full = wire_order(
             "filled",
             "0.00100000",
             "0.00060000",
@@ -4123,15 +4141,20 @@ async fn test_partial_rest_observations_survive_later_history_and_restart(
             "-0.03",
             timestamp + 20,
         );
+
+        if algo_child {
+            full["data"][0]["clOrdId"] = json!("ChildClient1");
+            full["data"][0]["algoClOrdId"] = json!(CID);
+        }
         *venue.report.lock().await = json!({"code":"0", "msg":"", "data":full["data"]});
         let first = json!({
-            "instType":"SPOT", "instId":"BTC-USD", "ordId":VID, "clOrdId":CID,
+            "instType":"SPOT", "instId":"BTC-USD", "ordId":VID, "clOrdId":if algo_child { "ChildClient1" } else { CID },
             "tradeId":"90001", "billId":"80001", "fillSz":"0.00040000", "fillPx":"50000.0",
             "side":"buy", "posSide":"net", "execType":"T", "fee":"-0.02", "feeCcy":"USD",
             "ts":(timestamp+5).to_string(), "fillTime":(timestamp+1).to_string()
         });
         let second = json!({
-            "instType":"SPOT", "instId":"BTC-USD", "ordId":VID, "clOrdId":CID,
+            "instType":"SPOT", "instId":"BTC-USD", "ordId":VID, "clOrdId":if algo_child { "ChildClient1" } else { CID },
             "tradeId":"90002", "billId":"80002", "fillSz": if recover { "0.00060000" } else { "0.00100000" }, "fillPx":"50000.0",
             "side":"buy", "posSide":"net", "execType":"T", "fee": if recover { "-0.03" } else { "-0.05" }, "feeCcy":"USD",
             "ts":(timestamp+25).to_string(), "fillTime":(timestamp+21).to_string()
@@ -5079,10 +5102,11 @@ async fn test_startup_timeout_retains_observed_fill_evidence_in_sealed_run(
 #[case::fee_conflict("fee")]
 #[case::price_conflict("fillPx")]
 #[case::missing_trade("tradeId")]
+#[case::client_conflict("clOrdId")]
 #[tokio::test]
 async fn test_tracked_stream_companion_constrains_later_query(
     #[case] conflict: &str,
-    #[values(false, true)] algo_child: bool,
+    #[values(None, Some(""), Some("ChildClient1"))] algo_child: Option<&str>,
     #[values(false, true)] stream_first: bool,
 ) {
     let store = tempfile::TempDir::new().unwrap();
@@ -5104,7 +5128,10 @@ async fn test_tracked_stream_companion_constrains_later_query(
     let observed = Rc::new(RefCell::new(0));
     let count = observed.clone();
     let handler = ShareableMessageHandler::from_typed(move |report: &ExecutionReport| {
-        if matches!(report, ExecutionReport::OrderQueryWithFills(..)) {
+        if matches!(
+            report,
+            ExecutionReport::OrderQueryWithFills(..) | ExecutionReport::OrderFillConflict(..)
+        ) {
             *count.borrow_mut() += 1;
         }
     });
@@ -5142,9 +5169,9 @@ async fn test_tracked_stream_companion_constrains_later_query(
             final_frame.clone()
         };
 
-        if algo_child {
+        if let Some(child_client_id) = algo_child {
             for value in [&mut frame, &mut final_frame] {
-                value["data"][0]["clOrdId"] = json!("");
+                value["data"][0]["clOrdId"] = json!(child_client_id);
                 value["data"][0]["algoClOrdId"] = json!(CID);
             }
         }
@@ -5162,7 +5189,7 @@ async fn test_tracked_stream_companion_constrains_later_query(
         assert_eq!(cached(&cache).trade_ids().len(), usize::from(stream_first));
         let before = snapshot(&cache);
         *venue.report.lock().await = json!({"code":"0", "msg":"", "data":final_frame["data"]});
-        let mut first = json!({"instType":"SPOT", "instId":"BTC-USD", "ordId":VID, "clOrdId":if algo_child { "" } else { CID },
+        let mut first = json!({"instType":"SPOT", "instId":"BTC-USD", "ordId":VID, "clOrdId":algo_child.unwrap_or(CID),
             "tradeId":"90001", "billId":"80001", "fillSz":"0.00040000", "fillPx":"50000.0",
             "side":"buy", "posSide":"net", "execType":"T", "fee":"-0.02", "feeCcy":"USD",
             "ts":(timestamp+1).to_string(), "fillTime":(timestamp+1).to_string()});
@@ -5188,6 +5215,7 @@ async fn test_tracked_stream_companion_constrains_later_query(
                 "fee" => "-0.04",
                 "fillPx" => "50001.0",
                 "tradeId" => "90003",
+                "clOrdId" => "UnrelatedClient1",
                 _ => unreachable!(),
             });
         }
@@ -5253,9 +5281,11 @@ async fn test_tracked_stream_companion_constrains_later_query(
     } else {
         let error = restored.unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("Unresolved persisted incomplete fill recovery"),
+            error.to_string().contains(if conflict == "clOrdId" {
+                "Unresolved persisted order fill conflict"
+            } else {
+                "Unresolved persisted incomplete fill recovery"
+            }),
             "{error:#}"
         );
     }
@@ -5267,7 +5297,16 @@ async fn test_tracked_stream_companion_constrains_later_query(
 #[tokio::test]
 async fn test_cold_order_only_tied_closing_fills_and_restart(
     #[values(false, true)] reverse: bool,
-    #[values("complete", "missing-fill", "fee", "cross-order-tie", "retained-close")] case: &str,
+    #[values(
+        "complete",
+        "child",
+        "child-id",
+        "missing-fill",
+        "fee",
+        "cross-order-tie",
+        "retained-close"
+    )]
+    case: &str,
 ) {
     use nautilus_model::{accounts::Account, types::Currency};
     use rust_decimal::Decimal;
@@ -5449,6 +5488,12 @@ async fn test_cold_order_only_tied_closing_fills_and_restart(
             frame["data"][0][key] = json!(value);
         }
 
+        if case.starts_with("child") && *cid == CID {
+            frame["data"][0]["clOrdId"] = json!("ChildClient1");
+            frame["data"][0]["algoClOrdId"] = json!(CID);
+            frame["data"][0]["algoId"] = json!("AlgoParent1");
+        }
+
         if case == "fee" && *cid == "QueryFills4" {
             frame["data"][0]["fee"] = json!("-0.004");
         }
@@ -5463,6 +5508,14 @@ async fn test_cold_order_only_tied_closing_fills_and_restart(
                 "side":side, "posSide":"net", "execType":"T", "fee":format!("-{fee}"), "feeCcy":"USD",
                 "ts":(timestamp+offset+10).to_string(), "fillTime":(timestamp+offset).to_string()})
         }).collect();
+
+        if case.starts_with("child") && *cid == CID {
+            fills[0]["clOrdId"] = json!(if case == "child-id" {
+                "UnrelatedClient1"
+            } else {
+                "ChildClient1"
+            });
+        }
 
         if case == "missing-fill" && *cid == "QueryFills4" {
             fills.pop();
@@ -5488,12 +5541,14 @@ async fn test_cold_order_only_tied_closing_fills_and_restart(
     venue.bulk.store(true, std::sync::atomic::Ordering::Relaxed);
 
     let result = tokio::time::timeout(DEADLINE, node.start()).await.unwrap();
-    if case != "complete" {
+    if !matches!(case, "complete" | "child") {
         let error = result.unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("Startup order fill recovery incomplete"),
+            error.to_string().contains(if case == "child-id" {
+                "Order fill recovery incomplete at shutdown"
+            } else {
+                "Startup order fill recovery incomplete"
+            }),
             "{error:#}"
         );
         assert!(venue.submissions.lock().await.is_empty());

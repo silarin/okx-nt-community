@@ -6005,7 +6005,81 @@ async fn test_generate_mass_status_fails_on_malformed_fill_quantity() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_mass_status_recovers_historical_triggered_child_status() {
+async fn test_generate_fill_reports_resolves_triggered_child_identity(
+    #[values(false, true)] worker: bool,
+    #[values("valid", "missing", "wrong_instrument", "wrong_order", "duplicate")] detail: &str,
+) {
+    let detail_queries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let addr = start_mass_status_triggered_child_server(
+        Arc::clone(&detail_queries),
+        "effective",
+        (detail != "missing").then_some("filled"),
+        "1",
+        "OMASSTRIGGERED1",
+        "OCHILDGENERATED1",
+        if detail == "wrong_instrument" {
+            "BTC-USDT-SWAP"
+        } else {
+            "ETH-USDT-SWAP"
+        },
+        (detail == "wrong_order").then_some("other-venue-order"),
+        if detail == "duplicate" { 2 } else { 1 },
+        false,
+        &["mass-triggered-child-venue-id"],
+        None,
+    )
+    .await;
+    let base_url = format!("http://{addr}");
+    let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
+        config.instrument_types = vec![OKXInstrumentType::Swap];
+    });
+    client.on_instrument(query_order_instrument());
+    let cmd = GenerateFillReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let result = if worker {
+        let task = client.generate_fill_reports_task(&cmd).unwrap();
+        nautilus_common::live::get_runtime()
+            .spawn(task.collection)
+            .await
+            .unwrap();
+        (task.finish)()
+    } else {
+        client.generate_fill_reports(cmd).await
+    };
+    assert_eq!(detail_queries.lock().await.len(), 1);
+
+    if detail != "valid" {
+        assert!(result.is_err());
+        return;
+    }
+    let reports = result.unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        reports[0].client_order_id,
+        Some(ClientOrderId::from("OMASSTRIGGERED1"))
+    );
+    assert_eq!(
+        reports[0].venue_order_id,
+        VenueOrderId::from("mass-triggered-child-venue-id")
+    );
+    assert_eq!(reports[0].last_qty, Quantity::from("1"));
+    assert_eq!(reports[0].last_px, Price::from("850.00"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_recovers_historical_triggered_child_status(
+    #[values("", "OCHILDGENERATED1")] child_client_order_id: &'static str,
+    #[values(false, true)] conflicting_parent: bool,
+) {
     let detail_queries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let addr = start_mass_status_triggered_child_server(
         Arc::clone(&detail_queries),
@@ -6013,12 +6087,13 @@ async fn test_generate_mass_status_recovers_historical_triggered_child_status() 
         Some("filled"),
         "1",
         "OMASSTRIGGERED1",
-        "",
+        child_client_order_id,
         "ETH-USDT-SWAP",
         None,
         1,
         false,
         &["mass-triggered-child-venue-id"],
+        conflicting_parent.then_some("UnrelatedParent1"),
     )
     .await;
     let base_url = format!("http://{addr}");
@@ -6029,6 +6104,13 @@ async fn test_generate_mass_status_recovers_historical_triggered_child_status() 
 
     let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
     let reports = mass_status.order_reports();
+    if conflicting_parent {
+        assert!(!mass_status.reports_complete());
+        assert!(reports.is_empty());
+        assert!(mass_status.fill_reports().is_empty());
+        assert_eq!(detail_queries.lock().await.len(), 1);
+        return;
+    }
     let report = reports
         .get(&VenueOrderId::from("mass-triggered-child-venue-id"))
         .expect("expected recovered triggered child report");
@@ -6054,6 +6136,13 @@ async fn test_generate_mass_status_recovers_historical_triggered_child_status() 
     assert_eq!(
         report.client_order_id,
         Some(ClientOrderId::from("OMASSTRIGGERED1"))
+    );
+    let fills = mass_status.fill_reports();
+    let fills = fills.get(&report.venue_order_id).unwrap();
+    assert_eq!(fills.len(), 1);
+    assert_eq!(
+        fills[0].client_order_id,
+        (!child_client_order_id.is_empty()).then(|| ClientOrderId::from("OMASSTRIGGERED1"))
     );
     assert_eq!(report.order_status, OrderStatus::Filled);
     assert_eq!(report.quantity, Quantity::from("1"));
@@ -6093,6 +6182,7 @@ async fn test_generate_mass_status_preserves_triggered_child_status(
         1,
         false,
         &["mass-triggered-child-venue-id"],
+        None,
     )
     .await;
     let base_url = format!("http://{addr}");
@@ -6131,6 +6221,7 @@ async fn test_generate_mass_status_uses_live_child_quantity_for_close_fraction_p
         1,
         false,
         &["mass-triggered-child-venue-id"],
+        None,
     )
     .await;
     let base_url = format!("http://{addr}");
@@ -6312,6 +6403,7 @@ async fn test_generate_mass_status_preserves_external_triggered_child_identity()
         1,
         false,
         &["mass-triggered-child-venue-id"],
+        None,
     )
     .await;
     let base_url = format!("http://{addr}");
@@ -6418,6 +6510,7 @@ async fn test_generate_mass_status_omits_unresolved_triggered_child(
         detail_record_count,
         false,
         child_order_ids,
+        None,
     )
     .await;
     let base_url = format!("http://{addr}");
@@ -6450,6 +6543,7 @@ async fn test_generate_mass_status_preserves_rejected_algo_parent() {
         1,
         false,
         &["mass-triggered-child-venue-id"],
+        None,
     )
     .await;
     let base_url = format!("http://{addr}");
@@ -6487,6 +6581,7 @@ async fn test_generate_mass_status_preserves_regular_child_for_ambiguous_algo_pa
         1,
         true,
         &["mass-triggered-child-venue-id", "other-child-venue-id"],
+        None,
     )
     .await;
     let base_url = format!("http://{addr}");
@@ -6525,6 +6620,7 @@ async fn test_generate_mass_status_preserves_external_regular_child_when_detail_
         1,
         true,
         &["mass-triggered-child-venue-id"],
+        None,
     )
     .await;
     let base_url = format!("http://{addr}");
@@ -6563,6 +6659,7 @@ async fn test_generate_mass_status_recovers_sole_listed_child_order_id() {
         1,
         false,
         &["mass-triggered-child-venue-id"],
+        None,
     )
     .await;
     let base_url = format!("http://{addr}");
@@ -6622,6 +6719,7 @@ async fn start_mass_status_triggered_child_server(
     detail_record_count: usize,
     bulk_regular_child: bool,
     child_order_ids: &'static [&'static str],
+    child_parent_client_order_id: Option<&'static str>,
 ) -> SocketAddr {
     let algo_history = get(
         move |Query(params): Query<HashMap<String, String>>| async move {
@@ -6690,7 +6788,8 @@ async fn start_mass_status_triggered_child_server(
             let mut response = regular_order_detail_response(&params);
             let order = &mut response["data"][0];
             order["accFillSz"] = json!(filled_qty);
-            order["algoClOrdId"] = json!("");
+            order["algoClOrdId"] =
+                json!(child_parent_client_order_id.unwrap_or(parent_client_order_id));
             order["avgPx"] = json!(if filled_qty == "0" { "" } else { "850.00" });
             order["clOrdId"] = json!(child_client_order_id);
             order["fillPx"] = json!(if filled_qty == "0" { "" } else { "850.00" });
@@ -6751,12 +6850,12 @@ async fn start_mass_status_triggered_child_server(
     });
     let fills = get(
         move |Query(params): Query<HashMap<String, String>>| async move {
-            if filled_qty == "0" || !params.contains_key("ordId") {
+            if filled_qty == "0" {
                 return Json(json!({"code":"0", "msg":"", "data":[]}));
             }
             Json(json!({"code":"0", "msg":"", "data":[{
-                "instType":"SWAP", "instId":response_instrument_id,
-                "ordId":params["ordId"], "clOrdId":"", "tradeId":"90001", "billId":"80001",
+                "instType":"SWAP", "instId":"ETH-USDT-SWAP",
+                "ordId":params.get("ordId").map_or("mass-triggered-child-venue-id", String::as_str), "clOrdId":if parent_client_order_id.is_empty() { "" } else { child_client_order_id }, "tradeId":"90001", "billId":"80001",
                 "fillSz":filled_qty, "fillPx":"850.00", "side":"buy", "posSide":"net", "execType":"T",
                 "fee":"-0.01", "feeCcy":"USDT", "ts":"1000", "fillTime":"1000"
             }]}))

@@ -2603,7 +2603,13 @@ fn dispatch_unparsed_order_fill(
         account_id: emitter.account_id(),
         instrument_id: instrument.id(),
         venue_order_id: VenueOrderId::new(msg.ord_id),
-        client_order_id: client_order_id.or_else(|| parse_client_order_id(msg.cl_ord_id.as_str())),
+        client_order_id: client_order_id
+            .or_else(|| {
+                msg.algo_cl_ord_id
+                    .as_deref()
+                    .and_then(parse_client_order_id)
+            })
+            .or_else(|| parse_client_order_id(msg.cl_ord_id.as_str())),
         trade_id: parse_order_trade_id(&msg.trade_id),
         trade_id_placeholder: is_order_trade_id_placeholder(&msg.trade_id, msg.category),
         order_side: msg.side.into(),

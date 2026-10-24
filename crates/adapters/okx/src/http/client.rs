@@ -639,7 +639,44 @@ pub(crate) struct ReportSweep<T> {
     pub complete: bool,
 }
 
-type FillObserver<'a> = dyn Fn(&FillReport) -> anyhow::Result<()> + Sync + 'a;
+type FillObserver<'a> = dyn Fn(&mut FillReport) -> anyhow::Result<()> + Sync + 'a;
+
+/// Retains the wire client identity alongside the canonical native order identity.
+#[derive(Clone, Debug)]
+pub(crate) struct OrderQueryReport {
+    pub report: OrderStatusReport,
+    pub instrument_type: OKXInstrumentType,
+    pub venue_client_order_id: Option<ClientOrderId>,
+    pub algo_client_order_id: Option<ClientOrderId>,
+}
+
+impl OrderQueryReport {
+    pub(crate) fn normalize_fill(&self, fill: &mut FillReport) -> anyhow::Result<()> {
+        let report = &self.report;
+        anyhow::ensure!(
+            fill.account_id == report.account_id
+                && fill.instrument_id == report.instrument_id
+                && fill.venue_order_id == report.venue_order_id
+                && fill.venue_position_id == report.venue_position_id
+                && report
+                    .order_side
+                    .is_some_and(|side| side == fill.order_side)
+                && fill
+                    .client_order_id
+                    .is_none_or(|id| Some(id) == self.venue_client_order_id
+                        && report.client_order_id.is_some())
+                && fill.last_qty.is_positive()
+                && fill.last_px.is_positive(),
+            ConflictingFillEvidence("Order query fill identity is mismatched or duplicated")
+        );
+        // Only the same authenticated order detail can relate a supplied child
+        // client ID to the algo client ID used by native orders and stream fills.
+        if fill.client_order_id.is_some() {
+            fill.client_order_id = report.client_order_id;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum FillHistory {
@@ -4605,7 +4642,7 @@ impl OKXHttpClient {
             None,
         )
         .await
-        .map(|result| result.map(|(report, _)| report))
+        .map(|result| result.map(|query| query.report))
     }
 
     pub(crate) async fn request_order_status_report_with_type(
@@ -4615,7 +4652,7 @@ impl OKXHttpClient {
         client_order_id: Option<ClientOrderId>,
         venue_order_id: Option<VenueOrderId>,
         observe_order: Option<&(dyn Fn(&ExecutionReport) + Sync)>,
-    ) -> anyhow::Result<Option<(OrderStatusReport, OKXInstrumentType)>> {
+    ) -> anyhow::Result<Option<OrderQueryReport>> {
         let instrument = self.instrument_from_cache(instrument_id.symbol.inner())?;
         let mut params_builder = GetOrderParamsBuilder::default();
         params_builder.inst_id(instrument_id.symbol.inner().to_string());
@@ -4713,7 +4750,16 @@ impl OKXHttpClient {
             report.cancel_reason = Some(reason);
         }
 
-        Ok(Some((report, order.inst_type)))
+        Ok(Some(OrderQueryReport {
+            report,
+            instrument_type: order.inst_type,
+            venue_client_order_id: (!order.cl_ord_id.is_empty())
+                .then(|| ClientOrderId::from(order.cl_ord_id.as_str())),
+            algo_client_order_id: order
+                .algo_cl_ord_id
+                .filter(|id| !id.is_empty())
+                .map(|id| ClientOrderId::from(id.as_str())),
+        }))
     }
 
     /// Requests spread order status reports for the given parameters.
@@ -5091,76 +5137,6 @@ impl OKXHttpClient {
         Ok(PageSweep::from_pages(all, exhausted))
     }
 
-    // Paginates through transaction details (fills) using `bill_id` as the cursor
-    async fn paginate_fills(
-        &self,
-        base: &GetTransactionDetailsParams,
-        limit: Option<u32>,
-        history: FillHistory,
-        mut observe_page: impl FnMut(&[OKXTransactionDetail]) -> anyhow::Result<()> + Send,
-    ) -> anyhow::Result<PageSweep<OKXTransactionDetail>> {
-        let mut all = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut exhausted = true;
-
-        for _ in 0..MAX_RECONCILIATION_PAGES {
-            let mut params = base.clone();
-            params.after = cursor.take();
-
-            let page = match history {
-                FillHistory::Recent => self.inner.get_fills(params).await,
-                FillHistory::Extended => self.inner.get_fills_history(params).await,
-            };
-            let page = match page {
-                Ok(page) => page,
-                Err(e) if base.ord_id.is_some() && !all.is_empty() => {
-                    // Order recovery must retain earlier pages as observations even
-                    // when a later request fails. They never prove a complete sweep.
-                    log::warn!("Order fill pagination failed after partial history: {e}");
-                    return Ok(PageSweep {
-                        items: all,
-                        complete: false,
-                    });
-                }
-                Err(e) => return Err(e.into()),
-            };
-
-            let take = limit.map_or(page.len(), |limit| {
-                (limit as usize).saturating_sub(all.len()).min(page.len())
-            });
-            observe_page(&page[..take])?;
-            let page_len = page.len();
-            cursor = page.last().map(|o| o.bill_id.to_string());
-            all.extend(page);
-
-            if page_len < OKX_PAGE_SIZE {
-                exhausted = false;
-                break;
-            }
-
-            if let Some(lim) = limit
-                && all.len() >= lim as usize
-            {
-                exhausted = false;
-                break;
-            }
-        }
-
-        if exhausted && !all.is_empty() {
-            log::warn!(
-                "Fill pagination hit {MAX_RECONCILIATION_PAGES} page cap, \
-                 results may be truncated ({} records)",
-                all.len()
-            );
-        }
-
-        if let Some(lim) = limit {
-            all.truncate(lim as usize);
-        }
-
-        Ok(PageSweep::from_pages(all, exhausted))
-    }
-
     // Paginates through pending algo orders using `algo_id` as the cursor
     async fn paginate_algo_pending(
         &self,
@@ -5303,6 +5279,7 @@ impl OKXHttpClient {
                 FillHistory::Recent,
                 None,
                 None,
+                None,
             )
             .await?
             .reports)
@@ -5321,6 +5298,7 @@ impl OKXHttpClient {
         history: FillHistory,
         scope: Option<ReportInstrumentScope<'_>>,
         observe_fill: Option<&FillObserver<'_>>,
+        mut order_queries: Option<&mut AHashMap<VenueOrderId, OrderQueryReport>>,
     ) -> anyhow::Result<ReportSweep<FillReport>> {
         if instrument_id.as_ref().is_some_and(|id| self.is_spread(*id))
             || (instrument_id.is_none() && instrument_type.is_none())
@@ -5384,8 +5362,35 @@ impl OKXHttpClient {
 
         let ts_init = self.generate_ts_init();
         let mut reports = Vec::new();
-        let mut observe_page = |details: &[OKXTransactionDetail]| -> anyhow::Result<()> {
-            for detail in details {
+        let mut cursor = None;
+        let mut seen = 0;
+        let mut exhausted = true;
+
+        for _ in 0..MAX_RECONCILIATION_PAGES {
+            let mut page_params = params.clone();
+            page_params.after = cursor.take();
+            let page = match history {
+                FillHistory::Recent => self.inner.get_fills(page_params).await,
+                FillHistory::Extended => self.inner.get_fills_history(page_params).await,
+            };
+            let page = match page {
+                Ok(page) => page,
+                Err(e) if venue_order_id.is_some() && seen > 0 => {
+                    // Earlier normalized facts are already retained, but a failed
+                    // later page must never certify complete order history.
+                    log::warn!("Order fill pagination failed after partial history: {e}");
+                    return Ok(ReportSweep {
+                        reports,
+                        complete: false,
+                    });
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let take = limit.map_or(page.len(), |limit| {
+                (limit as usize).saturating_sub(seen).min(page.len())
+            });
+
+            for detail in &page[..take] {
                 if let Some(venue_order_id) = venue_order_id {
                     anyhow::ensure!(
                         detail.ord_id.as_str() == venue_order_id.as_str()
@@ -5434,7 +5439,7 @@ impl OKXHttpClient {
                     }
                 };
 
-                let report = parse_fill_report(
+                let mut report = parse_fill_report(
                     detail,
                     account_id,
                     inst.id(),
@@ -5450,17 +5455,59 @@ impl OKXHttpClient {
                     }
                 })?;
 
+                if let Some(queries) = order_queries.as_deref_mut() {
+                    if report.client_order_id.is_some()
+                        && !queries.contains_key(&report.venue_order_id)
+                    {
+                        let query = self
+                            .request_order_status_report_with_type(
+                                account_id,
+                                report.instrument_id,
+                                None,
+                                Some(report.venue_order_id),
+                                None,
+                            )
+                            .await?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Fill identity requires authenticated order detail for {}",
+                                    report.venue_order_id,
+                                )
+                            })?;
+                        queries.insert(report.venue_order_id, query);
+                    }
+
+                    if let Some(query) = queries.get(&report.venue_order_id) {
+                        anyhow::ensure!(
+                            query.instrument_type == detail.inst_type,
+                            ConflictingFillEvidence(
+                                "Fill instrument type disagrees with order detail"
+                            )
+                        );
+                        query.normalize_fill(&mut report)?;
+                    }
+                }
+
                 if let Some(observe) = observe_fill {
-                    observe(&report)?;
+                    observe(&mut report)?;
                 }
                 reports.push(report);
             }
-            Ok(())
-        };
-        let sweep = self
-            .paginate_fills(&params, limit, history, &mut observe_page)
-            .await?;
-        complete &= sweep.complete;
+            seen += page.len();
+            cursor = page.last().map(|fill| fill.bill_id.to_string());
+
+            if page.len() < OKX_PAGE_SIZE || limit.is_some_and(|limit| seen >= limit as usize) {
+                exhausted = false;
+                break;
+            }
+        }
+
+        if exhausted && seen > 0 {
+            log::warn!(
+                "Fill pagination hit {MAX_RECONCILIATION_PAGES} page cap, results may be truncated ({seen} records)"
+            );
+            complete = false;
+        }
         Ok(ReportSweep { reports, complete })
     }
 
