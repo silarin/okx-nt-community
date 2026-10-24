@@ -171,12 +171,15 @@ struct Venue {
     submissions: tokio::sync::Mutex<Vec<Value>>,
     omit_submission_ack: std::sync::atomic::AtomicBool,
     queries: tokio::sync::Mutex<Vec<HashMap<String, String>>>,
+    instruments: tokio::sync::Mutex<Value>,
     balance: tokio::sync::Mutex<Value>,
     report: tokio::sync::Mutex<Value>,
+    order_details: tokio::sync::Mutex<HashMap<String, Value>>,
     fills: tokio::sync::Mutex<Value>,
     historical_fills: tokio::sync::Mutex<Value>,
     next_fill_page: tokio::sync::Mutex<Option<Value>>,
     scoped_fills: tokio::sync::Mutex<Option<Value>>,
+    order_fills: tokio::sync::Mutex<HashMap<String, Value>>,
     stalled_request: tokio::sync::Mutex<Option<String>>,
     order_response_gate: tokio::sync::Notify,
     fill_queries: tokio::sync::Mutex<Vec<HashMap<String, String>>>,
@@ -289,12 +292,15 @@ async fn start_venue() -> (SocketAddr, Arc<Venue>, tokio::task::JoinHandle<()>) 
         submissions: Default::default(),
         omit_submission_ack: Default::default(),
         queries: Default::default(),
+        instruments: tokio::sync::Mutex::new(instruments()),
         balance: tokio::sync::Mutex::new(balance()),
         report: tokio::sync::Mutex::new(json!({"code":"0","msg":"","data":[]})),
+        order_details: Default::default(),
         fills: tokio::sync::Mutex::new(json!({"code":"0","msg":"","data":[]})),
         historical_fills: tokio::sync::Mutex::new(json!({"code":"0","msg":"","data":[]})),
         next_fill_page: Default::default(),
         scoped_fills: Default::default(),
+        order_fills: Default::default(),
         stalled_request: Default::default(),
         order_response_gate: Default::default(),
         fill_queries: Default::default(),
@@ -305,11 +311,11 @@ async fn start_venue() -> (SocketAddr, Arc<Venue>, tokio::task::JoinHandle<()>) 
         .route("/ws/business", get(websocket))
         .route(
             "/api/v5/public/instruments",
-            get(|| async { Json(instruments()) }),
+            get(|State(s): State<Arc<Venue>>| async move { Json(s.instruments.lock().await.clone()) }),
         )
         .route(
             "/api/v5/account/instruments",
-            get(|| async { Json(instruments()) }),
+            get(|State(s): State<Arc<Venue>>| async move { Json(s.instruments.lock().await.clone()) }),
         )
         .route(
             "/api/v5/account/balance",
@@ -319,7 +325,15 @@ async fn start_venue() -> (SocketAddr, Arc<Venue>, tokio::task::JoinHandle<()>) 
             "/api/v5/trade/order",
             get(
                 |State(s): State<Arc<Venue>>, Query(q): Query<HashMap<String, String>>| async move {
-                    let response = s.report.lock().await.clone();
+                    let response = if let Some(id) = q.get("ordId") {
+                        s.order_details.lock().await.get(id).cloned()
+                    } else {
+                        None
+                    };
+                    let response = match response {
+                        Some(response) => response,
+                        None => s.report.lock().await.clone(),
+                    };
                     let stalled = s.stalled_request.lock().await.as_deref() == Some("order_status");
                     s.queries.lock().await.push(q);
                     if stalled {
@@ -344,8 +358,12 @@ async fn start_venue() -> (SocketAddr, Arc<Venue>, tokio::task::JoinHandle<()>) 
                 {
                     std::future::pending::<()>().await;
                 }
-                let mut response = if q.contains_key("ordId") {
-                    s.scoped_fills.lock().await.clone()
+                let mut response = if let Some(order_id) = q.get("ordId") {
+                    s.order_fills.lock().await.get(order_id).cloned().or(s
+                        .scoped_fills
+                        .lock()
+                        .await
+                        .clone())
                 } else {
                     None
                 }
@@ -5241,6 +5259,378 @@ async fn test_tracked_stream_companion_constrains_later_query(
             "{error:#}"
         );
     }
+    server.abort();
+}
+
+#[cfg(feature = "high-precision")]
+#[rstest]
+#[tokio::test]
+async fn test_cold_order_only_tied_closing_fills_and_restart(
+    #[values(false, true)] reverse: bool,
+    #[values("complete", "missing-fill", "fee", "cross-order-tie", "retained-close")] case: &str,
+) {
+    use nautilus_model::{accounts::Account, types::Currency};
+    use rust_decimal::Decimal;
+
+    let store = tempfile::TempDir::new().unwrap();
+    let (addr, venue, server) = start_venue().await;
+    let mut instrument_response = instruments();
+    instrument_response["data"][0]["tickSz"] = json!("0.01");
+    *venue.instruments.lock().await = instrument_response.clone();
+    let mut node = build_node_with_store(
+        addr,
+        Rc::new(RefCell::new(Vec::new())),
+        QuerySource::Direct,
+        Some(EventStoreConfig {
+            base_dir: store.path().to_path_buf(),
+            retention: RetentionMode::Full,
+            ..Default::default()
+        }),
+        None,
+    );
+    let instruments: OKXResponse<OKXInstrument> =
+        serde_json::from_value(instrument_response).unwrap();
+    node.kernel()
+        .cache
+        .borrow_mut()
+        .add_instrument(
+            parse_instrument_any(&instruments.data[0], None, None, Default::default())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    let response: OKXResponse<OKXAccount> = serde_json::from_value(balance()).unwrap();
+    let account = parse_account_state(
+        &response.data[0],
+        AccountId::from("OKX-001"),
+        AccountType::Cash,
+        UnixNanos::default(),
+    )
+    .unwrap();
+    node.kernel()
+        .cache
+        .borrow_mut()
+        .add_account(AccountAny::Cash(CashAccount::new(account, false, false)))
+        .unwrap();
+    let instance = node.kernel().instance_id.to_string();
+    let cache = node.kernel().cache.clone();
+    let wallet = cache
+        .borrow()
+        .account(&AccountId::from("OKX-001"))
+        .unwrap()
+        .balance_total(Some(Currency::USD()))
+        .unwrap();
+    let timestamp = node.kernel().clock.borrow().timestamp_ns().as_u64() / 1_000_000 - 2000;
+    // Two cash cycles, with the final closing order split at one execution timestamp.
+    let mut executions = [
+        (
+            CID,
+            VID,
+            "90001",
+            "buy",
+            "0.002514",
+            "2386.62",
+            "0.01199992536",
+            0,
+        ),
+        (
+            "QueryFills2",
+            "2497956918703120387",
+            "90002",
+            "sell",
+            "0.002514",
+            "2384.70",
+            "0.0119902716",
+            400,
+        ),
+        (
+            "QueryFills3",
+            "2497956918703120388",
+            "90003",
+            "buy",
+            "0.000838",
+            "2387.59",
+            "0.00400160084",
+            793,
+        ),
+        (
+            "QueryFills4",
+            "2497956918703120389",
+            "90004",
+            "sell",
+            "0.000449",
+            "2384.70",
+            "0.0021414606",
+            1191,
+        ),
+        (
+            "QueryFills4",
+            "2497956918703120389",
+            "90005",
+            "sell",
+            "0.000389",
+            "2384.53",
+            "0.00185516434",
+            1191,
+        ),
+    ];
+
+    if case == "cross-order-tie" {
+        executions[2].7 = executions[3].7;
+    }
+
+    if case == "retained-close" {
+        let mut closing = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(TraderId::from("TESTER-001"))
+            .strategy_id(StrategyId::external())
+            .client_order_id(ClientOrderId::from("QueryFills4"))
+            .instrument_id(InstrumentId::from(INSTRUMENT))
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("0.000838"))
+            .build();
+        closing
+            .apply(TestOrderEventStubs::submitted(
+                &closing,
+                AccountId::from("OKX-001"),
+            ))
+            .unwrap();
+        closing
+            .apply(TestOrderEventStubs::accepted(
+                &closing,
+                AccountId::from("OKX-001"),
+                VenueOrderId::from("2497956918703120389"),
+            ))
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_order(closing, None, Some(ClientId::from("OKX")), true)
+            .unwrap();
+    }
+    let mut reports = Vec::new();
+    let mut all_fills = Vec::new();
+
+    for group in [
+        &executions[..1],
+        &executions[1..2],
+        &executions[2..3],
+        &executions[3..],
+    ] {
+        let (cid, vid, trade, side, qty, price, fee, offset) = group.last().unwrap();
+        let total: Decimal = group.iter().map(|f| f.4.parse::<Decimal>().unwrap()).sum();
+        let commission: Decimal = group.iter().map(|f| f.6.parse::<Decimal>().unwrap()).sum();
+        let notional: Decimal = group
+            .iter()
+            .map(|f| f.4.parse::<Decimal>().unwrap() * f.5.parse::<Decimal>().unwrap())
+            .sum();
+        let total = total.to_string();
+        let mut frame = wire_order(
+            "filled",
+            &total,
+            qty,
+            trade,
+            &(-commission).to_string(),
+            &format!("-{fee}"),
+            timestamp + offset - 1,
+        );
+
+        for (key, value) in [
+            ("clOrdId", cid.to_string()),
+            ("ordId", vid.to_string()),
+            ("side", side.to_string()),
+            ("sz", total.clone()),
+            ("px", price.to_string()),
+            ("fillPx", price.to_string()),
+            (
+                "avgPx",
+                (notional / total.parse::<Decimal>().unwrap()).to_string(),
+            ),
+            ("ordType", "ioc".to_string()),
+        ] {
+            frame["data"][0][key] = json!(value);
+        }
+
+        if case == "fee" && *cid == "QueryFills4" {
+            frame["data"][0]["fee"] = json!("-0.004");
+        }
+        venue.order_details.lock().await.insert(
+            vid.to_string(),
+            json!({"code":"0", "msg":"", "data":frame["data"]}),
+        );
+        reports.push(frame["data"][0].clone());
+        let mut fills: Vec<_> = group.iter().map(|(cid, vid, trade, side, qty, px, fee, offset)| {
+            json!({"instType":"SPOT", "instId":"BTC-USD", "ordId":vid, "clOrdId":cid,
+                "tradeId":trade, "billId":trade, "fillSz":qty, "fillPx":px,
+                "side":side, "posSide":"net", "execType":"T", "fee":format!("-{fee}"), "feeCcy":"USD",
+                "ts":(timestamp+offset+10).to_string(), "fillTime":(timestamp+offset).to_string()})
+        }).collect();
+
+        if case == "missing-fill" && *cid == "QueryFills4" {
+            fills.pop();
+        }
+
+        if reverse {
+            fills.reverse();
+        }
+        all_fills.extend(fills.clone());
+        venue
+            .order_fills
+            .lock()
+            .await
+            .insert(vid.to_string(), json!({"code":"0", "msg":"", "data":fills}));
+    }
+
+    if reverse {
+        reports.reverse();
+        all_fills.reverse();
+    }
+    *venue.report.lock().await = json!({"code":"0", "msg":"", "data":reports});
+    *venue.fills.lock().await = json!({"code":"0", "msg":"", "data":all_fills});
+    venue.bulk.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let result = tokio::time::timeout(DEADLINE, node.start()).await.unwrap();
+    if case != "complete" {
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Startup order fill recovery incomplete"),
+            "{error:#}"
+        );
+        assert!(venue.submissions.lock().await.is_empty());
+        assert!(
+            cache
+                .borrow()
+                .orders(None, None, None, None, None)
+                .iter()
+                .all(|order| order.filled_qty().is_zero())
+        );
+        assert!(
+            cache
+                .borrow()
+                .positions(None, None, None, None, None)
+                .is_empty()
+        );
+        assert_eq!(
+            cache
+                .borrow()
+                .account(&AccountId::from("OKX-001"))
+                .unwrap()
+                .balance_total(Some(Currency::USD())),
+            Some(wallet)
+        );
+        node.dispose();
+        drop(node);
+        drop(cache);
+        let runs = RedbBackend::list_runs(store.path(), &instance).unwrap();
+        let restarted = build_node(addr, Rc::new(RefCell::new(Vec::new())), QuerySource::Direct);
+        let error = restore_cache_from_sealed_run(
+            &mut restarted.kernel().cache.borrow_mut(),
+            store.path().to_path_buf(),
+            &instance,
+            &runs[0].run_id,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Unresolved persisted incomplete fill recovery"),
+            "{error:#}"
+        );
+        server.abort();
+        return;
+    }
+    result.unwrap();
+    assert!(node.handle().is_running());
+    assert!(venue.submissions.lock().await.is_empty());
+
+    for (cid, _, trade, _, qty, px, fee, offset) in executions {
+        let cache = cache.borrow();
+        let order = cache.order(&ClientOrderId::from(cid)).unwrap();
+        assert_eq!(order.status(), OrderStatus::Filled);
+        let fills: Vec<_> = order
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                OrderEventAny::Filled(fill) if fill.trade_id == TradeId::from(trade) => Some(fill),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].last_qty, Quantity::from(qty));
+        assert_eq!(fills[0].last_px, Price::from(px));
+        assert_eq!(
+            fills[0].commission,
+            Some(Money::from_decimal_exact(fee.parse().unwrap(), Currency::USD()).unwrap())
+        );
+        assert_eq!(fills[0].ts_event.as_u64(), (timestamp + offset) * 1_000_000);
+    }
+    assert!(
+        cache
+            .borrow()
+            .positions(None, None, None, None, None)
+            .is_empty()
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .account(&AccountId::from("OKX-001"))
+            .unwrap()
+            .balance_total(Some(Currency::USD())),
+        Some(wallet)
+    );
+    let before: Vec<_> = cache
+        .borrow()
+        .orders(None, None, None, None, None)
+        .into_iter()
+        .map(|order| order.cloned())
+        .collect();
+    node.stop().await.unwrap();
+    node.dispose();
+    drop(node);
+    drop(cache);
+
+    let runs = RedbBackend::list_runs(store.path(), &instance).unwrap();
+    let mut restarted = build_node(addr, Rc::new(RefCell::new(Vec::new())), QuerySource::Direct);
+    let cache = restarted.kernel().cache.clone();
+    restore_cache_from_sealed_run(
+        &mut cache.borrow_mut(),
+        store.path().to_path_buf(),
+        &instance,
+        &runs[0].run_id,
+    )
+    .unwrap();
+    tokio::time::timeout(DEADLINE, restarted.start())
+        .await
+        .unwrap()
+        .unwrap();
+
+    for order in before {
+        assert_eq!(
+            cache
+                .borrow()
+                .order(&order.client_order_id())
+                .unwrap()
+                .events(),
+            order.events()
+        );
+    }
+    assert!(
+        cache
+            .borrow()
+            .positions(None, None, None, None, None)
+            .is_empty()
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .account(&AccountId::from("OKX-001"))
+            .unwrap()
+            .balance_total(Some(Currency::USD())),
+        Some(wallet)
+    );
+    assert!(venue.submissions.lock().await.is_empty());
+    restarted.stop().await.unwrap();
+    restarted.dispose();
     server.abort();
 }
 

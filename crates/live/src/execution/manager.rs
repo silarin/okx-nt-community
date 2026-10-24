@@ -1293,8 +1293,10 @@ impl ExecutionManager {
         // A complete order history is required before any startup projection. Keep all
         // trades in the existing globally sorted mass-status path, including orphan fills.
         let mut histories_complete = true;
+        let startup_orders = mass_status.order_reports();
         let startup_fills = mass_status.fill_reports();
-        for report in mass_status.order_reports().values() {
+
+        for report in startup_orders.values() {
             if report.filled_qty.is_zero() || self.should_skip_order_report(report) {
                 continue;
             }
@@ -1347,8 +1349,7 @@ impl ExecutionManager {
             if !self.should_reconcile_instrument(&fill.instrument_id)
                 || client_order_id
                     .is_some_and(|id| self.config.filtered_client_order_ids.contains(&id))
-                || mass_status
-                    .order_reports()
+                || startup_orders
                     .get(&fill.venue_order_id)
                     .is_some_and(|report| self.should_skip_order_report(report))
             {
@@ -1401,9 +1402,6 @@ impl ExecutionManager {
                 histories_complete = false;
             }
         }
-
-        histories_complete &=
-            !fills_have_ambiguous_position_order(&self.cache.borrow(), &scoped_startup_fills, true);
 
         if !histories_complete {
             log::error!("Startup reconciliation requires complete compatible order fill histories");
@@ -1479,6 +1477,29 @@ impl ExecutionManager {
                 })
                 .map(|fill| (fill.account_id, fill.instrument_id, fill.trade_id)),
         );
+
+        // Complete order-only history cannot allocate fills to position episodes,
+        // retain the full ordering context if any retained order or orphan can affect them.
+        let affects_positions = scoped_startup_fills.iter().any(|fill| {
+            !order_only_ids.contains(&fill.venue_order_id)
+                || startup_orders
+                    .get(&fill.venue_order_id)
+                    .is_none_or(|report| report.filled_qty.is_zero())
+        });
+
+        if affects_positions
+            && fills_have_ambiguous_position_order(
+                &self.cache.borrow(),
+                &scoped_startup_fills,
+                true,
+            )
+        {
+            log::error!("Startup reconciliation requires unambiguous position fill histories");
+            return ReconciliationResult {
+                order_fill_history_incomplete: true,
+                ..Default::default()
+            };
+        }
 
         let mut events = Vec::new();
         let mut external_orders = Vec::new();
