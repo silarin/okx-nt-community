@@ -1,10 +1,10 @@
-# nautilus-live
+# OKX NT Community: `nautilus-live`
 
-[![build](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml)
-[![Documentation](https://img.shields.io/docsrs/nautilus-live)](https://docs.rs/nautilus-live/latest/nautilus_live/)
-[![crates.io version](https://img.shields.io/crates/v/nautilus-live.svg)](https://crates.io/crates/nautilus-live)
-![license](https://img.shields.io/github/license/nautechsystems/nautilus_trader?color=blue)
-[![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?logo=discord&logoColor=white)](https://discord.gg/NautilusTrader)
+This source crate is part of [OKX NT Community](../../README.md), maintained independently by silarin.
+
+Neither Nautech Systems Pty Ltd nor the official NautilusTrader project is affiliated with this fork,
+endorses it, or provides support for it. Use [this fork's issues](https://github.com/silarin/okx-nt-community/issues)
+for questions about the changes maintained here.
 
 Live system node for [NautilusTrader](https://nautilustrader.io).
 
@@ -16,7 +16,7 @@ It builds on top of the system kernel to provide simplified interfaces for live 
 - `LiveNodeConfig` Configuration for live node deployment.
 - `AsyncRunner` for managing system real-time data flow.
 
-## NautilusTrader
+## Upstream NautilusTrader
 
 [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
 engine for multi-asset, multi-venue trading systems.
@@ -44,7 +44,7 @@ This crate provides feature flags to control source code inclusion during compil
 
 ## Documentation
 
-See [the docs](https://docs.rs/nautilus-live) for more detailed usage.
+For the upstream API reference, see [the upstream docs](https://docs.rs/nautilus-live) for more detailed usage.
 
 ## License
 
@@ -52,12 +52,10 @@ The source code for NautilusTrader is available on GitHub under the [GNU Lesser 
 
 ---
 
-NautilusTrader™ is developed and maintained by Nautech Systems, a technology
+Upstream NautilusTrader™ is developed and maintained by Nautech Systems, a technology
 company specializing in the development of high-performance trading systems.
 For more information, visit <https://nautilustrader.io>.
 
 Use of this software is subject to the [Disclaimer](https://nautilustrader.io/legal/disclaimer/).
-
-<img src="https://github.com/nautechsystems/nautilus_trader/raw/develop/assets/nautilus-logo-white.png" alt="logo" width="300" height="auto"/>
 
 © 2015-2026 Nautech Systems Pty Ltd. All rights reserved.

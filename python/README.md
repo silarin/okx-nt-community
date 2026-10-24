@@ -1,4 +1,10 @@
-# NautilusTrader Python package
+# OKX NT Community: Python Source
+
+This package source is part of [OKX NT Community](../README.md), maintained independently by silarin.
+
+Neither Nautech Systems Pty Ltd nor the official NautilusTrader project is affiliated with this fork,
+endorses it, or provides support for it. Use [this fork's issues](https://github.com/silarin/okx-nt-community/issues)
+for questions about the changes maintained here.
 
 This directory contains the `nautilus_trader` Python package. Rust core bindings are exposed
 through PyO3.
@@ -81,14 +87,17 @@ UUID4()
 ### From source
 
 ```bash
-git clone https://github.com/nautechsystems/nautilus_trader.git
-cd nautilus_trader
+git clone https://github.com/silarin/okx-nt-community.git
+cd okx-nt-community
 make build
 ```
 
-### Development wheels (pre-release)
+### Upstream development wheels (pre-release)
 
-CI publishes development wheels on successful `develop` and `nightly` builds.
+The following command and platform table describe upstream artifacts, which do not contain this
+fork's changes. Build this fork from source to use the changes maintained here.
+
+Upstream CI publishes development wheels on successful `develop` and `nightly` builds.
 
 ```bash
 uv pip install --pre --index-url=https://packages.nautechsystems.io/simple/ nautilus-trader
@@ -101,7 +110,7 @@ uv pip install --pre --index-url=https://packages.nautechsystems.io/simple/ naut
 | `macOS (ARM64)`    | 3.13-3.14 | -       | ✓       |
 | `Windows (x86_64)` | 3.13-3.14 | -       | ✓       |
 
-The nightly merge builds and tests wheels on every listed platform.
+The upstream nightly merge builds and tests wheels on every listed platform.
 
 The `--pre` flag is required because wheels are tagged as pre-release builds. Run this command
 outside the NautilusTrader source checkout so the repository's `exclude-newer` uv policy does not

@@ -1,4 +1,10 @@
-# nautilus-coinapi
+# OKX NT Community: `nautilus-coinapi`
+
+This source crate is part of [OKX NT Community](../../../README.md), maintained independently by silarin.
+
+Neither Nautech Systems Pty Ltd nor the official NautilusTrader project is affiliated with this fork,
+endorses it, or provides support for it. Use [this fork's issues](https://github.com/silarin/okx-nt-community/issues)
+for questions about the changes maintained here.
 
 [CoinAPI Market Data API](https://www.coinapi.io/products/market-data-api?ref=nautilus) integration for
 [NautilusTrader](https://nautilustrader.io).

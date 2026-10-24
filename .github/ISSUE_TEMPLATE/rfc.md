@@ -13,18 +13,12 @@ An RFC (Request for Comments) is a proposal for significant changes or additions
 such as new features, major refactorings, or process improvements. RFCs are meant for ideas that
 could have a broad impact and benefit from wider community discussion.
 
-New venue integrations always start here. See
-[Community-contributed integrations](https://github.com/nautechsystems/nautilus_trader/blob/develop/ROADMAP.md#community-contributed-integrations)
-for the approval process, and
-[ADAPTERS.md](https://github.com/nautechsystems/nautilus_trader/blob/develop/ADAPTERS.md)
-for adapter tiers and support boundaries.
-
 ## Before you proceed
 
-Check the [open-source scope](https://github.com/nautechsystems/nautilus_trader/blob/develop/ROADMAP.md#open-source-scope)
-before opening an RFC. Topics excluded there are also out of scope for proposals and discussion.
+This RFC concerns the independent OKX NT Community fork. Explain how the proposal relates to the
+[project scope](https://github.com/silarin/okx-nt-community#okx-nt-community).
 
-- [ ] I've searched existing issues and discussions to avoid duplicates.
+- [ ] I've searched this fork's existing issues to avoid duplicates.
 - [ ] I have no other RFC open, unless maintainers requested this RFC. This limit helps
       each proposal get the attention it deserves.
 - [ ] I've disclosed any commercial relationships relevant to this RFC and stated whether I'm

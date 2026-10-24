@@ -1,10 +1,10 @@
-# nautilus-event-store
+# OKX NT Community: `nautilus-event-store`
 
-[![build](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml)
-[![Documentation](https://img.shields.io/docsrs/nautilus-event-store)](https://docs.rs/nautilus-event-store/latest/nautilus_event_store/)
-[![crates.io version](https://img.shields.io/crates/v/nautilus-event-store.svg)](https://crates.io/crates/nautilus-event-store)
-![license](https://img.shields.io/github/license/nautechsystems/nautilus_trader?color=blue)
-[![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?logo=discord&logoColor=white)](https://discord.gg/NautilusTrader)
+This source crate is part of [OKX NT Community](../../README.md), maintained independently by silarin.
+
+Neither Nautech Systems Pty Ltd nor the official NautilusTrader project is affiliated with this fork,
+endorses it, or provides support for it. Use [this fork's issues](https://github.com/silarin/okx-nt-community/issues)
+for questions about the changes maintained here.
 
 Embedded event store and authoritative log of state-affecting messages for
 [NautilusTrader](https://nautilustrader.io).
@@ -170,7 +170,7 @@ This crate provides feature flags to control source code inclusion during compil
   and operational examples.
 - [docs.rs](https://docs.rs/nautilus-event-store): generated Rust API reference.
 
-## NautilusTrader
+## Upstream NautilusTrader
 
 [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
 engine for multi-asset, multi-venue trading systems.
@@ -185,12 +185,10 @@ The source code for NautilusTrader is available on GitHub under the
 
 ---
 
-NautilusTrader™ is developed and maintained by Nautech Systems, a technology
+Upstream NautilusTrader™ is developed and maintained by Nautech Systems, a technology
 company specializing in the development of high-performance trading systems.
 For more information, visit <https://nautilustrader.io>.
 
 Use of this software is subject to the [Disclaimer](https://nautilustrader.io/legal/disclaimer/).
-
-<img src="https://github.com/nautechsystems/nautilus_trader/raw/develop/assets/nautilus-logo-white.png" alt="logo" width="300" height="auto"/>
 
 © 2015-2026 Nautech Systems Pty Ltd. All rights reserved.

@@ -1,15 +1,17 @@
-# nautilus-pyo3
+# OKX NT Community: `nautilus-pyo3`
 
-[![build](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml)
-![license](https://img.shields.io/github/license/nautechsystems/nautilus_trader?color=blue)
-[![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?logo=discord&logoColor=white)](https://discord.gg/NautilusTrader)
+This source crate is part of [OKX NT Community](../../README.md), maintained independently by silarin.
+
+Neither Nautech Systems Pty Ltd nor the official NautilusTrader project is affiliated with this fork,
+endorses it, or provides support for it. Use [this fork's issues](https://github.com/silarin/okx-nt-community/issues)
+for questions about the changes maintained here.
 
 Python bindings for [NautilusTrader](https://nautilustrader.io).
 
 The `nautilus-pyo3` crate provides all [PyO3](https://pyo3.rs) Python bindings for the
 main `nautilus_trader` Python package, built via [maturin](https://github.com/PyO3/maturin).
 
-## NautilusTrader
+## Upstream NautilusTrader
 
 [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
 engine for multi-asset, multi-venue trading systems.
@@ -39,12 +41,10 @@ The source code for NautilusTrader is available on GitHub under the [GNU Lesser 
 
 ---
 
-NautilusTrader™ is developed and maintained by Nautech Systems, a technology
+Upstream NautilusTrader™ is developed and maintained by Nautech Systems, a technology
 company specializing in the development of high-performance trading systems.
 For more information, visit <https://nautilustrader.io>.
 
 Use of this software is subject to the [Disclaimer](https://nautilustrader.io/legal/disclaimer/).
-
-<img src="https://github.com/nautechsystems/nautilus_trader/raw/develop/assets/nautilus-logo-white.png" alt="logo" width="300" height="auto"/>
 
 © 2015-2026 Nautech Systems Pty Ltd. All rights reserved.

@@ -7,12 +7,11 @@ labels:
 
 # Feature Request
 
-Check the [open-source scope](https://github.com/nautechsystems/nautilus_trader/blob/develop/ROADMAP.md#open-source-scope)
-before opening this request. Broad changes, major refactorings, and process changes belong in an
-RFC instead. New venue integrations always start as an RFC, see
-[Community-contributed integrations](https://github.com/nautechsystems/nautilus_trader/blob/develop/ROADMAP.md#community-contributed-integrations).
+Propose changes to this independent fork here. Describe how they relate to the
+[project scope](https://github.com/silarin/okx-nt-community#okx-nt-community).
+Broad changes, major refactorings, and process changes belong in an RFC instead.
 
-- [ ] I've searched existing issues and discussions to avoid duplicates.
+- [ ] I've searched this fork's existing issues to avoid duplicates.
 
 ## Problem statement
 

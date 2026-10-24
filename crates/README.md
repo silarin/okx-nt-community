@@ -1,7 +1,10 @@
-# nautilus-trader
+# OKX NT Community: `nautilus-trader`
 
-[![crates.io version](https://img.shields.io/crates/v/nautilus-trader.svg)](https://crates.io/crates/nautilus-trader)
-[![Documentation](https://docs.rs/nautilus-trader/badge.svg)](https://docs.rs/nautilus-trader)
+This source crate is part of [OKX NT Community](../README.md), maintained independently by silarin.
+
+Neither Nautech Systems Pty Ltd nor the official NautilusTrader project is affiliated with this fork,
+endorses it, or provides support for it. Use [this fork's issues](https://github.com/silarin/okx-nt-community/issues)
+for questions about the changes maintained here.
 
 Container crate for [NautilusTrader](https://nautilustrader.io).
 
@@ -25,9 +28,9 @@ Use the other component crates that match your use case:
 - `nautilus-portfolio`: Portfolio accounting.
 - `nautilus-risk`: Risk engine.
 
-Venue adapters publish as separate crates.
+Upstream venue adapters publish as separate crates.
 
-## NautilusTrader
+## Upstream NautilusTrader
 
 [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade,
 Rust-native engine for multi-asset, multi-venue trading systems.
@@ -43,7 +46,7 @@ This crate provides feature flags to control source code inclusion during compil
 
 ## Documentation
 
-See [the NautilusTrader documentation](https://nautilustrader.io/docs) and the
+See [the upstream NautilusTrader documentation](https://nautilustrader.io/docs) and the
 component crate docs on [docs.rs](https://docs.rs/releases/search?query=nautilus).
 
 ## License
