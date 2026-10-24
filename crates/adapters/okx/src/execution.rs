@@ -2187,55 +2187,81 @@ impl ExecutionClient for OKXExecutionClient {
 
         // Complete every regular order history before the manager globally sorts fills.
         // Runtime query responses must not project startup trades in HTTP completion order.
-        let observation_emitter = self.emitter.clone();
-
-        for report in &mut order_reports {
-            if report.filled_qty.is_zero() || self.http_client.is_spread(report.instrument_id) {
-                continue;
-            }
-            let history = async {
-                if !fill_queries.contains_key(&report.venue_order_id) {
-                    let query = self
-                        .http_client
-                        .request_order_status_report_with_type(
-                            report.account_id,
-                            report.instrument_id,
-                            None,
-                            Some(report.venue_order_id),
-                            Some(&|report| {
-                                observation_emitter.send_execution_report(report.clone());
-                            }),
+        // Keep independent histories in flight without spawning tasks. Dropping the
+        // mass-status future cancels unfinished requests; observed facts have already
+        // been retained. The shared HTTP client still enforces endpoint quotas.
+        {
+            let history_requests: Vec<_> = order_reports
+                .iter_mut()
+                .filter(|report| {
+                    !report.filled_qty.is_zero()
+                        && !self.http_client.is_spread(report.instrument_id)
+                })
+                .map(|report| (fill_queries.remove(&report.venue_order_id), report))
+                .collect();
+            let histories = futures_util::stream::iter(history_requests)
+                .map(|(mut query, report)| async move {
+                    let observation_emitter = &self.emitter;
+                    let history = async {
+                        if query.is_none() {
+                            let detail = self
+                                .http_client
+                                .request_order_status_report_with_type(
+                                    report.account_id,
+                                    report.instrument_id,
+                                    None,
+                                    Some(report.venue_order_id),
+                                    Some(&|report| {
+                                        observation_emitter.send_execution_report(report.clone());
+                                    }),
+                                )
+                                .await?
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("Missing startup order product scope")
+                                })?;
+                            self.emitter.send_execution_report(
+                                ExecutionReport::OrderQueryWithFills(
+                                    Box::new(detail.report.clone()),
+                                    Vec::new(),
+                                ),
+                            );
+                            *report = detail.report.clone();
+                            query = Some(detail);
+                        }
+                        request_order_query_fills(
+                            &self.http_client,
+                            report,
+                            query.as_ref().expect("order detail resolved"),
+                            &self.emitter,
                         )
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("Missing startup order product scope"))?;
-                    self.emitter
-                        .send_execution_report(ExecutionReport::OrderQueryWithFills(
-                            Box::new(query.report.clone()),
-                            Vec::new(),
-                        ));
-                    *report = query.report.clone();
-                    fill_queries.insert(report.venue_order_id, query);
-                }
-                let query = &fill_queries[&report.venue_order_id];
-                request_order_query_fills(&self.http_client, report, query, &self.emitter).await
-            }
-            .await;
-
-            match history {
-                Ok(fills) => fill_reports.extend(fills),
-                Err(e) => {
-                    if let Some(incomplete) = e.downcast_ref::<IncompleteOrderFill>() {
-                        self.emitter
-                            .send_execution_report(ExecutionReport::IncompleteFill(Box::new(
-                                incomplete.0.clone(),
-                            )));
+                        .await
                     }
+                    .await;
+                    (report.venue_order_id, query, history)
+                })
+                .buffer_unordered(MAX_CONCURRENT_STARTUP_ORDER_HISTORIES);
+            pin_mut!(histories);
 
-                    fills_complete = false;
-                    log::warn!(
-                        "Startup order {} requires complete fill history: {e}",
-                        report.venue_order_id
-                    );
+            while let Some((venue_order_id, query, history)) = histories.next().await {
+                if let Some(query) = query {
+                    fill_queries.insert(venue_order_id, query);
+                }
+
+                match history {
+                    Ok(fills) => fill_reports.extend(fills),
+                    Err(e) => {
+                        if let Some(incomplete) = e.downcast_ref::<IncompleteOrderFill>() {
+                            self.emitter
+                                .send_execution_report(ExecutionReport::IncompleteFill(Box::new(
+                                    incomplete.0.clone(),
+                                )));
+                        }
+
+                        fills_complete = false;
+                        log::warn!(
+                            "Startup order {venue_order_id} requires complete fill history: {e}"
+                        );
+                    }
                 }
             }
         }
@@ -2803,6 +2829,7 @@ impl ExecutionClient for OKXExecutionClient {
 }
 
 const MAX_TRIGGERED_CHILD_RECOVERIES: usize = 100;
+const MAX_CONCURRENT_STARTUP_ORDER_HISTORIES: usize = 4;
 
 async fn request_order_query_fills(
     http_client: &OKXHttpClient,

@@ -8150,3 +8150,258 @@ async fn test_imported_order_first_amend_confirmation(
         Quantity::from(if with_fill { "2" } else { "0" })
     );
 }
+
+struct StartupHistoryState {
+    started: AtomicUsize,
+    active: AtomicUsize,
+    peak: AtomicUsize,
+    release: tokio::sync::Semaphore,
+    release_first: tokio::sync::Notify,
+    completed_fills: tokio::sync::Mutex<Vec<usize>>,
+}
+
+impl Default for StartupHistoryState {
+    fn default() -> Self {
+        Self {
+            started: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            release_first: tokio::sync::Notify::new(),
+            completed_fills: tokio::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+fn startup_history_order(index: usize, now_ms: i64) -> serde_json::Value {
+    let mut order = load_test_data("http_get_orders_history.json")["data"][0].clone();
+    order["instId"] = json!("ETH-USDT-SWAP");
+    order["ordId"] = json!(format!("{}", 1000 + index));
+    order["clOrdId"] = json!(format!("OSTARTUP{index}"));
+    order["ordType"] = json!("limit");
+    order["posSide"] = json!("net");
+    order["tdMode"] = json!("cross");
+    order["sz"] = json!("1");
+    order["accFillSz"] = json!("1");
+    order["fillSz"] = json!("1");
+    order["px"] = json!("2000.00");
+    order["avgPx"] = json!("2000.00");
+    order["fillPx"] = json!("2000.00");
+    order["fee"] = json!("-0.01");
+    order["tradeId"] = json!(format!("{}", 2000 + index));
+    order["cTime"] = json!(now_ms.to_string());
+    order["uTime"] = json!(now_ms.to_string());
+    order["fillTime"] = json!(now_ms.to_string());
+    order
+}
+
+async fn start_concurrent_startup_history_server(
+    state: Arc<StartupHistoryState>,
+    fail_history: bool,
+) -> SocketAddr {
+    let now_ms = jiff::Timestamp::now().as_millisecond();
+    let history = get(move || async move {
+        Json(
+            json!({"code":"0", "msg":"", "data":(0..12).map(|index| startup_history_order(index, now_ms)).collect::<Vec<_>>()}),
+        )
+    });
+    let detail_state = Arc::clone(&state);
+    let detail = get(move |Query(params): Query<HashMap<String, String>>| {
+        let state = Arc::clone(&detail_state);
+        async move {
+            let index = params["ordId"].parse::<usize>().unwrap() - 1000;
+            let active = state.active.fetch_add(1, Ordering::SeqCst) + 1;
+            state.peak.fetch_max(active, Ordering::SeqCst);
+            state.started.fetch_add(1, Ordering::SeqCst);
+            state.release.acquire().await.unwrap().forget();
+
+            // Force a later order's fill to arrive before the first order's detail.
+            if index == 0 {
+                state.release_first.notified().await;
+            }
+            state.active.fetch_sub(1, Ordering::SeqCst);
+            Json(json!({"code":"0", "msg":"", "data":[startup_history_order(index, now_ms)]}))
+        }
+    });
+    let fills = get(move |Query(params): Query<HashMap<String, String>>| {
+        let state = Arc::clone(&state);
+        async move {
+            let Some(order_id) = params.get("ordId") else {
+                return Json(json!({"code":"0", "msg":"", "data":[]}));
+            };
+            let index = order_id.parse::<usize>().unwrap() - 1000;
+            state.completed_fills.lock().await.push(index);
+
+            if index == 1 {
+                state.release_first.notify_one();
+            }
+            Json(json!({"code":"0", "msg":"", "data":[{
+                "instType":"SWAP", "instId":"ETH-USDT-SWAP",
+                "ordId":order_id, "clOrdId":format!("OSTARTUP{index}"),
+                "tradeId":format!("{}", 2000 + index), "billId":format!("{}", 3000 + index),
+                "fillSz":if fail_history && index == 0 { "0.5" } else { "1" },
+                "fillPx":"2000.00", "side":"buy", "posSide":"net", "execType":"T",
+                "fee":"-0.01", "feeCcy":"USDT", "ts":now_ms.to_string(), "fillTime":now_ms.to_string()
+            }]}))
+        }
+    });
+    let empty = get(|| async { Json(json!({"code":"0", "msg":"", "data":[]})) });
+    let router = Router::new()
+        .route("/api/v5/trade/order", detail)
+        .route("/api/v5/trade/orders-history", history)
+        .route("/api/v5/trade/orders-pending", empty.clone())
+        .route("/api/v5/trade/orders-algo-pending", empty.clone())
+        .route("/api/v5/trade/orders-algo-history", empty.clone())
+        .route("/api/v5/trade/fills", fills)
+        .route(
+            "/api/v5/trade/fills-history",
+            get(|| async { StatusCode::NOT_FOUND }),
+        )
+        .route("/api/v5/account/positions", empty)
+        .route(
+            "/api/v5/account/balance",
+            get(|| async { Json(load_test_data("http_get_account_balance.json")) }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+    addr
+}
+
+#[rstest]
+#[case::complete(false)]
+#[case::failed_later_history(true)]
+#[tokio::test]
+async fn test_mass_status_bounds_concurrent_histories_and_retains_evidence(
+    #[case] fail_history: bool,
+) {
+    let state = Arc::new(StartupHistoryState::default());
+    let addr = start_concurrent_startup_history_server(Arc::clone(&state), fail_history).await;
+    let (mut client, mut rx, _) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.instrument_types = vec![OKXInstrumentType::Swap];
+        });
+    client.start().unwrap();
+    client.on_instrument(query_order_instrument());
+    let mass_status = tokio::time::timeout(Duration::from_secs(10), async {
+        let recovery = client.generate_mass_status(None);
+        let control = async {
+            wait_until_async(
+                || async { state.started.load(Ordering::SeqCst) == 4 },
+                Duration::from_secs(5),
+            )
+            .await;
+            // Four blocked requests must prevent the rest of the backlog from starting.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(state.started.load(Ordering::SeqCst), 4);
+            state.release.add_permits(12);
+        };
+        let (result, ()) = tokio::join!(recovery, control);
+        result.unwrap().unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(state.started.load(Ordering::SeqCst), 12);
+    assert_eq!(state.peak.load(Ordering::SeqCst), 4);
+    let completed = state.completed_fills.lock().await;
+    assert!(
+        completed.iter().position(|index| *index == 1).unwrap()
+            < completed.iter().position(|index| *index == 0).unwrap()
+    );
+    assert_eq!(mass_status.reports_complete(), !fail_history);
+    assert_eq!(mass_status.order_reports().len(), 12);
+    assert_eq!(
+        mass_status.fill_reports().len(),
+        if fail_history { 11 } else { 12 }
+    );
+
+    for index in 0..12 {
+        let venue_id = VenueOrderId::new(format!("{}", 1000 + index));
+        let report = &mass_status.order_reports()[&venue_id];
+        assert_eq!(
+            report.client_order_id,
+            Some(ClientOrderId::new(format!("OSTARTUP{index}")))
+        );
+        assert_eq!(report.filled_qty, Quantity::from("1"));
+
+        if index == 0 && fail_history {
+            assert!(!mass_status.fill_reports().contains_key(&venue_id));
+            continue;
+        }
+        let fills = &mass_status.fill_reports()[&venue_id];
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].trade_id, TradeId::new(format!("{}", 2000 + index)));
+        assert_eq!(fills[0].client_order_id, report.client_order_id);
+        assert_eq!(fills[0].commission, Money::from("0.01 USDT"));
+        assert_eq!(fills[0].last_qty, Quantity::from("1"));
+    }
+    let facts: Vec<_> = drain_events(&mut rx)
+        .into_iter()
+        .filter_map(|event| match event {
+            ExecutionEvent::Report(CommonExecutionReport::FillEvidence(fill)) => Some(fill),
+            ExecutionEvent::Order(_) => {
+                panic!("startup must not project fills in HTTP completion order")
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(facts.len(), 12);
+    let first = facts
+        .iter()
+        .find(|fill| fill.venue_order_id.as_str() == "1000")
+        .unwrap();
+    assert_eq!(
+        first.last_qty,
+        Quantity::from(if fail_history { "0.5" } else { "1" })
+    );
+}
+
+#[tokio::test]
+async fn test_mass_status_cancellation_retains_facts_without_starting_more_histories() {
+    let state = Arc::new(StartupHistoryState::default());
+    let addr = start_concurrent_startup_history_server(Arc::clone(&state), false).await;
+    let (mut client, mut rx, _) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.instrument_types = vec![OKXInstrumentType::Swap];
+        });
+    client.start().unwrap();
+    client.on_instrument(query_order_instrument());
+    state.release.add_permits(4);
+    {
+        let recovery = client.generate_mass_status(None);
+        tokio::pin!(recovery);
+        let observed = async {
+            loop {
+                if state.completed_fills.lock().await.len() == 4
+                    && state.started.load(Ordering::SeqCst) == 8
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        tokio::select! {
+            result = &mut recovery => panic!("blocked history returned early: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(5), observed) => result.unwrap(),
+        }
+        // Drop the native future just as the existing startup deadline does.
+    }
+    let facts: Vec<_> = drain_events(&mut rx)
+        .into_iter()
+        .filter_map(|event| match event {
+            ExecutionEvent::Report(CommonExecutionReport::FillEvidence(fill)) => Some(fill),
+            ExecutionEvent::Order(_) => panic!("startup must not project incomplete recovery"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(facts.len(), 4);
+    state.release.add_permits(12);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(state.started.load(Ordering::SeqCst), 8);
+    assert_eq!(state.completed_fills.lock().await.len(), 4);
+    assert!(drain_events(&mut rx).is_empty());
+}
