@@ -1340,5 +1340,5 @@ operation.
 
 :::info
 To contribute to the Kraken adapter, see the
-[contributing guide](https://github.com/nautechsystems/nautilus_trader/blob/develop/CONTRIBUTING.md).
+[contributing guide](../../CONTRIBUTING.md).
 :::

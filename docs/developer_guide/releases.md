@@ -1,5 +1,12 @@
 # Releases
 
+:::note[Upstream reference]
+The release branches, package registries, deployment environments, and automation below describe
+upstream NautilusTrader. This fork is maintained as source and makes no corresponding publication
+or release-schedule promise. See [Fork Maintenance](../../FORK.md) for its integration process.
+The release-note writing guidance remains useful when preparing a change description.
+:::
+
 This guide covers the release process and the standards for writing release notes.
 
 ## Overview

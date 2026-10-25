@@ -12,6 +12,9 @@ project is affiliated with this repository, endorses it, or provides support for
 Report issues with this fork through [this repository's issues](https://github.com/silarin/okx-nt-community/issues).
 Upstream documentation and community channels describe the original NautilusTrader project.
 
+See [Fork Maintenance](FORK.md) for the upstream baseline, maintained differences, and synchronization
+process, and [CONTRIBUTING.md](CONTRIBUTING.md) for contributions to this repository.
+
 ## Source and attribution
 
 This repository preserves the upstream source history and its copyright notices. Crate and module

@@ -24,7 +24,7 @@ All tracked Python examples import the current public package surface. Adapter e
 self-contained actors and strategies maintained with the example.
 
 Ensure that the `nautilus_trader` package is either compiled from source or installed via pip before
-running the examples. See the [installation guide](https://nautilustrader.io/docs/latest/getting_started/installation)
+running the examples. See the [installation guide](../docs/getting_started/installation.md#from-source)
 for more information.
 
 From the repository root, run a Rust-native adapter tester against the venue testnet:

@@ -1105,5 +1105,5 @@ For more details, see the [Server Infrastructure article](https://support.deribi
 
 :::info
 For additional features or to contribute to the Deribit adapter, please see our
-[contributing guide](https://github.com/nautechsystems/nautilus_trader/blob/develop/CONTRIBUTING.md).
+[contributing guide](../../CONTRIBUTING.md).
 :::

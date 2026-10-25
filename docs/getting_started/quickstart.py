@@ -3,17 +3,16 @@
 #
 # Run your first backtest in under five minutes.
 #
-# [View source on GitHub](https://github.com/nautechsystems/nautilus_trader/blob/develop/docs/getting_started/quickstart.py).
+# [View source on GitHub](https://github.com/silarin/okx-nt-community/blob/develop/docs/getting_started/quickstart.py).
 
 # %% [markdown]
 # ## Prerequisites
 #
 # - Python 3.13-3.14
-# - NautilusTrader 2.x installed (`pip install -U --pre nautilus_trader`). The `--pre`
-#   flag is required while 2.x ships as `2.0.0rcN`; without it pip installs the 1.x
-#   line, whose Python API differs and cannot run this page.
-# - NumPy and pandas (`pip install numpy pandas`). The wheel declares no runtime
-#   dependencies, so it does not pull them in.
+# - [OKX NT Community built from source](installation.md#from-source).
+# - Run `make sync` and `make build-debug` in this fork's checkout, then use
+#   `python/.venv` for the tutorial. The sync includes NumPy and pandas.
+# - Upstream package-index wheels do not contain fork-only changes.
 
 # %% [markdown]
 # ## Write a strategy

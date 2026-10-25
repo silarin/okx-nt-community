@@ -849,5 +849,5 @@ Only L2 (MBP) book type is supported.
 
 :::info
 For additional features or to contribute to the dYdX adapter, please see our
-[contributing guide](https://github.com/nautechsystems/nautilus_trader/blob/develop/CONTRIBUTING.md).
+[contributing guide](../../CONTRIBUTING.md).
 :::

@@ -64,13 +64,13 @@ signals with sklearn](https://databento.com/blog/hft-sklearn-python).
 
 - Python 3.13+
 - [NautilusTrader installed](../getting_started/installation.md).
-- A clone of the NautilusTrader repository. The snippets read
+- A clone of the OKX NT Community repository. The snippets read
   `crates/adapters/databento/publishers.json` and import the strategy from
   `examples/live/architect_ax`, so run them from the repository root:
 
 ```bash
-git clone https://github.com/nautechsystems/nautilus_trader
-cd nautilus_trader
+git clone --branch develop https://github.com/silarin/okx-nt-community.git
+cd okx-nt-community
 ```
 
 - A Databento API key:

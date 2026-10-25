@@ -1,6 +1,9 @@
 # Developer Guide
 
-Guidance on developing and extending NautilusTrader, or contributing back to the project.
+Guidance on developing the shared NautilusTrader engine in OKX NT Community. For contributions
+to this independent fork, start with [CONTRIBUTING.md](../../CONTRIBUTING.md) and
+[Fork Maintenance](../../FORK.md). Release and security architecture pages explicitly identify
+inherited upstream infrastructure.
 
 NautilusTrader has a **Rust core with Python bindings**:
 
