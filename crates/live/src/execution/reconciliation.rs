@@ -99,6 +99,8 @@ pub struct ReconciliationResult {
     pub external_orders: Vec<ExternalOrderMetadata>,
     /// Diagnostics for in-scope nonzero venue positions unrecovered after event processing.
     pub unresolved_positions: Vec<String>,
+    /// Startup history is incomplete or conflicts with retained executions.
+    pub order_fill_history_incomplete: bool,
 }
 
 /// Result of inflight order checks containing terminal events and intermediate queries.
@@ -342,7 +344,9 @@ pub(crate) async fn request_targeted_order_reports(
             if let Some(candidate) =
                 targeted_report_response(&query, client_id, response, &mut coverage_complete)
             {
-                if terminal_report_has_missing_fills(&candidate, query.filled_qty) {
+                if !client.requires_order_query_fills(candidate.instrument_id)
+                    && terminal_report_has_missing_fills(&candidate, query.filled_qty)
+                {
                     let command = targeted_fill_command(&query, &candidate);
 
                     match client.generate_fill_reports(command).await {
@@ -409,7 +413,13 @@ pub(crate) async fn collect_targeted_order_reports(
         let fill_query = result
             .report
             .as_ref()
-            .filter(|report| terminal_report_has_missing_fills(report, query.filled_qty))
+            .filter(|report| {
+                terminal_report_has_missing_fills(report, query.filled_qty)
+                    && !clients.iter().any(|client| {
+                        Some(client.client_id()) == result.client_id
+                            && client.requires_order_query_fills(report.instrument_id)
+                    })
+            })
             .map(|report| (targeted_fill_command(&query, report), report.clone()));
         let client_id = result.client_id;
         let result_index = results.borrow().len();
@@ -1072,6 +1082,7 @@ pub(super) mod tests {
             fills: Vec<FillReport>,
             state: CollectionState,
             worker: bool,
+            native_fills: bool,
             release_at: usize,
             release: Arc<tokio::sync::Notify>,
         }
@@ -1133,6 +1144,10 @@ pub(super) mod tests {
 
         #[async_trait::async_trait(?Send)]
         impl ExecutionClient for CollectionClient {
+            fn requires_order_query_fills(&self, _instrument_id: InstrumentId) -> bool {
+                self.native_fills
+            }
+
             fn is_connected(&self) -> bool {
                 true
             }
@@ -1276,6 +1291,7 @@ pub(super) mod tests {
                 fills: vec![fill()],
                 state: state.clone(),
                 worker,
+                native_fills: false,
                 release_at,
                 release: Arc::new(tokio::sync::Notify::new()),
             }
@@ -1384,6 +1400,57 @@ pub(super) mod tests {
                 assert_eq!(cmd.causation_id, None);
                 assert_eq!(cmd.log_receipt_level, LogLevel::Debug);
             }
+        }
+
+        #[rstest]
+        #[case::direct(false, false)]
+        #[case::inline(true, false)]
+        #[case::worker(true, true)]
+        #[cfg_attr(
+            not(all(feature = "simulation", madsim)),
+            tokio::test(start_paused = true)
+        )]
+        #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+        async fn test_targeted_reports_preserve_native_fill_recovery(
+            #[case] deferred: bool,
+            #[case] worker: bool,
+            #[values(false, true)] native_fills: bool,
+        ) {
+            let state = CollectionState::default();
+            let mut c = client(&state, worker, 0);
+            c.native_fills = native_fills;
+
+            let results = if deferred {
+                let results = Rc::new(RefCell::new(Vec::new()));
+                assert!(
+                    collect_targeted_order_reports(
+                        vec![query()],
+                        vec![LiveExecutionClient::new(Box::new(c))],
+                        Duration::ZERO,
+                        dst::time::Instant::now() + Duration::from_secs(1),
+                        results.clone(),
+                    )
+                    .await
+                );
+                Rc::try_unwrap(results).unwrap().into_inner()
+            } else {
+                request_targeted_order_reports(vec![query()], &[&c], Duration::ZERO).await
+            };
+
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].report, Some(report()));
+            assert!(results[0].coverage_complete);
+            assert_eq!(state.status_finished.get(), 1);
+            assert_eq!(state.commands.borrow().len(), usize::from(!native_fills));
+            assert_eq!(state.fill_finished.get(), usize::from(!native_fills));
+            assert_eq!(
+                results[0].fills,
+                if native_fills {
+                    Vec::new()
+                } else {
+                    vec![fill()]
+                }
+            );
         }
 
         #[rstest]

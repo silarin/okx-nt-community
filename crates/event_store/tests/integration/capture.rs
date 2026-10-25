@@ -25,7 +25,10 @@ use std::{any::Any, cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 use bytes::Bytes;
 use indexmap::IndexMap;
 use nautilus_common::{
+    cache::Cache,
+    clock::VirtualClock,
     messages::{
+        ExecutionReport,
         data::{DataResponse, DataResponseEnvelope, QuotesResponse},
         execution::{SubmitOrder, TradingCommand},
     },
@@ -37,22 +40,29 @@ use nautilus_common::{
 use nautilus_core::{UUID4, UnixNanos, time::get_atomic_clock_static};
 use nautilus_event_store::{
     AppendEntry, BusCaptureAdapter, EncoderRegistry, EntryDraft, EventStore, EventStoreEntry,
-    EventStoreError, EventStoreWriter, HaltCallback, Headers, IndexKind, MemoryBackend,
-    RegisteredComponents, RunManifest, RunStatus, ScanDirection, Topic, WriterConfig,
-    default_registry, noop_halt,
+    EventStoreError, EventStoreReader, EventStoreWriter, HaltCallback, Headers, IndexKind,
+    MemoryBackend, RegisteredComponents, RunManifest, RunStatus, ScanDirection, SnapshotAnchor,
+    Topic, WriterConfig, default_registry, noop_halt, restore_cache_snapshot_and_replay_tail,
 };
+use nautilus_execution::{engine::ExecutionEngine, reconciliation::RECONCILIATION_ORDER_TAG};
 use nautilus_model::{
-    enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce},
+    accounts::CashAccount,
+    enums::{
+        AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, PositionSide,
+        TimeInForce,
+    },
     events::{
-        OrderEventAny, OrderFilled,
+        AccountState, OrderEventAny, OrderFilled,
         order::spec::{OrderFilledSpec, OrderInitializedSpec},
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId,
         TraderId, VenueOrderId,
     },
+    instruments::{Instrument, InstrumentAny, stubs::audusd_sim},
+    orders::{Order, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
-    types::{Currency, Money, Price, Quantity},
+    types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use parking_lot::Mutex;
 use rstest::rstest;
@@ -68,7 +78,7 @@ fn manifest(run_id: &str) -> RunManifest {
         binary_hash: "deadbeef".to_string(),
         schema_version: 1,
         crate_versions: "feedface".to_string(),
-        feature_flags: Vec::new(),
+        feature_flags: vec!["order-capture=committed-routes-cumulative-fees-v2".to_string()],
         adapter_versions: IndexMap::new(),
         config_hash: "cafebabe".to_string(),
         registered_components: RegisteredComponents::default(),
@@ -336,10 +346,9 @@ fn end_to_end_capture_writes_command_event_and_report() {
 }
 
 #[rstest]
-fn capture_dedups_order_event_across_dispatch_hops() {
-    // The execution engine sends the same OrderEventAny to the portfolio endpoint and
-    // publishes it on the strategy topic; both boundaries reach the tap. The log must
-    // record the event once or tail replay aborts on OrderError::DuplicateFill.
+fn capture_preserves_order_routes_and_dedups_same_route() {
+    // Ingress and committed publication must both survive capture: replay applies
+    // only the latter, which may carry a newly assigned position ID.
     let (writer, backend_arc) = writer_with_open_run("run-capture-dedup", noop_halt());
     let registry = Arc::new(default_registry());
     let adapter = BusCaptureAdapter::new(Arc::clone(&writer), registry, noop_halt());
@@ -368,7 +377,18 @@ fn capture_dedups_order_event_across_dispatch_hops() {
         .expect("second capture");
 
     assert!(first, "first dispatch hop must capture");
-    assert!(!second, "second dispatch hop must dedup on event identity");
+    assert!(second, "committed publication must survive prior ingress");
+    assert!(
+        !adapter
+            .capture::<OrderEventAny>(
+                Topic::from("events.order.S-001"),
+                &event,
+                Headers::empty(),
+                UnixNanos::from(11),
+            )
+            .unwrap(),
+        "repeated publication on the same route is deduplicated"
+    );
 
     // A distinct event still captures.
     let other_fill = make_order_filled(
@@ -385,18 +405,20 @@ fn capture_dedups_order_event_across_dispatch_hops() {
         .expect("third capture");
     assert!(captured_other, "distinct event identity must capture");
 
-    drain(&writer, 2);
+    drain(&writer, 3);
 
     let backend = backend_arc.lock();
-    assert_eq!(backend.high_watermark().expect("hwm"), 2);
+    assert_eq!(backend.high_watermark().expect("hwm"), 3);
 
     let entry = backend.scan_seq(1).expect("scan").expect("present");
     assert_eq!(entry.payload_type.as_str(), "OrderFilled");
     assert_eq!(
         entry.topic.as_ref(),
         "Portfolio.update_order",
-        "first dispatch hop wins the captured topic"
+        "ingress remains available as forensic evidence"
     );
+    let committed = backend.scan_seq(2).expect("scan").expect("present");
+    assert_eq!(committed.topic.as_ref(), "events.order.S-001");
 }
 
 #[rstest]
@@ -832,4 +854,423 @@ fn tap_path_writes_headers_from_data_response_correlation_handler() {
     drop(adapter);
     let writer = Arc::try_unwrap(writer).expect("sole writer reference");
     let _ = writer.close(run_ended_draft()).expect("close writer");
+}
+
+#[rstest]
+fn order_only_historical_fill_preserves_captured_position_projection(
+    #[values(0, 1, 2)] anchor_stage: u8,
+) {
+    let _bus = MessageBus::new(TraderId::from("TRADER-001"), UUID4::new(), None, None)
+        .register_message_bus();
+    let (writer, backend_arc) = writer_with_open_run("order-only-fill", noop_halt());
+    let submitted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let adapter = Arc::new(
+        BusCaptureAdapter::new(
+            Arc::clone(&writer),
+            Arc::new(default_registry()),
+            noop_halt(),
+        )
+        .with_submit_counter(Arc::clone(&submitted)),
+    );
+    msgbus::set_bus_tap(Rc::new(AdapterTap {
+        adapter: Arc::clone(&adapter),
+    }));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let mut engine = ExecutionEngine::new(
+        Rc::new(RefCell::new(VirtualClock::new())),
+        Rc::clone(&cache),
+        None,
+    );
+    let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+    let account_id = AccountId::from("SIM-001");
+    let account = CashAccount::new(
+        AccountState::new(
+            account_id,
+            AccountType::Cash,
+            vec![AccountBalance::new(
+                Money::from("1000000 USD"),
+                Money::from("0 USD"),
+                Money::from("1000000 USD"),
+            )],
+            vec![],
+            true,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            Some(Currency::USD()),
+        ),
+        true,
+        false,
+    );
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    cache.borrow_mut().add_account(account.into()).unwrap();
+    engine.register_oms_type(StrategyId::external(), OmsType::Netting);
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .trader_id(TraderId::from("TRADER-001"))
+        .strategy_id(StrategyId::external())
+        .instrument_id(instrument.id())
+        .client_order_id(ClientOrderId::from("O-SNAPSHOT"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100_000))
+        .tags(vec![Ustr::from(RECONCILIATION_ORDER_TAG)])
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, true)
+        .unwrap();
+    msgbus::publish_any(
+        msgbus::switchboard::get_event_order_topic(order.strategy_id()),
+        order.events()[0],
+    );
+    engine.process(&TestOrderEventStubs::submitted(&order, account_id));
+    engine.process(&TestOrderEventStubs::accepted(
+        &order,
+        account_id,
+        VenueOrderId::from("V-SNAPSHOT"),
+    ));
+    let opening = OrderFilledSpec::builder()
+        .trader_id(order.trader_id())
+        .strategy_id(order.strategy_id())
+        .instrument_id(instrument.id())
+        .client_order_id(order.client_order_id())
+        .venue_order_id(VenueOrderId::from("V-SNAPSHOT"))
+        .account_id(account_id)
+        .trade_id(TradeId::from("T-SNAPSHOT"))
+        .order_side(OrderSide::Buy)
+        .order_type(OrderType::Market)
+        .last_qty(Quantity::from(100_000))
+        .last_px(Price::from("1.00000"))
+        .currency(Currency::USD())
+        .commission(Money::from("0 USD"))
+        .liquidity_side(LiquiditySide::Taker)
+        .ts_event(UnixNanos::from(9_000_000))
+        .build();
+    engine.process(&OrderEventAny::Filled(opening));
+    let before_orders = cache
+        .borrow()
+        .orders(None, None, None, None, None)
+        .into_iter()
+        .map(|order| order.clone())
+        .collect::<Vec<_>>();
+    let before_position = cache.borrow().positions(None, None, None, None, None)[0].clone();
+    assert_eq!(before_position.quantity, Quantity::from(100_000));
+    let before_seq = submitted.load(std::sync::atomic::Ordering::Relaxed);
+    let history = FillReport::new(
+        account_id,
+        instrument.id(),
+        VenueOrderId::from("V-HISTORY"),
+        TradeId::from("T-HISTORY"),
+        OrderSide::Buy,
+        Quantity::from(100_000),
+        Price::from("1.00000"),
+        Money::from("0.012345678 USD"),
+        LiquiditySide::Taker,
+        None,
+        None,
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    );
+    let report = OrderStatusReport::new(
+        account_id,
+        instrument.id(),
+        None,
+        history.venue_order_id,
+        Some(OrderSide::Buy),
+        OrderType::Limit,
+        TimeInForce::Gtc,
+        OrderStatus::Filled,
+        history.last_qty,
+        history.last_qty,
+        history.ts_event,
+        history.ts_event,
+        history.ts_event,
+        None,
+    )
+    .with_price(history.last_px);
+    engine.reconcile_execution_report(&ExecutionReport::OrderQueryWithFills(
+        Box::new(report),
+        vec![history],
+    ));
+    let final_orders = cache
+        .borrow()
+        .orders(None, None, None, None, None)
+        .into_iter()
+        .map(|order| order.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(final_orders.len(), 2);
+    let final_position = cache.borrow().positions(None, None, None, None, None)[0].clone();
+    assert_eq!(final_position, before_position);
+    let historical_id = *cache
+        .borrow()
+        .client_order_id(&VenueOrderId::from("V-HISTORY"))
+        .unwrap();
+    assert_eq!(
+        cache.borrow().order(&historical_id).unwrap().filled_qty(),
+        Quantity::from(100_000)
+    );
+    assert!(
+        !final_position
+            .trade_ids
+            .contains(&TradeId::from("T-HISTORY"))
+    );
+    let after_seq = submitted.load(std::sync::atomic::Ordering::Relaxed);
+    drain(&writer, after_seq);
+
+    if anchor_stage > 0 {
+        backend_arc
+            .lock()
+            .record_snapshot_anchor(SnapshotAnchor::new(
+                if anchor_stage == 1 {
+                    before_seq
+                } else {
+                    after_seq
+                },
+                "cache://fixture",
+                "fixture",
+            ))
+            .unwrap();
+    }
+    msgbus::clear_bus_tap();
+    drop(adapter);
+    Arc::try_unwrap(writer)
+        .unwrap()
+        .close(run_ended_draft())
+        .unwrap();
+    let backend = Arc::try_unwrap(backend_arc).unwrap().into_inner();
+    let entries = backend
+        .scan_range(1, after_seq, ScanDirection::Forward)
+        .unwrap();
+    let marker = entries
+        .iter()
+        .find(|entry| {
+            entry
+                .topic
+                .as_ref()
+                .starts_with("events.order_fill_order_only.")
+        })
+        .unwrap();
+    let marked: OrderFilled = rmp_serde::from_slice(&marker.payload).unwrap();
+    assert_eq!(marked.trade_id, TradeId::from("T-HISTORY"));
+    assert_eq!(marked.commission, Some(Money::from("0.012345678 USD")));
+    let committed = entries
+        .iter()
+        .find(|entry| {
+            entry.topic.as_ref() == "events.order.EXTERNAL"
+                && entry.payload_type.as_str() == "OrderFilled"
+                && entry.seq > marker.seq
+        })
+        .unwrap();
+    assert_eq!(
+        rmp_serde::from_slice::<OrderFilled>(&committed.payload).unwrap(),
+        marked
+    );
+    let mut restored = Cache::default();
+    restored.add_instrument(instrument).unwrap();
+    let reader = EventStoreReader::new(backend);
+    restore_cache_snapshot_and_replay_tail(&mut restored, &reader, |cache, anchor| {
+        if anchor.is_some() {
+            let orders = if anchor_stage == 1 {
+                &before_orders
+            } else {
+                &final_orders
+            };
+
+            for order in orders {
+                cache
+                    .add_order(order.clone(), order.position_id(), None, false)
+                    .unwrap();
+            }
+            cache
+                .add_position(&before_position, OmsType::Netting)
+                .unwrap();
+        }
+        Ok(())
+    })
+    .unwrap();
+    let positions = restored.positions(None, None, None, None, None);
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].quantity, final_position.quantity);
+    assert_eq!(positions[0].commissions(), final_position.commissions());
+    assert_eq!(positions[0].realized_pnl, final_position.realized_pnl);
+    assert_eq!(positions[0].trade_ids, final_position.trade_ids);
+    assert_eq!(
+        restored.order(&historical_id).unwrap().events(),
+        cache.borrow().order(&historical_id).unwrap().events()
+    );
+}
+
+#[rstest]
+#[case("0.006", "0.0054", "0.0006")]
+#[case("-0.006", "-0.0054", "-0.0006")]
+fn position_flip_preserves_exact_fees_through_engine_capture_and_replay(
+    #[case] total: &str,
+    #[case] closing_fee: &str,
+    #[case] opening_fee: &str,
+    #[values(false, true)] snapshot_before_flip: bool,
+) {
+    let exact =
+        |value: &str| Money::from_decimal_exact(value.parse().unwrap(), Currency::USD()).unwrap();
+    let (total, closing_fee, opening_fee) = (exact(total), exact(closing_fee), exact(opening_fee));
+    let _bus = MessageBus::new(TraderId::from("TRADER-001"), UUID4::new(), None, None)
+        .register_message_bus();
+    let (writer, backend_arc) = writer_with_open_run("exact-flip-fees", noop_halt());
+    let submitted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let adapter = Arc::new(
+        BusCaptureAdapter::new(
+            Arc::clone(&writer),
+            Arc::new(default_registry()),
+            noop_halt(),
+        )
+        .with_submit_counter(Arc::clone(&submitted)),
+    );
+    msgbus::set_bus_tap(Rc::new(AdapterTap {
+        adapter: Arc::clone(&adapter),
+    }));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let mut engine = ExecutionEngine::new(
+        Rc::new(RefCell::new(VirtualClock::new())),
+        Rc::clone(&cache),
+        None,
+    );
+    let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_account(CashAccount::default().into())
+        .unwrap();
+    let strategy_id = StrategyId::external();
+    engine.register_oms_type(strategy_id, OmsType::Netting);
+    let account_id = AccountId::from("SIM-001");
+    let position_id = PositionId::new(format!("{}-{strategy_id}", instrument.id()));
+    let mut snapshot_orders = Vec::new();
+    let mut snapshot_position = None;
+    let mut anchor_seq = 0;
+
+    for (id, side, quantity, commission) in [
+        ("ENTRY", OrderSide::Sell, 180_000, Money::from("0 USD")),
+        ("FLIP", OrderSide::Buy, 200_000, total),
+    ] {
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(TraderId::from("TRADER-001"))
+            .strategy_id(strategy_id)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::new(id))
+            .side(side)
+            .quantity(Quantity::from(quantity))
+            .tags(vec![Ustr::from(RECONCILIATION_ORDER_TAG)])
+            .build();
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, true)
+            .unwrap();
+        msgbus::publish_any(
+            msgbus::switchboard::get_event_order_topic(strategy_id),
+            order.events()[0],
+        );
+        engine.process(&TestOrderEventStubs::submitted(&order, account_id));
+        engine.process(&TestOrderEventStubs::accepted(
+            &order,
+            account_id,
+            VenueOrderId::new(id),
+        ));
+        let fill = OrderFilledSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(strategy_id)
+            .instrument_id(instrument.id())
+            .client_order_id(order.client_order_id())
+            .venue_order_id(VenueOrderId::new(id))
+            .account_id(account_id)
+            .trade_id(TradeId::new(id))
+            .order_side(side)
+            .order_type(OrderType::Market)
+            .last_qty(order.quantity())
+            .last_px(Price::from("1.00000"))
+            .currency(Currency::USD())
+            .commission(commission)
+            .liquidity_side(LiquiditySide::Taker)
+            .ts_event(UnixNanos::from(if id == "ENTRY" { 1 } else { 2 }))
+            .build();
+        engine.process(&OrderEventAny::Filled(fill.clone()));
+        let before = cache.borrow().position(&position_id).unwrap().clone();
+        engine.process(&OrderEventAny::Filled(fill));
+        assert_eq!(cache.borrow().position(&position_id).unwrap(), &before);
+        if id == "ENTRY" {
+            snapshot_orders = cache
+                .borrow()
+                .orders(None, None, None, None, None)
+                .into_iter()
+                .map(|order| order.clone())
+                .collect();
+            snapshot_position = Some(before);
+            anchor_seq = submitted.load(std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let position = cache.borrow().position(&position_id).unwrap().clone();
+    let closed = cache.borrow().position_snapshots(Some(&position_id), None);
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0].commissions(), vec![closing_fee]);
+    assert_eq!(closed[0].realized_pnl, Some(-closing_fee));
+    assert_eq!(position.commissions(), vec![opening_fee]);
+    assert_eq!(position.realized_pnl, Some(-opening_fee));
+    assert_eq!(position.quantity, Quantity::from(20_000));
+    assert_eq!(position.side, PositionSide::Long);
+    let last_seq = submitted.load(std::sync::atomic::Ordering::Relaxed);
+    drain(&writer, last_seq);
+
+    if snapshot_before_flip {
+        backend_arc
+            .lock()
+            .record_snapshot_anchor(SnapshotAnchor::new(anchor_seq, "cache://flip", "fixture"))
+            .unwrap();
+    }
+    msgbus::clear_bus_tap();
+    drop(adapter);
+    Arc::try_unwrap(writer)
+        .unwrap()
+        .close(run_ended_draft())
+        .unwrap();
+    let reader = EventStoreReader::new(Arc::try_unwrap(backend_arc).unwrap().into_inner());
+    let mut restored = Cache::default();
+    restored.add_instrument(instrument).unwrap();
+    restore_cache_snapshot_and_replay_tail(&mut restored, &reader, |cache, anchor| {
+        assert_eq!(anchor.is_some(), snapshot_before_flip);
+        if snapshot_before_flip {
+            for order in &snapshot_orders {
+                cache
+                    .add_order(order.clone(), order.position_id(), None, false)
+                    .unwrap();
+            }
+            cache
+                .add_position(snapshot_position.as_ref().unwrap(), OmsType::Netting)
+                .unwrap();
+        }
+        Ok(())
+    })
+    .unwrap();
+    let restored_position = restored.position(&position_id).unwrap();
+    assert_eq!(restored_position.commissions(), position.commissions());
+    assert_eq!(restored_position.realized_pnl, position.realized_pnl);
+    assert_eq!(restored_position.quantity, position.quantity);
+    let restored_closed = restored.position_snapshots(Some(&position_id), None);
+    assert_eq!(restored_closed.len(), 1);
+    assert_eq!(restored_closed[0].commissions(), closed[0].commissions());
+    assert_eq!(restored_closed[0].realized_pnl, closed[0].realized_pnl);
+    assert_eq!(
+        restored
+            .order(&ClientOrderId::from("FLIP"))
+            .unwrap()
+            .events(),
+        cache
+            .borrow()
+            .order(&ClientOrderId::from("FLIP"))
+            .unwrap()
+            .events()
+    );
 }
