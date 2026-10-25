@@ -309,11 +309,12 @@ impl OKXExecutionClient {
         &self,
         cmd: &GenerateOrderStatusReports,
         require_complete_active_coverage: bool,
+        max_history_pages: Option<u32>,
     ) -> anyhow::Result<OrderReportSweep> {
         let mut client = self.report_client();
         client.evidence_emitter = require_complete_active_coverage.then(|| self.emitter.clone());
         let sweep = client
-            .collect_order_status_reports(cmd, require_complete_active_coverage)
+            .collect_order_status_reports(cmd, require_complete_active_coverage, max_history_pages)
             .await?;
         Ok(finish_order_report_sweep(&self.core, sweep, cmd))
     }
@@ -323,10 +324,13 @@ impl OKXExecutionClient {
         cmd: GenerateFillReports,
         history: FillHistory,
         retain_observations: bool,
+        max_history_pages: Option<u32>,
     ) -> anyhow::Result<(Vec<FillReport>, bool)> {
         let mut client = self.report_client();
         client.evidence_emitter = retain_observations.then(|| self.emitter.clone());
-        client.collect_fill_reports(cmd, history).await
+        client
+            .collect_fill_reports(cmd, history, max_history_pages)
+            .await
     }
 
     async fn collect_position_status_reports(
@@ -2046,7 +2050,7 @@ impl ExecutionClient for OKXExecutionClient {
         Some(ExecutionReportTask::new(
             async move {
                 let mut sweep = client
-                    .collect_order_status_reports(&collection_command, false)
+                    .collect_order_status_reports(&collection_command, false, None)
                     .await?;
                 sweep.regular_by_venue_order_id = AHashMap::new();
                 sweep.ambiguous_triggered_child_ids = AHashSet::new();
@@ -2065,7 +2069,7 @@ impl ExecutionClient for OKXExecutionClient {
         Some(ExecutionReportTask::new(
             async move {
                 client
-                    .collect_fill_reports(command, FillHistory::Recent)
+                    .collect_fill_reports(command, FillHistory::Recent, None)
                     .await
             },
             |(reports, _)| Ok(reports),
@@ -2097,7 +2101,10 @@ impl ExecutionClient for OKXExecutionClient {
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        Ok(self.collect_order_status_reports(cmd, false).await?.reports)
+        Ok(self
+            .collect_order_status_reports(cmd, false, None)
+            .await?
+            .reports)
     }
 
     async fn generate_fill_reports(
@@ -2105,7 +2112,7 @@ impl ExecutionClient for OKXExecutionClient {
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
         Ok(self
-            .collect_fill_reports(cmd, FillHistory::Recent, false)
+            .collect_fill_reports(cmd, FillHistory::Recent, false, None)
             .await?
             .0)
     }
@@ -2160,8 +2167,17 @@ impl ExecutionClient for OKXExecutionClient {
             (mut fill_reports, mut fills_complete),
             (mut position_reports, positions_complete),
         ) = tokio::try_join!(
-            self.collect_order_status_reports(&order_cmd, true),
-            self.collect_fill_reports(fill_cmd, fill_history, true),
+            self.collect_order_status_reports(
+                &order_cmd,
+                true,
+                self.config.max_reconciliation_history_pages,
+            ),
+            self.collect_fill_reports(
+                fill_cmd,
+                fill_history,
+                true,
+                self.config.max_reconciliation_history_pages,
+            ),
             self.collect_position_status_reports(&position_cmd),
         )?;
         let OrderReportSweep {
@@ -2833,6 +2849,7 @@ async fn request_order_query_fills(
                 None,
                 history,
                 None,
+                None,
                 Some(&observe_fill),
             )
             .await?;
@@ -3308,6 +3325,7 @@ impl OKXReportClient {
         &self,
         cmd: &GenerateOrderStatusReports,
         require_complete_active_coverage: bool,
+        max_history_pages: Option<u32>,
     ) -> anyhow::Result<OrderReportSweep> {
         let instrument_types = Self::instrument_types(&self.instrument_types);
         let routing_types = order_routing_instrument_types(&instrument_types);
@@ -3342,6 +3360,7 @@ impl OKXReportClient {
                     cmd.open_only,
                     None,
                     Some(scope),
+                    max_history_pages,
                     Some(&observe_order),
                 )
                 .await?;
@@ -3374,6 +3393,7 @@ impl OKXReportClient {
                         start,
                         end,
                         require_complete_active_coverage,
+                        max_history_pages,
                         Some(&observe_order),
                     )
                     .await
@@ -3415,6 +3435,7 @@ impl OKXReportClient {
                         cmd.open_only,
                         None,
                         Some(scope),
+                        max_history_pages,
                         Some(&observe_order),
                     )
                     .await?;
@@ -3443,6 +3464,7 @@ impl OKXReportClient {
                             start,
                             end,
                             require_complete_active_coverage,
+                            max_history_pages,
                             Some(&observe_order),
                         )
                         .await
@@ -3486,6 +3508,7 @@ impl OKXReportClient {
                     cmd.open_only,
                     None,
                     Some(scope),
+                    max_history_pages,
                     Some(&observe_order),
                 )
                 .await
@@ -3531,6 +3554,7 @@ impl OKXReportClient {
         &self,
         cmd: GenerateFillReports,
         history: FillHistory,
+        max_history_pages: Option<u32>,
     ) -> anyhow::Result<(Vec<FillReport>, bool)> {
         let instrument_types = Self::instrument_types(&self.instrument_types);
         let routing_types = order_routing_instrument_types(&instrument_types);
@@ -3560,6 +3584,7 @@ impl OKXReportClient {
                     None,
                     history,
                     Some(scope),
+                    max_history_pages,
                     Some(&observe_fill),
                 )
                 .await?;
@@ -3579,6 +3604,7 @@ impl OKXReportClient {
                         None,
                         history,
                         Some(scope),
+                        max_history_pages,
                         Some(&observe_fill),
                     )
                     .await?;
@@ -3599,6 +3625,7 @@ impl OKXReportClient {
                         None,
                         history,
                         Some(scope),
+                        max_history_pages,
                         Some(&observe_fill),
                     )
                     .await?;

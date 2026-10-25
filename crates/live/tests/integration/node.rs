@@ -359,6 +359,8 @@ pub(crate) mod serial_tests {
     #[cfg(not(madsim))]
     mod reconciliation_bench;
 
+    mod report_acceptance;
+
     #[derive(Clone, Debug, Default)]
     struct StartupMassStatusClientState {
         connected: Arc<AtomicBool>,
@@ -1095,11 +1097,21 @@ pub(crate) mod serial_tests {
         bulk_order_report_requested: Arc<AtomicBool>,
         bulk_order_report_count: Arc<AtomicUsize>,
         fill_report_count: Arc<AtomicUsize>,
+        fill_report_finish_ns: Arc<AtomicU64>,
+        fill_report_finalizations: Arc<AtomicUsize>,
+        fill_report_finish_busy_ns: Arc<AtomicU64>,
+        fill_reports_finalized: Arc<Mutex<Vec<TradeId>>>,
         targeted_order_report_ids: Arc<Mutex<Vec<ClientOrderId>>>,
+        targeted_order_reports_finalized: Arc<Mutex<Vec<ClientOrderId>>>,
+        fill_report_error: Arc<AtomicBool>,
         position_report_requested: Arc<AtomicBool>,
         position_report_count: Arc<AtomicUsize>,
+        position_reports_finalized: Arc<AtomicUsize>,
         instrument_received: Arc<AtomicBool>,
         report_response_returned: Arc<AtomicBool>,
+        order_report_finish_ns: Arc<AtomicU64>,
+        order_report_finish_busy_ns: Arc<AtomicU64>,
+        order_reports_finalized: Arc<Mutex<Vec<ClientOrderId>>>,
     }
 
     struct BlockingReportExecutionClient {
@@ -1436,32 +1448,33 @@ pub(crate) mod serial_tests {
             (task.finish)()
         }
 
+        fn generate_order_status_report_task(
+            &self,
+            cmd: &GenerateOrderStatusReport,
+        ) -> Option<ExecutionReportTask<Option<OrderStatusReport>>> {
+            self.state
+                .report_worker
+                .load(Ordering::Relaxed)
+                .then(|| self.targeted_order_report_task(cmd))
+        }
+
         async fn generate_order_status_report(
             &self,
             cmd: &GenerateOrderStatusReport,
         ) -> anyhow::Result<Option<OrderStatusReport>> {
-            let client_order_id = cmd
-                .client_order_id
-                .expect("targeted report command must carry a client order ID");
+            let task = self.targeted_order_report_task(cmd);
+            task.collection.await;
+            (task.finish)()
+        }
 
-            let request_count = {
-                let mut ids = self.state.targeted_order_report_ids.lock();
-                ids.push(client_order_id);
-                ids.len()
-            };
-
-            if self.block_every_second_targeted_report && request_count.is_multiple_of(2) {
-                return std::future::pending::<anyhow::Result<Option<OrderStatusReport>>>().await;
-            }
-
-            if let Some(release) = &self.targeted_report_release {
-                release.notified().await;
-            }
-
+        fn generate_fill_reports_task(
+            &self,
+            cmd: &GenerateFillReports,
+        ) -> Option<ExecutionReportTask<Vec<FillReport>>> {
             self.state
-                .report_response_returned
-                .store(true, Ordering::Relaxed);
-            Ok(self.targeted_order_report.clone())
+                .report_worker
+                .load(Ordering::Relaxed)
+                .then(|| self.fill_report_task(cmd))
         }
 
         async fn generate_fill_reports(
@@ -1502,42 +1515,23 @@ pub(crate) mod serial_tests {
             Ok(reports)
         }
 
+        fn generate_position_status_reports_task(
+            &self,
+            _cmd: &GeneratePositionStatusReports,
+        ) -> Option<ExecutionReportTask<Vec<PositionStatusReport>>> {
+            self.state
+                .report_worker
+                .load(Ordering::Relaxed)
+                .then(|| self.position_report_task())
+        }
+
         async fn generate_position_status_reports(
             &self,
             _cmd: &GeneratePositionStatusReports,
         ) -> anyhow::Result<Vec<PositionStatusReport>> {
-            self.state
-                .position_report_requested
-                .store(true, Ordering::Relaxed);
-            let request_count = self
-                .state
-                .position_report_count
-                .fetch_add(1, Ordering::Relaxed)
-                + 1;
-
-            if let Some(release) = &self.report_release
-                && (!self.report_release_once || request_count == 1)
-            {
-                release.notified().await;
-            }
-
-            if self.position_reports_complete {
-                if self.state.report_cpu_ns.load(Ordering::Relaxed) != 0 {
-                    Self::run_report_cpu(&self.state, request_count);
-                }
-
-                self.state
-                    .report_response_returned
-                    .store(true, Ordering::Relaxed);
-                Ok(self.position_reports.clone())
-            } else if self.report_release.is_some() {
-                self.state
-                    .report_response_returned
-                    .store(true, Ordering::Relaxed);
-                Ok(Vec::new())
-            } else {
-                std::future::pending::<anyhow::Result<Vec<PositionStatusReport>>>().await
-            }
+            let task = self.position_report_task();
+            task.collection.await;
+            (task.finish)()
         }
     }
 
@@ -1549,6 +1543,7 @@ pub(crate) mod serial_tests {
             let report_release_once = self.report_release_once;
             let order_reports_complete = self.order_reports_complete;
             let order_reports = self.order_reports.clone();
+            let finish_state = self.state.clone();
 
             ExecutionReportTask::new(
                 async move {
@@ -1589,7 +1584,198 @@ pub(crate) mod serial_tests {
                         std::future::pending::<anyhow::Result<Vec<OrderStatusReport>>>().await
                     }
                 },
-                Ok,
+                move |reports| {
+                    let started = std::time::Instant::now();
+                    let delay = Duration::from_nanos(
+                        finish_state.order_report_finish_ns.load(Ordering::Relaxed),
+                    );
+                    #[cfg(all(feature = "simulation", madsim))]
+                    madsim::time::advance(delay);
+                    #[cfg(not(all(feature = "simulation", madsim)))]
+                    std::thread::sleep(delay);
+                    finish_state
+                        .order_reports_finalized
+                        .lock()
+                        .extend(reports.iter().filter_map(|report| report.client_order_id));
+                    finish_state
+                        .order_report_finish_busy_ns
+                        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    Ok(reports)
+                },
+            )
+        }
+
+        fn targeted_order_report_task(
+            &self,
+            cmd: &GenerateOrderStatusReport,
+        ) -> ExecutionReportTask<Option<OrderStatusReport>> {
+            let client_order_id = cmd
+                .client_order_id
+                .expect("targeted command carries order ID");
+            let state = self.state.clone();
+            let finish_state = self.state.clone();
+            let release = self.targeted_report_release.clone();
+            let report = self.targeted_order_report.clone();
+            let block_every_second = self.block_every_second_targeted_report;
+
+            ExecutionReportTask::new(
+                async move {
+                    let _guard = ReportCollectionGuard::new(state.clone());
+                    *state.report_thread.lock() = Some(std::thread::current().id());
+
+                    let request_count = {
+                        let mut ids = state.targeted_order_report_ids.lock();
+                        ids.push(client_order_id);
+                        ids.len()
+                    };
+
+                    if state.report_cpu_ns.load(Ordering::Relaxed) != 0 {
+                        Self::run_report_cpu(&state, request_count);
+                    }
+
+                    if block_every_second && request_count.is_multiple_of(2) {
+                        return std::future::pending::<anyhow::Result<Option<OrderStatusReport>>>()
+                            .await;
+                    }
+
+                    if let Some(release) = release {
+                        release.notified().await;
+                    }
+
+                    state
+                        .report_response_returned
+                        .store(true, Ordering::Relaxed);
+                    Ok(report)
+                },
+                move |report| {
+                    finish_state
+                        .targeted_order_reports_finalized
+                        .lock()
+                        .push(client_order_id);
+                    Ok(report)
+                },
+            )
+        }
+
+        fn fill_report_task(
+            &self,
+            cmd: &GenerateFillReports,
+        ) -> ExecutionReportTask<Vec<FillReport>> {
+            let cmd = cmd.clone();
+            let state = self.state.clone();
+            let finish_state = self.state.clone();
+            let release = self.fill_report_release.clone();
+            let responses = self.fill_report_responses.clone();
+            let at_window_end = self.fill_reports_at_window_end;
+
+            ExecutionReportTask::new(
+                async move {
+                    let _guard = ReportCollectionGuard::new(state.clone());
+                    *state.report_thread.lock() = Some(std::thread::current().id());
+                    let count = state.fill_report_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count == 1
+                        && let Some(release) = release
+                    {
+                        release.notified().await;
+                    }
+
+                    if state.fill_report_error.load(Ordering::Relaxed) {
+                        anyhow::bail!("fill query rejected");
+                    }
+
+                    let mut responses = responses.lock();
+                    let mut reports = if responses.len() > 1 {
+                        responses.pop_front().unwrap()
+                    } else {
+                        responses.front().cloned().unwrap_or_default()
+                    };
+
+                    if at_window_end {
+                        for report in &mut reports {
+                            report.ts_event = cmd.end.unwrap_or(cmd.ts_init);
+                            report.ts_init = report.ts_event;
+                        }
+                    }
+
+                    state
+                        .report_response_returned
+                        .store(true, Ordering::Relaxed);
+                    Ok(reports)
+                },
+                move |mut reports| {
+                    let started = std::time::Instant::now();
+                    let delay = Duration::from_nanos(
+                        finish_state.fill_report_finish_ns.load(Ordering::Relaxed),
+                    );
+                    #[cfg(all(feature = "simulation", madsim))]
+                    madsim::time::advance(delay);
+                    #[cfg(not(all(feature = "simulation", madsim)))]
+                    std::thread::sleep(delay);
+                    let mut finalized = finish_state.fill_reports_finalized.lock();
+                    reports.retain(|report| {
+                        if finalized.contains(&report.trade_id) {
+                            false
+                        } else {
+                            finalized.push(report.trade_id);
+                            true
+                        }
+                    });
+
+                    finish_state
+                        .fill_report_finalizations
+                        .fetch_add(1, Ordering::Relaxed);
+                    finish_state.fill_report_finish_busy_ns.fetch_add(
+                        u64::try_from(started.elapsed().as_nanos()).unwrap(),
+                        Ordering::Relaxed,
+                    );
+                    Ok(reports)
+                },
+            )
+        }
+
+        fn position_report_task(&self) -> ExecutionReportTask<Vec<PositionStatusReport>> {
+            let state = self.state.clone();
+            let finish_state = self.state.clone();
+            let release = self.report_release.clone();
+            let release_once = self.report_release_once;
+            let complete = self.position_reports_complete;
+            let reports = self.position_reports.clone();
+
+            ExecutionReportTask::new(
+                async move {
+                    let _guard = ReportCollectionGuard::new(state.clone());
+                    state
+                        .position_report_requested
+                        .store(true, Ordering::Relaxed);
+                    let count = state.position_report_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+                    if let Some(release) = &release
+                        && (!release_once || count == 1)
+                    {
+                        release.notified().await;
+                    }
+
+                    if complete {
+                        Self::run_report_cpu(&state, count);
+                        state
+                            .report_response_returned
+                            .store(true, Ordering::Relaxed);
+                        Ok(reports)
+                    } else if release.is_some() {
+                        state
+                            .report_response_returned
+                            .store(true, Ordering::Relaxed);
+                        Ok(Vec::new())
+                    } else {
+                        std::future::pending::<anyhow::Result<Vec<PositionStatusReport>>>().await
+                    }
+                },
+                move |reports| {
+                    finish_state
+                        .position_reports_finalized
+                        .fetch_add(1, Ordering::Relaxed);
+                    Ok(reports)
+                },
             )
         }
 
@@ -4819,9 +5005,14 @@ pub(crate) mod serial_tests {
     }
 
     #[rstest]
+    #[case::inline(false)]
+    #[case::worker(true)]
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn test_position_report_completed_during_shutdown_does_not_start_fill_report() {
+    async fn test_position_report_completed_during_shutdown_does_not_start_fill_report(
+        #[case] worker: bool,
+    ) {
         let state = BlockingReportClientState::default();
+        state.report_worker.store(worker, Ordering::Relaxed);
         let release = Arc::new(tokio::sync::Notify::new());
         let factory = BlockingReportExecutionClientFactory::configurable(
             ClientId::from("BLOCKING-REPORT"),
@@ -4867,12 +5058,20 @@ pub(crate) mod serial_tests {
 
         assert!(result.is_ok());
         assert_eq!(state.fill_report_count.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            state.position_reports_finalized.load(Ordering::Relaxed),
+            usize::from(!worker)
+        );
+        assert_eq!(state.report_collections_active.load(Ordering::Relaxed), 0);
     }
 
     #[rstest]
+    #[case::inline(false)]
+    #[case::worker(true)]
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn test_position_fill_report_completed_during_shutdown_is_applied() {
+    async fn test_position_fill_report_completed_during_shutdown_is_applied(#[case] worker: bool) {
         let state = BlockingReportClientState::default();
+        state.report_worker.store(worker, Ordering::Relaxed);
         let fill_release = Arc::new(tokio::sync::Notify::new());
         let client_order_id = ClientOrderId::from("O-SHUTDOWN-FILL");
         let venue_order_id = VenueOrderId::from("V-SHUTDOWN-FILL");
@@ -4941,6 +5140,17 @@ pub(crate) mod serial_tests {
         let order = cache.order(&client_order_id).unwrap();
         assert_eq!(order.status(), OrderStatus::PartiallyFilled);
         assert_eq!(order.filled_qty(), Quantity::from("1.0"));
+        assert!(matches!(order.last_event(), OrderEventAny::Filled(event)
+            if event.trade_id == TradeId::from("T-SHUTDOWN-FILL") && event.last_qty == Quantity::from("1.0")));
+        assert_eq!(
+            *state.fill_reports_finalized.lock(),
+            if worker {
+                vec![TradeId::from("T-SHUTDOWN-FILL")]
+            } else {
+                vec![]
+            }
+        );
+        assert_eq!(state.report_collections_active.load(Ordering::Relaxed), 0);
     }
 
     #[rstest]
