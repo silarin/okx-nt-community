@@ -35,7 +35,7 @@ use axum::{
         Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -48,7 +48,7 @@ use nautilus_common::{
         ExecutionEvent,
         execution::{
             BatchCancelOrders, CancelOrder, ExecutionReport as CommonExecutionReport, ModifyOrder,
-            OrderFeeOrigin, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+            QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
             report::{GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports},
         },
     },
@@ -327,24 +327,9 @@ async fn recv_query_order_report(
                     panic!("event stream closed before query order report");
                 };
 
-                match event {
-                    ExecutionEvent::Report(CommonExecutionReport::Order(report)) => {
-                        assert_eq!(report.client_order_id, expected_client_order_id);
-                        assert!(report.filled_qty.is_zero());
-                        return *report;
-                    }
-                    ExecutionEvent::Report(CommonExecutionReport::OrderQueryWithFills(report, fills)) => {
-                        assert_eq!(report.client_order_id, expected_client_order_id);
-
-                        if fills.is_empty() {
-                            continue;
-                        }
-                        assert_eq!(fills.len(), 1);
-                        assert_eq!(fills[0].venue_order_id, report.venue_order_id);
-                        assert_eq!(fills[0].last_qty, report.filled_qty);
-                        return *report;
-                    }
-                    _ => {}
+                if let ExecutionEvent::Report(CommonExecutionReport::Order(report)) = event {
+                    assert_eq!(report.client_order_id, expected_client_order_id);
+                    return *report;
                 }
             }
             () = tokio::time::sleep_until(deadline) => {
@@ -1526,8 +1511,6 @@ fn test_dispatch_tracked_algo_child_fill_with_empty_client_order_id(#[case] send
         live.trade_id.clear();
         live.fee = None;
         live.fill_fee = None;
-        live.fill_time = 0;
-        live.rebate = Some("0".to_string());
 
         dispatch_ws_message(
             OKXWsMessage::Orders(vec![live]),
@@ -1560,30 +1543,11 @@ fn test_dispatch_tracked_algo_child_fill_with_empty_client_order_id(#[case] send
         get_atomic_clock_realtime(),
     );
 
-    let mut events = drain_events(&mut rx);
-    let ExecutionEvent::Report(CommonExecutionReport::OrderFeeEvidence(fee)) = events.remove(0)
-    else {
-        panic!("Expected cumulative fee facts before execution delivery");
-    };
-    assert!(!fee.constraints.is_empty());
-    assert!(
-        fee.boundary_quantity
-            .is_some_and(|quantity| quantity.is_sign_positive() && !quantity.is_zero())
-    );
-
-    assert!(matches!(events.last().unwrap(),
-        ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
-        if fills.len() == 1 && fills[0].venue_order_id == report.venue_order_id
-            && fills[0].last_qty == report.filled_qty));
-    assert_eq!(events.len(), if send_live { 3 } else { 4 });
-    assert!(matches!(&events[0],
-        ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
-            if report.client_order_id == Some(client_order_id) && report.venue_order_id == venue_order_id
-                && report.filled_qty == Quantity::from("0.003") && fills.len() == 1));
-    let filled_index = 1 + usize::from(!send_live);
-
+    let events = drain_events(&mut rx);
+    assert_eq!(events.len(), if send_live { 1 } else { 2 });
+    let filled_index = usize::from(!send_live);
     if !send_live {
-        assert_venue_order_id_update(&events[1]);
+        assert_venue_order_id_update(&events[0]);
     }
 
     match &events[filled_index] {
@@ -1624,17 +1588,7 @@ fn test_dispatch_tracked_algo_child_fill_with_empty_client_order_id(#[case] send
         get_atomic_clock_realtime(),
     );
 
-    let mut duplicates = drain_events(&mut rx);
-    let ExecutionEvent::Report(CommonExecutionReport::OrderFeeEvidence(repeated_fee)) =
-        duplicates.remove(0)
-    else {
-        panic!("Expected retained duplicate cumulative facts");
-    };
-    assert!(fee.same_observation(&repeated_fee));
-    assert_eq!(duplicates.len(), 1);
-    assert!(
-        matches!(&duplicates[0], ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(_, fills)) if fills.len() == 1)
-    );
+    assert!(drain_events(&mut rx).is_empty());
 }
 
 #[rstest]
@@ -1670,26 +1624,9 @@ fn test_dispatch_untracked_algo_child_fill_with_empty_client_order_id_as_report(
         get_atomic_clock_realtime(),
     );
 
-    let mut events = drain_events(&mut rx);
-    let ExecutionEvent::Report(CommonExecutionReport::OrderFeeEvidence(fee)) = events.remove(0)
-    else {
-        panic!("Expected cumulative fee facts before execution delivery");
-    };
-    assert!(!fee.constraints.is_empty());
-    assert!(
-        fee.boundary_quantity
-            .is_some_and(|quantity| quantity.is_sign_positive() && !quantity.is_zero())
-    );
-
-    assert!(matches!(events.last().unwrap(),
-        ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
-        if fills.len() == 1 && fills[0].venue_order_id == report.venue_order_id
-            && fills[0].last_qty == report.filled_qty));
-    assert_eq!(events.len(), 3);
-    assert!(matches!(&events[0],
-        ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
-            if report.client_order_id == Some(client_order_id) && report.filled_qty.is_positive() && fills.len() == 1));
-    match &events[1] {
+    let events = drain_events(&mut rx);
+    assert_eq!(events.len(), 1);
+    match &events[0] {
         ExecutionEvent::Report(CommonExecutionReport::Fill(report)) => {
             assert_eq!(report.account_id, AccountId::from("OKX-001"));
             assert_eq!(report.instrument_id, instrument_id);
@@ -1795,26 +1732,9 @@ fn test_dispatch_venue_initiated_order_fill_as_report(#[case] case: VenueFillCas
         get_atomic_clock_realtime(),
     );
 
-    let mut events = drain_events(&mut rx);
-    let ExecutionEvent::Report(CommonExecutionReport::OrderFeeEvidence(fee)) = events.remove(0)
-    else {
-        panic!("Expected cumulative fee facts before execution delivery");
-    };
-    assert!(!fee.constraints.is_empty());
-    assert!(
-        fee.boundary_quantity
-            .is_some_and(|quantity| quantity.is_sign_positive() && !quantity.is_zero())
-    );
-
-    assert!(matches!(events.last().unwrap(),
-        ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
-        if fills.len() == 1 && fills[0].venue_order_id == report.venue_order_id
-            && fills[0].last_qty == report.filled_qty));
-    assert_eq!(events.len(), 3);
-    assert!(matches!(&events[0],
-        ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
-            if report.client_order_id.is_none() && report.filled_qty.is_positive() && fills.len() == 1));
-    match &events[1] {
+    let events = drain_events(&mut rx);
+    assert_eq!(events.len(), 1);
+    match &events[0] {
         ExecutionEvent::Report(CommonExecutionReport::Fill(report)) => {
             // Venue-initiated flow (liquidation or ADL): no client order ID,
             // surfaced as a fill report
@@ -2921,22 +2841,12 @@ fn regular_order_detail_response(params: &HashMap<String, String>) -> serde_json
     order["clOrdId"] = json!(client_order_id);
     order["fillPx"] = json!(if is_filled { price } else { "" });
     order["fillSz"] = json!(if is_filled { "1" } else { "" });
-    if !is_filled {
-        order["fee"] = json!("0");
-        order["rebate"] = json!("0");
-        order["fillTime"] = json!("0");
-        order["tradeId"] = json!("");
-    }
     order["instId"] = json!("ETH-USDT-SWAP");
     order["ordId"] = json!(venue_order_id);
     order["ordType"] = json!(order_type);
     order["posSide"] = json!("net");
     order["px"] = json!(if order_type == "market" { "" } else { price });
     order["state"] = json!(state);
-    // Conditional child fixtures must retain their cached parent's sell side
-    if !algo_client_order_id.is_empty() {
-        order["side"] = json!("sell");
-    }
     order["sz"] = json!("1");
     order["tdMode"] = json!("cross");
     response
@@ -3056,22 +2966,6 @@ async fn start_exec_query_order_test_server(state: Arc<QueryOrderRouteState>) ->
                     state.regular_queries.lock().await.push(params);
                     Json(response).into_response()
                 }
-            }),
-        )
-        .route(
-            "/api/v5/trade/fills",
-            get(|Query(params): Query<HashMap<String, String>>| async move {
-                assert_eq!(params.get("instType").unwrap(), "SWAP");
-                assert_eq!(params.get("instId").unwrap(), "ETH-USDT-SWAP");
-                let response = regular_order_detail_response(&params);
-                let order = &response["data"][0];
-                Json(json!({"code":"0", "msg":"", "data":[{
-                    "instType":"SWAP", "instId":"ETH-USDT-SWAP",
-                    "ordId":order["ordId"], "clOrdId":"", "tradeId":"query-fill-1",
-                    "billId":"query-bill-1", "fillSz":order["accFillSz"], "fillPx":order["avgPx"],
-                    "side":order["side"], "posSide":"net", "execType":"T",
-                    "fee":"-0.1", "feeCcy":"USDT", "ts":order["uTime"], "fillTime":order["uTime"]
-                }]}))
             }),
         )
         .route(
@@ -6005,81 +5899,7 @@ async fn test_generate_mass_status_fails_on_malformed_fill_quantity() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_fill_reports_resolves_triggered_child_identity(
-    #[values(false, true)] worker: bool,
-    #[values("valid", "missing", "wrong_instrument", "wrong_order", "duplicate")] detail: &str,
-) {
-    let detail_queries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let addr = start_mass_status_triggered_child_server(
-        Arc::clone(&detail_queries),
-        "effective",
-        (detail != "missing").then_some("filled"),
-        "1",
-        "OMASSTRIGGERED1",
-        "OCHILDGENERATED1",
-        if detail == "wrong_instrument" {
-            "BTC-USDT-SWAP"
-        } else {
-            "ETH-USDT-SWAP"
-        },
-        (detail == "wrong_order").then_some("other-venue-order"),
-        if detail == "duplicate" { 2 } else { 1 },
-        false,
-        &["mass-triggered-child-venue-id"],
-        None,
-    )
-    .await;
-    let base_url = format!("http://{addr}");
-    let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
-        config.instrument_types = vec![OKXInstrumentType::Swap];
-    });
-    client.on_instrument(query_order_instrument());
-    let cmd = GenerateFillReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-    let result = if worker {
-        let task = client.generate_fill_reports_task(&cmd).unwrap();
-        nautilus_common::live::get_runtime()
-            .spawn(task.collection)
-            .await
-            .unwrap();
-        (task.finish)()
-    } else {
-        client.generate_fill_reports(cmd).await
-    };
-    assert_eq!(detail_queries.lock().await.len(), 1);
-
-    if detail != "valid" {
-        assert!(result.is_err());
-        return;
-    }
-    let reports = result.unwrap();
-    assert_eq!(reports.len(), 1);
-    assert_eq!(
-        reports[0].client_order_id,
-        Some(ClientOrderId::from("OMASSTRIGGERED1"))
-    );
-    assert_eq!(
-        reports[0].venue_order_id,
-        VenueOrderId::from("mass-triggered-child-venue-id")
-    );
-    assert_eq!(reports[0].last_qty, Quantity::from("1"));
-    assert_eq!(reports[0].last_px, Price::from("850.00"));
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_generate_mass_status_recovers_historical_triggered_child_status(
-    #[values("", "OCHILDGENERATED1")] child_client_order_id: &'static str,
-    #[values(false, true)] conflicting_parent: bool,
-) {
+async fn test_generate_mass_status_recovers_historical_triggered_child_status() {
     let detail_queries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let addr = start_mass_status_triggered_child_server(
         Arc::clone(&detail_queries),
@@ -6087,13 +5907,12 @@ async fn test_generate_mass_status_recovers_historical_triggered_child_status(
         Some("filled"),
         "1",
         "OMASSTRIGGERED1",
-        child_client_order_id,
+        "",
         "ETH-USDT-SWAP",
         None,
         1,
         false,
         &["mass-triggered-child-venue-id"],
-        conflicting_parent.then_some("UnrelatedParent1"),
     )
     .await;
     let base_url = format!("http://{addr}");
@@ -6104,13 +5923,6 @@ async fn test_generate_mass_status_recovers_historical_triggered_child_status(
 
     let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
     let reports = mass_status.order_reports();
-    if conflicting_parent {
-        assert!(!mass_status.reports_complete());
-        assert!(reports.is_empty());
-        assert!(mass_status.fill_reports().is_empty());
-        assert_eq!(detail_queries.lock().await.len(), 1);
-        return;
-    }
     let report = reports
         .get(&VenueOrderId::from("mass-triggered-child-venue-id"))
         .expect("expected recovered triggered child report");
@@ -6136,13 +5948,6 @@ async fn test_generate_mass_status_recovers_historical_triggered_child_status(
     assert_eq!(
         report.client_order_id,
         Some(ClientOrderId::from("OMASSTRIGGERED1"))
-    );
-    let fills = mass_status.fill_reports();
-    let fills = fills.get(&report.venue_order_id).unwrap();
-    assert_eq!(fills.len(), 1);
-    assert_eq!(
-        fills[0].client_order_id,
-        (!child_client_order_id.is_empty()).then(|| ClientOrderId::from("OMASSTRIGGERED1"))
     );
     assert_eq!(report.order_status, OrderStatus::Filled);
     assert_eq!(report.quantity, Quantity::from("1"));
@@ -6182,7 +5987,6 @@ async fn test_generate_mass_status_preserves_triggered_child_status(
         1,
         false,
         &["mass-triggered-child-venue-id"],
-        None,
     )
     .await;
     let base_url = format!("http://{addr}");
@@ -6221,7 +6025,6 @@ async fn test_generate_mass_status_uses_live_child_quantity_for_close_fraction_p
         1,
         false,
         &["mass-triggered-child-venue-id"],
-        None,
     )
     .await;
     let base_url = format!("http://{addr}");
@@ -6403,7 +6206,6 @@ async fn test_generate_mass_status_preserves_external_triggered_child_identity()
         1,
         false,
         &["mass-triggered-child-venue-id"],
-        None,
     )
     .await;
     let base_url = format!("http://{addr}");
@@ -6510,7 +6312,6 @@ async fn test_generate_mass_status_omits_unresolved_triggered_child(
         detail_record_count,
         false,
         child_order_ids,
-        None,
     )
     .await;
     let base_url = format!("http://{addr}");
@@ -6543,7 +6344,6 @@ async fn test_generate_mass_status_preserves_rejected_algo_parent() {
         1,
         false,
         &["mass-triggered-child-venue-id"],
-        None,
     )
     .await;
     let base_url = format!("http://{addr}");
@@ -6581,7 +6381,6 @@ async fn test_generate_mass_status_preserves_regular_child_for_ambiguous_algo_pa
         1,
         true,
         &["mass-triggered-child-venue-id", "other-child-venue-id"],
-        None,
     )
     .await;
     let base_url = format!("http://{addr}");
@@ -6620,7 +6419,6 @@ async fn test_generate_mass_status_preserves_external_regular_child_when_detail_
         1,
         true,
         &["mass-triggered-child-venue-id"],
-        None,
     )
     .await;
     let base_url = format!("http://{addr}");
@@ -6659,7 +6457,6 @@ async fn test_generate_mass_status_recovers_sole_listed_child_order_id() {
         1,
         false,
         &["mass-triggered-child-venue-id"],
-        None,
     )
     .await;
     let base_url = format!("http://{addr}");
@@ -6719,7 +6516,6 @@ async fn start_mass_status_triggered_child_server(
     detail_record_count: usize,
     bulk_regular_child: bool,
     child_order_ids: &'static [&'static str],
-    child_parent_client_order_id: Option<&'static str>,
 ) -> SocketAddr {
     let algo_history = get(
         move |Query(params): Query<HashMap<String, String>>| async move {
@@ -6788,8 +6584,7 @@ async fn start_mass_status_triggered_child_server(
             let mut response = regular_order_detail_response(&params);
             let order = &mut response["data"][0];
             order["accFillSz"] = json!(filled_qty);
-            order["algoClOrdId"] =
-                json!(child_parent_client_order_id.unwrap_or(parent_client_order_id));
+            order["algoClOrdId"] = json!("");
             order["avgPx"] = json!(if filled_qty == "0" { "" } else { "850.00" });
             order["clOrdId"] = json!(child_client_order_id);
             order["fillPx"] = json!(if filled_qty == "0" { "" } else { "850.00" });
@@ -6848,19 +6643,6 @@ async fn start_mass_status_triggered_child_server(
         order["uTime"] = json!(now_ms);
         Json(response).into_response()
     });
-    let fills = get(
-        move |Query(params): Query<HashMap<String, String>>| async move {
-            if filled_qty == "0" {
-                return Json(json!({"code":"0", "msg":"", "data":[]}));
-            }
-            Json(json!({"code":"0", "msg":"", "data":[{
-                "instType":"SWAP", "instId":"ETH-USDT-SWAP",
-                "ordId":params.get("ordId").map_or("mass-triggered-child-venue-id", String::as_str), "clOrdId":if parent_client_order_id.is_empty() { "" } else { child_client_order_id }, "tradeId":"90001", "billId":"80001",
-                "fillSz":filled_qty, "fillPx":"850.00", "side":"buy", "posSide":"net", "execType":"T",
-                "fee":"-0.01", "feeCcy":"USDT", "ts":"1000", "fillTime":"1000"
-            }]}))
-        },
-    );
     let empty = get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() });
     let router = Router::new()
         .route("/api/v5/trade/order", order_detail)
@@ -6868,7 +6650,7 @@ async fn start_mass_status_triggered_child_server(
         .route("/api/v5/trade/orders-history", regular_history)
         .route("/api/v5/trade/orders-algo-pending", empty.clone())
         .route("/api/v5/trade/orders-algo-history", algo_history)
-        .route("/api/v5/trade/fills", fills)
+        .route("/api/v5/trade/fills", empty.clone())
         .route("/api/v5/trade/fills-history", empty.clone())
         .route("/api/v5/account/positions", empty)
         .route(
@@ -7440,9 +7222,6 @@ impl BootstrapServer {
             order["state"] = json!("live");
             order["accFillSz"] = json!("0");
             order["fillSz"] = json!("0");
-            order["fillTime"] = json!("0");
-            order["fee"] = json!("0");
-            order["rebate"] = json!("0");
             order["tradeId"] = json!("");
             self.ws.messages.as_ref().unwrap().send(message).unwrap();
 
@@ -8022,118 +7801,50 @@ async fn test_imported_order_first_amend_confirmation(
     msg["tradeId"] = json!(if with_fill { "1518905529" } else { "" });
     msg["fee"] = json!("0");
     server.ws.messages.as_ref().unwrap().send(message).unwrap();
-    // Both authenticated sockets receive the fixture. Economic events are deduplicated,
-    // while each received fee and execution observation remains visible.
-    let mut received = Vec::new();
-    let mut fees = 0;
-    let mut updates = 0;
-    let mut fills = 0;
-    while fees < 2 || updates < 1 || fills < usize::from(with_fill) {
+    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let ExecutionEvent::Order(OrderEventAny::Updated(updated)) = first else {
+        panic!("expected imported amendment first, was {first:?}");
+    };
+
+    let expected = OrderUpdated::new(
+        order.trader_id(),
+        order.strategy_id(),
+        order.instrument_id(),
+        cid,
+        Quantity::from("3"),
+        updated.event_id,
+        UnixNanos::from(1_746_947_317_402_000_000),
+        updated.ts_init,
+        false,
+        Some(vid),
+        Some(client.account_id()),
+        Some(Price::from("50100.0")),
+        None,
+        None,
+        false,
+    );
+    assert_eq!(updated, expected);
+    order.apply(OrderEventAny::Updated(updated)).unwrap();
+
+    if with_fill {
         let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .unwrap()
             .unwrap();
 
-        match &event {
-            ExecutionEvent::Report(CommonExecutionReport::OrderFeeEvidence(_)) => fees += 1,
-            ExecutionEvent::Order(OrderEventAny::Updated(_)) => updates += 1,
-            ExecutionEvent::Order(OrderEventAny::Filled(_)) => fills += 1,
-            ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(_, _)) => {}
-            _ => panic!("unexpected imported amendment event: {event:?}"),
-        }
-        received.push(event);
-    }
-    client.disconnect().await.unwrap();
-    received.extend(drain_events(&mut rx));
-    let mut fee_count = 0;
-    let mut evidence_count = 0;
-    let mut update_count = 0;
-    let mut fill_count = 0;
+        let ExecutionEvent::Order(OrderEventAny::Filled(fill)) = event else {
+            panic!("expected fill after amendment, was {event:?}");
+        };
 
-    for event in received {
-        match event {
-            ExecutionEvent::Report(CommonExecutionReport::OrderFeeEvidence(fee)) => {
-                fee_count += 1;
-                assert_eq!(fee.account_id, client.account_id());
-                assert_eq!(fee.instrument_id, order.instrument_id());
-                assert_eq!(fee.client_order_id, Some(cid));
-                assert_eq!(fee.venue_order_id, vid);
-                assert_eq!(
-                    fee.boundary_quantity,
-                    Some(if with_fill { dec!(2) } else { dec!(0) })
-                );
-                assert_eq!(fee.origin, OrderFeeOrigin::Stream);
-            }
-            ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(status, reports)) => {
-                evidence_count += 1;
-                assert!(with_fill);
-                assert_eq!(status.account_id, client.account_id());
-                assert_eq!(status.instrument_id, order.instrument_id());
-                assert_eq!(status.client_order_id, Some(cid));
-                assert_eq!(status.venue_order_id, vid);
-                assert_eq!(status.order_status, OrderStatus::PartiallyFilled);
-                assert_eq!(status.quantity, Quantity::from("3"));
-                assert_eq!(status.filled_qty, Quantity::from("2"));
-                assert_eq!(reports.len(), 1);
-                let fill = &reports[0];
-                assert_eq!(fill.account_id, client.account_id());
-                assert_eq!(fill.instrument_id, order.instrument_id());
-                assert_eq!(fill.client_order_id, Some(cid));
-                assert_eq!(fill.venue_order_id, vid);
-                assert_eq!(fill.trade_id, TradeId::from("1518905529"));
-                assert_eq!(fill.last_qty, Quantity::from("2"));
-                assert_eq!(fill.last_px, Price::from("50100.0"));
-                assert_eq!(fill.commission, Money::from("0 USDT"));
-            }
-            ExecutionEvent::Order(OrderEventAny::Updated(updated)) => {
-                update_count += 1;
-                let expected = OrderUpdated::new(
-                    order.trader_id(),
-                    order.strategy_id(),
-                    order.instrument_id(),
-                    cid,
-                    Quantity::from("3"),
-                    updated.event_id,
-                    UnixNanos::from(1_746_947_317_402_000_000),
-                    updated.ts_init,
-                    false,
-                    Some(vid),
-                    Some(client.account_id()),
-                    Some(Price::from("50100.0")),
-                    None,
-                    None,
-                    false,
-                );
-                assert_eq!(updated, expected);
-                order.apply(OrderEventAny::Updated(updated)).unwrap();
-            }
-            ExecutionEvent::Order(OrderEventAny::Filled(fill)) => {
-                fill_count += 1;
-                assert!(with_fill);
-                assert_eq!(update_count, 1);
-                assert!(
-                    evidence_count > 0,
-                    "economic fill must follow its admission evidence"
-                );
-                assert_eq!(fill.trade_id, TradeId::from("1518905529"));
-                assert_eq!(fill.last_qty, Quantity::from("2"));
-                assert_eq!(fill.last_px, Price::from("50100.0"));
-                assert_eq!(fill.commission, Some(Money::from("0 USDT")));
-                order.apply(OrderEventAny::Filled(fill)).unwrap();
-            }
-            event => panic!("unexpected imported amendment event: {event:?}"),
-        }
+        assert_eq!(fill.last_qty, Quantity::from("2"));
+        order.apply(OrderEventAny::Filled(fill)).unwrap();
     }
-    assert_eq!(fee_count, 2);
-    assert_eq!(update_count, 1);
-    assert_eq!(fill_count, usize::from(with_fill));
-    if with_fill {
-        // A duplicate stream may retain only its companion, or both admission and
-        // companion evidence, depending on when the shared trade cache is updated.
-        assert!((2..=4).contains(&evidence_count));
-    } else {
-        assert_eq!(evidence_count, 0);
-    }
+
+    client.disconnect().await.unwrap();
     assert!(rx.try_recv().is_err());
     assert_eq!(
         order.status(),
@@ -8151,117 +7862,143 @@ async fn test_imported_order_first_amend_confirmation(
     );
 }
 
-struct StartupHistoryState {
-    started: AtomicUsize,
-    active: AtomicUsize,
-    peak: AtomicUsize,
-    release: tokio::sync::Semaphore,
-    release_first: tokio::sync::Notify,
-    completed_fills: tokio::sync::Mutex<Vec<usize>>,
+struct HistoryPageState {
+    full_pages: usize,
+    queries: tokio::sync::Mutex<HashMap<String, Vec<HashMap<String, String>>>>,
 }
 
-impl Default for StartupHistoryState {
-    fn default() -> Self {
-        Self {
-            started: AtomicUsize::new(0),
-            active: AtomicUsize::new(0),
-            peak: AtomicUsize::new(0),
-            release: tokio::sync::Semaphore::new(0),
-            release_first: tokio::sync::Notify::new(),
-            completed_fills: tokio::sync::Mutex::new(Vec::new()),
-        }
-    }
-}
+async fn start_history_page_test_server(state: Arc<HistoryPageState>) -> SocketAddr {
+    let router = Router::new().fallback(get(
+        move |uri: Uri, Query(params): Query<HashMap<String, String>>| {
+            let state = Arc::clone(&state);
+            async move {
+                let path = uri.path();
+                let key = format!(
+                    "{path}:{}:{}",
+                    params.get("ordType").map_or("", String::as_str),
+                    params.get("state").map_or("", String::as_str),
+                );
 
-fn startup_history_order(index: usize, now_ms: i64) -> serde_json::Value {
-    let mut order = load_test_data("http_get_orders_history.json")["data"][0].clone();
-    order["instId"] = json!("ETH-USDT-SWAP");
-    order["ordId"] = json!(format!("{}", 1000 + index));
-    order["clOrdId"] = json!(format!("OSTARTUP{index}"));
-    order["ordType"] = json!("limit");
-    order["posSide"] = json!("net");
-    order["tdMode"] = json!("cross");
-    order["sz"] = json!("1");
-    order["accFillSz"] = json!("1");
-    order["fillSz"] = json!("1");
-    order["px"] = json!("2000.00");
-    order["avgPx"] = json!("2000.00");
-    order["fillPx"] = json!("2000.00");
-    order["fee"] = json!("-0.01");
-    order["tradeId"] = json!(format!("{}", 2000 + index));
-    order["cTime"] = json!(now_ms.to_string());
-    order["uTime"] = json!(now_ms.to_string());
-    order["fillTime"] = json!(now_ms.to_string());
-    order
-}
+                let page = {
+                    let mut queries = state.queries.lock().await;
+                    let queries = queries.entry(key).or_default();
+                    queries.push(params.clone());
+                    queries.len() - 1
+                };
 
-async fn start_concurrent_startup_history_server(
-    state: Arc<StartupHistoryState>,
-    fail_history: bool,
-) -> SocketAddr {
-    let now_ms = jiff::Timestamp::now().as_millisecond();
-    let history = get(move || async move {
-        Json(
-            json!({"code":"0", "msg":"", "data":(0..12).map(|index| startup_history_order(index, now_ms)).collect::<Vec<_>>()}),
-        )
-    });
-    let detail_state = Arc::clone(&state);
-    let detail = get(move |Query(params): Query<HashMap<String, String>>| {
-        let state = Arc::clone(&detail_state);
-        async move {
-            let index = params["ordId"].parse::<usize>().unwrap() - 1000;
-            let active = state.active.fetch_add(1, Ordering::SeqCst) + 1;
-            state.peak.fetch_max(active, Ordering::SeqCst);
-            state.started.fetch_add(1, Ordering::SeqCst);
-            state.release.acquire().await.unwrap().forget();
+                let pending = path.ends_with("pending");
 
-            // Force a later order's fill to arrive before the first order's detail.
-            if index == 0 {
-                state.release_first.notified().await;
+                let fixture = match path {
+                    "/api/v5/trade/orders-pending" => "http_get_orders_pending.json",
+                    "/api/v5/trade/orders-history" => "http_get_orders_history.json",
+                    "/api/v5/trade/orders-algo-pending" | "/api/v5/trade/orders-algo-history" => {
+                        "http_get_orders_algo_pending.json"
+                    }
+                    "/api/v5/sprd/orders-pending" | "/api/v5/sprd/orders-history" => {
+                        "http_get_spread_orders.json"
+                    }
+                    "/api/v5/trade/fills" | "/api/v5/trade/fills-history" => {
+                        "http_transaction_detail.json"
+                    }
+                    "/api/v5/sprd/trades" => "http_get_spread_trades.json",
+                    "/api/v5/account/positions" => {
+                        return Json(load_test_data("http_get_positions.json"));
+                    }
+                    "/api/v5/account/balance" => {
+                        return Json(load_test_data("http_get_account_balance.json"));
+                    }
+                    "/api/v5/trade/order" => {
+                        let mut response = load_test_data("http_get_orders_pending.json");
+                        response["data"][0]["ordId"] = json!(params["ordId"]);
+                        return Json(response);
+                    }
+                    other => panic!("Unexpected request to {other}"),
+                };
+
+                let response = load_test_data(fixture);
+                let template = response
+                    .get("data")
+                    .map_or_else(|| response.clone(), |data| data[0].clone());
+
+                let count = if pending {
+                    if path.contains("algo")
+                        && params.get("ordType").map(String::as_str) != Some("trigger")
+                    {
+                        0
+                    } else if page == 0 {
+                        100
+                    } else {
+                        1
+                    }
+                } else if page < state.full_pages {
+                    100
+                } else {
+                    0
+                };
+
+                let now_ms = get_atomic_clock_realtime().get_time_ns().as_u64() / 1_000_000;
+
+                let records: Vec<_> = (0..count)
+                    .map(|index| {
+                        let mut record = template.clone();
+
+                        let base = match path {
+                            "/api/v5/trade/orders-pending" => 1_000_000,
+                            "/api/v5/trade/orders-algo-pending" => 2_000_000,
+                            "/api/v5/sprd/orders-pending" => 3_000_000,
+                            "/api/v5/trade/orders-history" => 4_000_000,
+                            "/api/v5/trade/orders-algo-history" => 5_000_000,
+                            "/api/v5/sprd/orders-history" => 6_000_000,
+                            _ => 7_000_000,
+                        };
+
+                        let id = (base + page * 100 + index).to_string();
+
+                        for field in ["ordId", "billId", "tradeId"] {
+                            if record.get(field).is_some() {
+                                record[field] = json!(id);
+                            }
+                        }
+
+                        if record.get("clOrdId").is_some() {
+                            record["clOrdId"] = json!("");
+                        }
+
+                        if path.contains("algo") {
+                            record["algoId"] = json!(id);
+                            record["algoClOrdId"] = json!("");
+                            record["ordId"] = json!("");
+                            if !pending {
+                                record["state"] = json!("canceled");
+                            }
+                        }
+
+                        if path == "/api/v5/sprd/orders-history" {
+                            record["state"] = json!("canceled");
+                        }
+
+                        if path == "/api/v5/trade/fills" || path == "/api/v5/trade/fills-history" {
+                            record["instId"] = json!("BTC-USDT-SWAP");
+                            record["instType"] = json!("SWAP");
+                        }
+
+                        if !pending {
+                            for field in ["uTime", "ts"] {
+                                if record.get(field).is_some() {
+                                    record[field] = json!(now_ms.to_string());
+                                }
+                            }
+                        }
+
+                        record
+                    })
+                    .collect();
+
+                Json(json!({"code": "0", "msg": "", "data": records}))
             }
-            state.active.fetch_sub(1, Ordering::SeqCst);
-            Json(json!({"code":"0", "msg":"", "data":[startup_history_order(index, now_ms)]}))
-        }
-    });
-    let fills = get(move |Query(params): Query<HashMap<String, String>>| {
-        let state = Arc::clone(&state);
-        async move {
-            let Some(order_id) = params.get("ordId") else {
-                return Json(json!({"code":"0", "msg":"", "data":[]}));
-            };
-            let index = order_id.parse::<usize>().unwrap() - 1000;
-            state.completed_fills.lock().await.push(index);
+        },
+    ));
 
-            if index == 1 {
-                state.release_first.notify_one();
-            }
-            Json(json!({"code":"0", "msg":"", "data":[{
-                "instType":"SWAP", "instId":"ETH-USDT-SWAP",
-                "ordId":order_id, "clOrdId":format!("OSTARTUP{index}"),
-                "tradeId":format!("{}", 2000 + index), "billId":format!("{}", 3000 + index),
-                "fillSz":if fail_history && index == 0 { "0.5" } else { "1" },
-                "fillPx":"2000.00", "side":"buy", "posSide":"net", "execType":"T",
-                "fee":"-0.01", "feeCcy":"USDT", "ts":now_ms.to_string(), "fillTime":now_ms.to_string()
-            }]}))
-        }
-    });
-    let empty = get(|| async { Json(json!({"code":"0", "msg":"", "data":[]})) });
-    let router = Router::new()
-        .route("/api/v5/trade/order", detail)
-        .route("/api/v5/trade/orders-history", history)
-        .route("/api/v5/trade/orders-pending", empty.clone())
-        .route("/api/v5/trade/orders-algo-pending", empty.clone())
-        .route("/api/v5/trade/orders-algo-history", empty.clone())
-        .route("/api/v5/trade/fills", fills)
-        .route(
-            "/api/v5/trade/fills-history",
-            get(|| async { StatusCode::NOT_FOUND }),
-        )
-        .route("/api/v5/account/positions", empty)
-        .route(
-            "/api/v5/account/balance",
-            get(|| async { Json(load_test_data("http_get_account_balance.json")) }),
-        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -8269,139 +8006,283 @@ async fn start_concurrent_startup_history_server(
             .await
             .unwrap();
     });
+
     addr
 }
 
 #[rstest]
-#[case::complete(false)]
-#[case::failed_later_history(true)]
+#[case::default(None, 2, 3, true)]
+#[case::skip(Some(0), 2, 0, false)]
+#[case::one_page(Some(1), 2, 1, false)]
+#[case::two_pages(Some(2), 2, 2, false)]
+#[case::exhausted(Some(3), 2, 3, true)]
+#[case::empty(Some(1), 0, 1, true)]
+#[case::safety_cap(Some(51), 50, 50, false)]
 #[tokio::test]
-async fn test_mass_status_bounds_concurrent_histories_and_retains_evidence(
-    #[case] fail_history: bool,
+async fn test_generate_mass_status_history_page_limits(
+    #[case] max_pages: Option<u32>,
+    #[case] full_pages: usize,
+    #[case] expected_queries: usize,
+    #[case] complete: bool,
+    #[values(None, Some(4_321))] lookback_mins: Option<u64>,
 ) {
-    let state = Arc::new(StartupHistoryState::default());
-    let addr = start_concurrent_startup_history_server(Arc::clone(&state), fail_history).await;
-    let (mut client, mut rx, _) =
+    let state = Arc::new(HistoryPageState {
+        full_pages,
+        queries: tokio::sync::Mutex::new(HashMap::new()),
+    });
+
+    let addr = start_history_page_test_server(Arc::clone(&state)).await;
+
+    let (mut client, _rx, _cache) =
         create_test_execution_client_configured(&format!("http://{addr}"), |config| {
             config.instrument_types = vec![OKXInstrumentType::Swap];
+            config.load_spreads = true;
+            config.max_reconciliation_history_pages = max_pages;
         });
-    client.start().unwrap();
-    client.on_instrument(query_order_instrument());
-    let mass_status = tokio::time::timeout(Duration::from_secs(10), async {
-        let recovery = client.generate_mass_status(None);
-        let control = async {
-            wait_until_async(
-                || async { state.started.load(Ordering::SeqCst) == 4 },
-                Duration::from_secs(5),
-            )
-            .await;
-            // Four blocked requests must prevent the rest of the backlog from starting.
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            assert_eq!(state.started.load(Ordering::SeqCst), 4);
-            state.release.add_permits(12);
-        };
-        let (result, ()) = tokio::join!(recovery, control);
-        result.unwrap().unwrap()
-    })
-    .await
-    .unwrap();
-    assert_eq!(state.started.load(Ordering::SeqCst), 12);
-    assert_eq!(state.peak.load(Ordering::SeqCst), 4);
-    let completed = state.completed_fills.lock().await;
-    assert!(
-        completed.iter().position(|index| *index == 1).unwrap()
-            < completed.iter().position(|index| *index == 0).unwrap()
-    );
-    assert_eq!(mass_status.reports_complete(), !fail_history);
-    assert_eq!(mass_status.order_reports().len(), 12);
-    assert_eq!(
-        mass_status.fill_reports().len(),
-        if fail_history { 11 } else { 12 }
-    );
 
-    for index in 0..12 {
-        let venue_id = VenueOrderId::new(format!("{}", 1000 + index));
-        let report = &mass_status.order_reports()[&venue_id];
-        assert_eq!(
-            report.client_order_id,
-            Some(ClientOrderId::new(format!("OSTARTUP{index}")))
-        );
-        assert_eq!(report.filled_qty, Quantity::from("1"));
+    client.on_instrument(btc_usdt_swap_instrument());
+    client.on_instrument(make_report_spread_instrument());
 
-        if index == 0 && fail_history {
-            assert!(!mass_status.fill_reports().contains_key(&venue_id));
-            continue;
-        }
-        let fills = &mass_status.fill_reports()[&venue_id];
-        assert_eq!(fills.len(), 1);
-        assert_eq!(fills[0].trade_id, TradeId::new(format!("{}", 2000 + index)));
-        assert_eq!(fills[0].client_order_id, report.client_order_id);
-        assert_eq!(fills[0].commission, Money::from("0.01 USDT"));
-        assert_eq!(fills[0].last_qty, Quantity::from("1"));
-    }
-    let facts: Vec<_> = drain_events(&mut rx)
-        .into_iter()
-        .filter_map(|event| match event {
-            ExecutionEvent::Report(CommonExecutionReport::FillEvidence(fill)) => Some(fill),
-            ExecutionEvent::Order(_) => {
-                panic!("startup must not project fills in HTTP completion order")
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(facts.len(), 12);
-    let first = facts
-        .iter()
-        .find(|fill| fill.venue_order_id.as_str() == "1000")
+    let status = client
+        .generate_mass_status(lookback_mins)
+        .await
+        .unwrap()
         .unwrap();
+    let queries = state.queries.lock().await;
+    let count = |key: &str| queries.get(key).map_or(0, Vec::len);
+
+    assert_eq!(status.reports_complete(), complete);
+
+    for path in [
+        "/api/v5/trade/orders-history",
+        "/api/v5/sprd/orders-history",
+        "/api/v5/sprd/trades",
+    ] {
+        assert_eq!(count(&format!("{path}::")), expected_queries, "{path}");
+    }
+
+    let (fill_path, unused_fill_path) = if lookback_mins.is_some() {
+        ("/api/v5/trade/fills-history", "/api/v5/trade/fills")
+    } else {
+        ("/api/v5/trade/fills", "/api/v5/trade/fills-history")
+    };
+
+    assert_eq!(count(&format!("{fill_path}::")), expected_queries);
+    assert_eq!(count(&format!("{unused_fill_path}::")), 0);
+
+    for ord_type in ["oco", "conditional", "trigger", "move_order_stop"] {
+        for state in ["effective", "canceled", "order_failed"] {
+            assert_eq!(
+                count(&format!(
+                    "/api/v5/trade/orders-algo-history:{ord_type}:{state}"
+                )),
+                expected_queries
+            );
+        }
+
+        assert_eq!(
+            count(&format!("/api/v5/trade/orders-algo-pending:{ord_type}:")),
+            if ord_type == "trigger" { 2 } else { 1 }
+        );
+    }
+
+    assert_eq!(count("/api/v5/trade/orders-pending::"), 2);
+    assert_eq!(count("/api/v5/sprd/orders-pending::"), 2);
+    assert_eq!(count("/api/v5/account/positions::"), 1);
+    let order_reports = status.order_reports();
+    for instrument in ["BTC-USDT-SWAP.OKX", "ETH-USD-SWAP_ETH-USD-231229.OKX"] {
+        let pending: Vec<_> = order_reports
+            .values()
+            .filter(|report| {
+                report.instrument_id == InstrumentId::from(instrument)
+                    && report.order_status.is_open()
+                    && report.order_type == OrderType::Limit
+            })
+            .collect();
+
+        assert_eq!(pending.len(), 101, "{instrument}");
+        assert!(
+            pending
+                .iter()
+                .all(|report| report.ts_last < status.lookback_start().unwrap())
+        );
+    }
+
+    let algo = &order_reports[&VenueOrderId::from("2000100")];
+    assert_eq!(algo.order_type, OrderType::StopLimit);
+    assert_eq!(algo.quantity, Quantity::from("1"));
     assert_eq!(
-        first.last_qty,
-        Quantity::from(if fail_history { "0.5" } else { "1" })
+        status.position_reports()[&InstrumentId::from("BTC-USDT-SWAP.OKX")][0].quantity,
+        Quantity::from("0.5")
     );
+    let history_pages = full_pages.min(max_pages.unwrap_or(50).min(50) as usize);
+    assert_eq!(
+        status.fill_reports().values().map(Vec::len).sum::<usize>(),
+        200 * history_pages
+    );
+    assert_eq!(
+        order_reports
+            .values()
+            .filter(
+                |report| report.order_type == OrderType::StopLimit && report.order_status.is_open()
+            )
+            .count(),
+        101
+    );
+
+    if expected_queries > 0 && full_pages > 0 {
+        let regular = &order_reports[&VenueOrderId::from("4000000")];
+        assert_eq!(regular.order_status, OrderStatus::Filled);
+        assert_eq!(regular.quantity, Quantity::from("0.03"));
+        assert_eq!(regular.filled_qty, Quantity::from("0.03"));
+
+        let terminal: Vec<_> = order_reports
+            .values()
+            .filter(|report| {
+                report.order_status.is_closed()
+                    && report.instrument_id == InstrumentId::from("BTC-USDT-SWAP.OKX")
+            })
+            .collect();
+
+        assert_eq!(terminal.len(), 200 * history_pages);
+        assert!(terminal.iter().all(|report| report.ts_accepted
+            < status.lookback_start().unwrap()
+            && report.ts_last >= status.lookback_start().unwrap()));
+    }
 }
 
+#[rstest]
 #[tokio::test]
-async fn test_mass_status_cancellation_retains_facts_without_starting_more_histories() {
-    let state = Arc::new(StartupHistoryState::default());
-    let addr = start_concurrent_startup_history_server(Arc::clone(&state), false).await;
-    let (mut client, mut rx, _) =
+async fn test_history_page_limit_leaves_standalone_reports_unchanged(
+    #[values(0, 1)] max_pages: u32,
+    #[values(false, true)] worker: bool,
+) {
+    let state = Arc::new(HistoryPageState {
+        full_pages: 2,
+        queries: tokio::sync::Mutex::new(HashMap::new()),
+    });
+
+    let addr = start_history_page_test_server(Arc::clone(&state)).await;
+
+    let (mut client, _rx, _cache) =
         create_test_execution_client_configured(&format!("http://{addr}"), |config| {
             config.instrument_types = vec![OKXInstrumentType::Swap];
+            config.load_spreads = true;
+            config.max_reconciliation_history_pages = Some(max_pages);
         });
-    client.start().unwrap();
-    client.on_instrument(query_order_instrument());
-    state.release.add_permits(4);
-    {
-        let recovery = client.generate_mass_status(None);
-        tokio::pin!(recovery);
-        let observed = async {
-            loop {
-                if state.completed_fills.lock().await.len() == 4
-                    && state.started.load(Ordering::SeqCst) == 8
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
+
+    client.on_instrument(btc_usdt_swap_instrument());
+    client.on_instrument(make_report_spread_instrument());
+
+    let order_cmd = GenerateOrderStatusReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let fill_cmd = GenerateFillReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let (orders, fills) = if worker {
+        let orders = client
+            .generate_order_status_reports_task(&order_cmd)
+            .unwrap();
+        let fills = client.generate_fill_reports_task(&fill_cmd).unwrap();
+
+        nautilus_common::live::get_runtime()
+            .spawn(orders.collection)
+            .await
+            .unwrap();
+
+        nautilus_common::live::get_runtime()
+            .spawn(fills.collection)
+            .await
+            .unwrap();
+        ((orders.finish)().unwrap(), (fills.finish)().unwrap())
+    } else {
+        (
+            client
+                .generate_order_status_reports(&order_cmd)
+                .await
+                .unwrap(),
+            client.generate_fill_reports(fill_cmd).await.unwrap(),
+        )
+    };
+
+    let target = GenerateOrderStatusReport::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(InstrumentId::from("BTC-USDT-SWAP.OKX")),
+        None,
+        Some(VenueOrderId::from("1000001")),
+        None,
+        None,
+    );
+    let report = client
+        .generate_order_status_report(&target)
+        .await
+        .unwrap()
+        .unwrap();
+    let queries = state.queries.lock().await;
+
+    assert_eq!(orders.len(), 903);
+    assert_eq!(fills.len(), 400);
+    assert_eq!(report.venue_order_id, VenueOrderId::from("1000001"));
+    assert_eq!(report.order_status, OrderStatus::Accepted);
+    assert_eq!(queries["/api/v5/trade/order::"].len(), 1);
+
+    for (key, queries) in queries.iter().filter(|(key, _)| {
+        key.contains("history") || key.contains("fills:") || key.contains("trades:")
+    }) {
+        assert_eq!(queries.len(), 3, "{key}");
+
+        let cursor = if key.contains("sprd") {
+            "endId"
+        } else {
+            "after"
         };
-        tokio::select! {
-            result = &mut recovery => panic!("blocked history returned early: {result:?}"),
-            result = tokio::time::timeout(Duration::from_secs(5), observed) => result.unwrap(),
+
+        let expected = match key.split(':').next().unwrap() {
+            "/api/v5/trade/orders-history" => ["4000099", "4000199"],
+            "/api/v5/trade/orders-algo-history" => ["5000099", "5000199"],
+            "/api/v5/sprd/orders-history" => ["6000099", "6000199"],
+            "/api/v5/trade/fills" | "/api/v5/trade/fills-history" | "/api/v5/sprd/trades" => {
+                ["7000099", "7000199"]
+            }
+            other => panic!("Unexpected history query {other}"),
+        };
+
+        assert!(!queries[0].contains_key(cursor), "{key}");
+        assert_eq!(
+            queries[1].get(cursor).map(String::as_str),
+            Some(expected[0]),
+            "{key}"
+        );
+        assert_eq!(
+            queries[2].get(cursor).map(String::as_str),
+            Some(expected[1]),
+            "{key}"
+        );
+
+        if key.starts_with("/api/v5/trade/orders-history:") {
+            assert!(
+                !queries
+                    .iter()
+                    .any(|query| query.contains_key("begin") || query.contains_key("end"))
+            );
         }
-        // Drop the native future just as the existing startup deadline does.
     }
-    let facts: Vec<_> = drain_events(&mut rx)
-        .into_iter()
-        .filter_map(|event| match event {
-            ExecutionEvent::Report(CommonExecutionReport::FillEvidence(fill)) => Some(fill),
-            ExecutionEvent::Order(_) => panic!("startup must not project incomplete recovery"),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(facts.len(), 4);
-    state.release.add_permits(12);
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(state.started.load(Ordering::SeqCst), 8);
-    assert_eq!(state.completed_fills.lock().await.len(), 4);
-    assert!(drain_events(&mut rx).is_empty());
 }

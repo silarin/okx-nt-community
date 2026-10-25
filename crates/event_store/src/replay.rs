@@ -30,29 +30,21 @@ use nautilus_common::{
             BarsResponse, FundingRatesResponse, InstrumentResponse, InstrumentsResponse,
             QuotesResponse, TradesResponse,
         },
-        execution::{
-            IncompleteFillReport, MAX_INCOMPLETE_FILL_OBSERVATIONS, MAX_ORDER_FEE_OBSERVATIONS,
-            MAX_ORDER_FILL_OBSERVATIONS, OrderFeeEvidence, SubmitOrderList,
-        },
+        execution::SubmitOrderList,
     },
-    msgbus::switchboard,
 };
-use nautilus_core::{DurationNanos, UUID4, UnixNanos};
-use nautilus_execution::{
-    engine::settlement::{settle_instrument_close, settlement_close},
-    reconciliation::{query_fill_evidence_matches, query_fill_recovery_complete},
-};
+use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos};
+use nautilus_execution::engine::settlement::{settle_instrument_close, settlement_close};
 use nautilus_model::{
-    data::{Bar, InstrumentClose, QuoteTick, TradeTick},
+    data::{Bar, BatchView, InstrumentClose, QuoteTick, TradeTick},
     enums::{OmsType, OrderSide, PositionSide},
     events::{
         AccountState, OrderEventAny, OrderFillVoided, OrderFilled, OrderInitialized,
         PositionAdjusted, PositionChanged, PositionClosed, PositionOpened,
     },
-    identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, VenueOrderId},
+    identifiers::{ClientId, InstrumentId, PositionId},
     orders::{Order, OrderAny},
     position::{Position, PositionReplayEvent},
-    reports::{FillReport, OrderStatusReport},
     types::{
         Money, Quantity,
         quantity::{QUANTITY_RAW_MAX, QuantityRaw},
@@ -66,11 +58,11 @@ use crate::capture::builtins::{
     PAYLOAD_TYPE_BOOK_DELTAS_RESPONSE, PAYLOAD_TYPE_BOOK_DEPTH_RESPONSE,
     PAYLOAD_TYPE_BOOK_RESPONSE, PAYLOAD_TYPE_CANCEL_ALL_ORDERS, PAYLOAD_TYPE_CANCEL_ORDER,
     PAYLOAD_TYPE_CUSTOM_DATA_RESPONSE, PAYLOAD_TYPE_EXECUTION_MASS_STATUS,
-    PAYLOAD_TYPE_MODIFY_ORDER, PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE,
-    PAYLOAD_TYPE_ORDER_STATUS_REPORT, PAYLOAD_TYPE_ORDER_WITH_FILLS,
-    PAYLOAD_TYPE_POSITION_STATUS_REPORT, PAYLOAD_TYPE_QUERY_ACCOUNT, PAYLOAD_TYPE_QUERY_ORDER,
-    PAYLOAD_TYPE_REQUEST_COMMAND, PAYLOAD_TYPE_SUBMIT_ORDER, PAYLOAD_TYPE_SUBSCRIBE_COMMAND,
-    PAYLOAD_TYPE_TIME_EVENT, PAYLOAD_TYPE_UNSUBSCRIBE_COMMAND,
+    PAYLOAD_TYPE_FILL_REPORT, PAYLOAD_TYPE_MODIFY_ORDER,
+    PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE, PAYLOAD_TYPE_ORDER_STATUS_REPORT,
+    PAYLOAD_TYPE_ORDER_WITH_FILLS, PAYLOAD_TYPE_POSITION_STATUS_REPORT, PAYLOAD_TYPE_QUERY_ACCOUNT,
+    PAYLOAD_TYPE_QUERY_ORDER, PAYLOAD_TYPE_REQUEST_COMMAND, PAYLOAD_TYPE_SUBMIT_ORDER,
+    PAYLOAD_TYPE_SUBSCRIBE_COMMAND, PAYLOAD_TYPE_TIME_EVENT, PAYLOAD_TYPE_UNSUBSCRIBE_COMMAND,
 };
 #[cfg(all(test, feature = "defi"))]
 use crate::capture::builtins::{
@@ -81,22 +73,18 @@ use crate::{
     RedbBackend,
     backend::{EventStore, ScanDirection},
     capture::builtins::{
-        PAYLOAD_TYPE_ACCOUNT_STATE, PAYLOAD_TYPE_BARS_RESPONSE, PAYLOAD_TYPE_FILL_QUERY_REQUIRED,
-        PAYLOAD_TYPE_FILL_REPORT, PAYLOAD_TYPE_FUNDING_RATES_RESPONSE,
-        PAYLOAD_TYPE_INCOMPLETE_FILL, PAYLOAD_TYPE_INSTRUMENT_CLOSE,
+        PAYLOAD_TYPE_ACCOUNT_STATE, PAYLOAD_TYPE_BARS_RESPONSE,
+        PAYLOAD_TYPE_FUNDING_RATES_RESPONSE, PAYLOAD_TYPE_INSTRUMENT_CLOSE,
         PAYLOAD_TYPE_INSTRUMENT_RESPONSE, PAYLOAD_TYPE_INSTRUMENTS_RESPONSE,
         PAYLOAD_TYPE_ORDER_ACCEPTED, PAYLOAD_TYPE_ORDER_CANCEL_REJECTED,
         PAYLOAD_TYPE_ORDER_CANCELED, PAYLOAD_TYPE_ORDER_DENIED, PAYLOAD_TYPE_ORDER_EMULATED,
-        PAYLOAD_TYPE_ORDER_EXPIRED, PAYLOAD_TYPE_ORDER_FEE_EVIDENCE,
-        PAYLOAD_TYPE_ORDER_FILL_CONFLICT, PAYLOAD_TYPE_ORDER_FILL_EVIDENCE,
-        PAYLOAD_TYPE_ORDER_FILL_VOIDED, PAYLOAD_TYPE_ORDER_FILLED, PAYLOAD_TYPE_ORDER_INITIALIZED,
-        PAYLOAD_TYPE_ORDER_MODIFY_REJECTED, PAYLOAD_TYPE_ORDER_PENDING_CANCEL,
-        PAYLOAD_TYPE_ORDER_PENDING_UPDATE, PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
+        PAYLOAD_TYPE_ORDER_EXPIRED, PAYLOAD_TYPE_ORDER_FILL_VOIDED, PAYLOAD_TYPE_ORDER_FILLED,
+        PAYLOAD_TYPE_ORDER_INITIALIZED, PAYLOAD_TYPE_ORDER_MODIFY_REJECTED,
+        PAYLOAD_TYPE_ORDER_PENDING_CANCEL, PAYLOAD_TYPE_ORDER_PENDING_UPDATE,
         PAYLOAD_TYPE_ORDER_REJECTED, PAYLOAD_TYPE_ORDER_RELEASED, PAYLOAD_TYPE_ORDER_SUBMITTED,
         PAYLOAD_TYPE_ORDER_TRIGGERED, PAYLOAD_TYPE_ORDER_UPDATED, PAYLOAD_TYPE_POSITION_ADJUSTED,
         PAYLOAD_TYPE_POSITION_CHANGED, PAYLOAD_TYPE_POSITION_CLOSED, PAYLOAD_TYPE_POSITION_OPENED,
         PAYLOAD_TYPE_QUOTES_RESPONSE, PAYLOAD_TYPE_SUBMIT_ORDER_LIST, PAYLOAD_TYPE_TRADES_RESPONSE,
-        extract_order_event_any_identity,
     },
     entry::EventStoreEntry,
     error::EventStoreError,
@@ -110,61 +98,6 @@ mod catalog;
 
 #[cfg(feature = "persistence")]
 pub use catalog::ParquetReplayCatalog;
-
-pub(crate) const ORDER_CAPTURE_CONTRACT: &str = "order-capture=committed-routes-cumulative-fees-v2";
-
-#[derive(Deserialize)]
-struct QueryFillEvidence {
-    #[serde(skip)]
-    stream: bool,
-    order_report: OrderStatusReport,
-    fill_reports: Vec<FillReport>,
-}
-
-impl QueryFillEvidence {
-    fn recovery_complete(
-        &self,
-        order: &OrderAny,
-        accounting: &OrderAny,
-        observations: &[(u64, Self)],
-    ) -> bool {
-        let complete_query_history = observations.iter().any(|(_, evidence)| {
-            !evidence.stream
-                && !evidence.fill_reports.is_empty()
-                && ((evidence.order_report.filled_qty >= self.order_report.filled_qty
-                    && evidence.order_report.ts_last >= self.order_report.ts_last)
-                    || (self.fill_reports.is_empty()
-                        && evidence.order_report.filled_qty == self.order_report.filled_qty
-                        && nautilus_execution::reconciliation::order_fill_evidence_matches(
-                            accounting,
-                            &self.order_report,
-                            &[],
-                        )))
-                && query_fill_recovery_complete(
-                    accounting,
-                    &evidence.order_report,
-                    &evidence.fill_reports,
-                    false,
-                )
-        });
-
-        if self.stream {
-            nautilus_execution::reconciliation::stream_fill_recovery_complete(
-                order,
-                &self.order_report,
-                &self.fill_reports,
-                complete_query_history,
-            )
-        } else {
-            query_fill_recovery_complete(
-                order,
-                &self.order_report,
-                &self.fill_reports,
-                complete_query_history,
-            )
-        }
-    }
-}
 
 /// Summary of a cache snapshot-tail replay.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,14 +120,8 @@ pub struct EventStoreReplayReport {
 }
 
 #[cfg(test)]
-// Includes recovery evidence which constrains replay without projecting a cache mutation.
 pub(crate) const CACHE_REPLAY_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
-    PAYLOAD_TYPE_FILL_QUERY_REQUIRED,
-    PAYLOAD_TYPE_INCOMPLETE_FILL,
-    PAYLOAD_TYPE_ORDER_FEE_EVIDENCE,
-    PAYLOAD_TYPE_ORDER_FILL_EVIDENCE,
-    PAYLOAD_TYPE_ORDER_FILL_CONFLICT,
-    PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
+    crate::capture::builtins::PAYLOAD_TYPE_DATA_RESPONSE_ENVELOPE,
     PAYLOAD_TYPE_SUBMIT_ORDER_LIST,
     PAYLOAD_TYPE_ACCOUNT_STATE,
     PAYLOAD_TYPE_INSTRUMENT_CLOSE,
@@ -699,12 +626,6 @@ impl CacheReplayError {
 struct CacheReplayContext {
     allow_deferred_flips: bool,
     pending_flips: Vec<PendingFlip>,
-    query_fill_evidence: Vec<(u64, QueryFillEvidence)>,
-    standalone_fill_evidence: Vec<(u64, FillReport, bool)>,
-    incomplete_fill_evidence: Vec<(u64, IncompleteFillReport)>,
-    order_fee_evidence: Vec<(u64, OrderFeeEvidence)>,
-    committed_order_sequences: IndexMap<UUID4, u64>,
-    order_only_fills: IndexMap<UUID4, (u64, OrderFilled)>,
 }
 
 struct PendingFlip {
@@ -712,14 +633,13 @@ struct PendingFlip {
     source_position_id: PositionId,
     oms_type: OmsType,
     opening_fill: OrderFilled,
-    orderless: bool,
 }
 
 impl CacheReplayContext {
     fn for_snapshot_tail() -> Self {
         Self {
             allow_deferred_flips: true,
-            ..Default::default()
+            pending_flips: Vec::new(),
         }
     }
 
@@ -737,14 +657,12 @@ impl CacheReplayContext {
         source_position_id: PositionId,
         oms_type: OmsType,
         opening_fill: OrderFilled,
-        orderless: bool,
     ) {
         self.pending_flips.push(PendingFlip {
             source_seq,
             source_position_id,
             oms_type,
             opening_fill,
-            orderless,
         });
     }
 
@@ -752,7 +670,7 @@ impl CacheReplayContext {
         &mut self,
         entry: &EventStoreEntry,
         opened: &PositionOpened,
-    ) -> Result<Option<(OrderFilled, OmsType, bool)>, CacheReplayError> {
+    ) -> Result<Option<(OrderFilled, OmsType)>, CacheReplayError> {
         let matching: Vec<usize> = self
             .pending_flips
             .iter()
@@ -786,13 +704,13 @@ impl CacheReplayContext {
         let Some(index) = matching.first().copied() else {
             return Ok(None);
         };
+
         let pending = self.pending_flips.remove(index);
         let mut fill = pending.opening_fill;
         let oms_type = if pending.source_position_id == opened.position_id {
             pending.oms_type
         } else {
-            // A replacement ID identifies a native virtual HEDGING flip, including
-            // full event-store replay where no cache snapshot supplied the OMS metadata.
+            // Replacement IDs identify HEDGING flips when no snapshot supplies OMS metadata
             OmsType::Hedging
         };
         fill.position_id = Some(opened.position_id);
@@ -800,564 +718,22 @@ impl CacheReplayContext {
         // stable and identifies the recovered opening transition, while causation still points
         // to the original unsplit venue fill.
         fill.event_id = opened.event_id;
-        Ok(Some((fill, oms_type, pending.orderless)))
+        Ok(Some((fill, oms_type)))
     }
 
-    fn record_order_fill_projection(
-        &mut self,
-        entry: &EventStoreEntry,
-    ) -> Result<(), CacheReplayError> {
-        if entry.payload_type.as_str() != PAYLOAD_TYPE_ORDER_FILLED {
+    fn ensure_complete(&self) -> Result<(), CacheReplayError> {
+        let Some(pending) = self.pending_flips.first() else {
             return Ok(());
-        }
-        let identity = decode_payload::<OrderReplayIdentity>(entry)?;
-        if !entry
-            .topic
-            .as_ref()
-            .starts_with("events.order_fill_order_only.")
-            && entry.topic.as_ref()
-                != switchboard::get_event_order_topic(identity.strategy_id).as_str()
-        {
-            return Ok(());
-        }
-        let fill = decode_replay_order_fill(entry)?;
-        if entry.topic.as_ref()
-            == switchboard::get_order_fill_order_only_topic(fill.instrument_id).as_str()
-        {
-            if let Some((_, previous)) = self.order_only_fills.get(&fill.event_id)
-                && previous != &fill
-            {
-                return Err(apply_error(entry, "Conflicting order-only fill projection"));
-            }
-            self.order_only_fills
-                .entry(fill.event_id)
-                .or_insert((entry.seq, fill));
-        } else if entry.topic.as_ref()
-            == switchboard::get_event_order_topic(fill.strategy_id).as_str()
-        {
-            if let Some((seq, projected)) = self.order_only_fills.get(&fill.event_id)
-                && (*seq >= entry.seq || projected != &fill)
-            {
-                return Err(apply_error(
-                    entry,
-                    "Order-only projection does not match committed fill",
-                ));
-            }
-            self.committed_order_sequences
-                .entry(fill.event_id)
-                .or_insert(entry.seq);
-        }
-        Ok(())
-    }
-
-    fn record_order_fee_evidence(
-        &mut self,
-        entry: &EventStoreEntry,
-    ) -> Result<(), CacheReplayError> {
-        if entry.payload_type.as_str() == PAYLOAD_TYPE_ORDER_FEE_EVIDENCE {
-            let report = decode_payload::<OrderFeeEvidence>(entry)?;
-            if !self.order_fee_evidence.iter().any(|(seq, previous)| {
-                previous.same_observation(&report) || (*seq == entry.seq && previous == &report)
-            }) {
-                self.order_fee_evidence.push((entry.seq, report.clone()));
-                let redundant = report.redundant_query_observation_indices(
-                    self.order_fee_evidence
-                        .iter()
-                        .enumerate()
-                        .map(|(index, (_, previous))| (index, previous)),
-                );
-
-                for index in redundant.into_iter().rev() {
-                    self.order_fee_evidence.remove(index);
-                }
-                let retained = self
-                    .order_fee_evidence
-                    .iter()
-                    .filter(|(_, previous)| {
-                        (
-                            previous.account_id,
-                            previous.instrument_id,
-                            previous.venue_order_id,
-                        ) == (
-                            report.account_id,
-                            report.instrument_id,
-                            report.venue_order_id,
-                        )
-                    })
-                    .count();
-
-                if retained > MAX_ORDER_FEE_OBSERVATIONS {
-                    self.order_fee_evidence.pop();
-                    return Err(apply_error(
-                        entry,
-                        format!(
-                            "Cumulative fee observation budget exhausted for {}",
-                            report.venue_order_id
-                        ),
-                    ));
-                }
-            }
-            return Ok(());
-        }
-        Ok(())
-    }
-
-    fn record_incomplete_fill_evidence(
-        &mut self,
-        entry: &EventStoreEntry,
-    ) -> Result<(), CacheReplayError> {
-        if entry.payload_type.as_str() == PAYLOAD_TYPE_INCOMPLETE_FILL {
-            let report = decode_payload::<IncompleteFillReport>(entry)?;
-            if self.incomplete_fill_evidence.iter().any(|(seq, previous)| {
-                previous.same_successful_observation(&report)
-                    || (*seq >= entry.seq
-                        && (previous == &report
-                            || previous.supersedes_malformed_observation(&report)))
-            }) {
-                return Ok(());
-            }
-            let redundant = report.superseded_malformed_observation_indices(
-                self.incomplete_fill_evidence
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (seq, _))| *seq < entry.seq)
-                    .map(|(index, (_, previous))| (index, previous)),
-            );
-
-            for index in redundant.into_iter().rev() {
-                self.incomplete_fill_evidence.remove(index);
-            }
-            let retained = self
-                .incomplete_fill_evidence
-                .iter()
-                .filter(|(_, previous)| previous.order_key() == report.order_key())
-                .count();
-
-            if retained >= MAX_INCOMPLETE_FILL_OBSERVATIONS {
-                return Err(apply_error(
-                    entry,
-                    format!(
-                        "Incomplete fill observation budget exhausted for {}",
-                        report.venue_order_id
-                    ),
-                ));
-            }
-            self.incomplete_fill_evidence.push((entry.seq, report));
-            return Ok(());
-        }
-        Ok(())
-    }
-
-    fn check_fill_observation_budget(
-        &self,
-        entry: &EventStoreEntry,
-        key: (AccountId, InstrumentId, VenueOrderId),
-        additional: usize,
-    ) -> Result<(), CacheReplayError> {
-        let standalone = self
-            .standalone_fill_evidence
-            .iter()
-            .filter(|(_, report, _)| {
-                (
-                    report.account_id,
-                    report.instrument_id,
-                    report.venue_order_id,
-                ) == key
-            })
-            .count();
-        let retained = self
-            .query_fill_evidence
-            .iter()
-            .filter(|(_, evidence)| {
-                let report = &evidence.order_report;
-                (
-                    report.account_id,
-                    report.instrument_id,
-                    report.venue_order_id,
-                ) == key
-            })
-            .fold(standalone, |total, (_, evidence)| {
-                total
-                    .saturating_add(1)
-                    .saturating_add(evidence.fill_reports.len())
-            });
-
-        if retained.saturating_add(additional) > MAX_ORDER_FILL_OBSERVATIONS {
-            return Err(apply_error(
-                entry,
-                format!("Execution observation budget exhausted for {}", key.2),
-            ));
-        }
-        Ok(())
-    }
-
-    fn record_query_fill_evidence(
-        &mut self,
-        entry: &EventStoreEntry,
-    ) -> Result<(), CacheReplayError> {
-        let requires_query = entry.payload_type.as_str() == PAYLOAD_TYPE_FILL_QUERY_REQUIRED;
-        if requires_query
-            || (entry.payload_type.as_str() == PAYLOAD_TYPE_FILL_REPORT
-                && entry.topic.as_ref()
-                    == switchboard::MessagingSwitchboard::reconciliation_fill_evidence_topic()
-                        .as_str())
-        {
-            let report = decode_payload::<FillReport>(entry)?;
-
-            if !self
-                .standalone_fill_evidence
-                .iter()
-                .any(|(_, previous, required)| {
-                    *required == requires_query
-                        && (!requires_query || report.ts_init <= previous.ts_init)
-                        && nautilus_execution::reconciliation::fill_evidence_matches(
-                            previous, &report,
-                        )
-                })
-            {
-                self.check_fill_observation_budget(
-                    entry,
-                    (
-                        report.account_id,
-                        report.instrument_id,
-                        report.venue_order_id,
-                    ),
-                    1,
-                )?;
-                self.standalone_fill_evidence
-                    .push((entry.seq, report, requires_query));
-            }
-            return Ok(());
-        }
-
-        if entry.payload_type.as_str() == PAYLOAD_TYPE_ORDER_FILL_CONFLICT {
-            let venue_order_id = decode_payload::<OrderStatusReport>(entry)?.venue_order_id;
-            return Err(apply_error(
-                entry,
-                format!("Unresolved persisted order fill conflict for {venue_order_id}"),
-            ));
-        }
-
-        if !matches!(
-            entry.payload_type.as_str(),
-            PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS | PAYLOAD_TYPE_ORDER_FILL_EVIDENCE
-        ) {
-            return Ok(());
-        }
-        let mut evidence = decode_payload::<QueryFillEvidence>(entry)?;
-        evidence.stream = entry.payload_type.as_str() == PAYLOAD_TYPE_ORDER_FILL_EVIDENCE;
-        let report = &evidence.order_report;
-        if report.filled_qty.is_zero() {
-            return Ok(());
-        }
-        // Exact retransmissions retain the original observation sequence. Distinct
-        // temporal and identity constraints must each acquire native completion proof.
-        let observed =
-            self.query_fill_evidence
-                .iter()
-                .any(|(previous_seq, previous)| {
-                    // A replay pass can revisit a capture after scanning later evidence.
-                    // The same capture remains one observation regardless of those constraints.
-                    let same_capture = *previous_seq == entry.seq
-                        && previous.stream == evidence.stream
-                        && previous.order_report == evidence.order_report
-                        && previous.fill_reports == evidence.fill_reports;
-
-                    same_capture
-                        || (evidence.stream == previous.stream
-                            && (evidence.stream || report.ts_init <= previous.order_report.ts_init)
-                            && query_fill_evidence_matches(
-                                report,
-                                &evidence.fill_reports,
-                                &previous.order_report,
-                                &previous.fill_reports,
-                            )
-                            && !self.incomplete_fill_evidence.iter().any(|(seq, fill)| {
-                                seq > previous_seq
-                                    && fill.account_id == report.account_id
-                                    && fill.instrument_id == report.instrument_id
-                                    && fill.venue_order_id == report.venue_order_id
-                            })
-                            && !self.standalone_fill_evidence.iter().any(
-                                |(seq, fill, required)| {
-                                    *required
-                                        && seq > previous_seq
-                                        && fill.account_id == report.account_id
-                                        && fill.instrument_id == report.instrument_id
-                                        && fill.venue_order_id == report.venue_order_id
-                                },
-                            ))
-                });
-
-        if !observed {
-            self.check_fill_observation_budget(
-                entry,
-                (
-                    report.account_id,
-                    report.instrument_id,
-                    report.venue_order_id,
-                ),
-                evidence.fill_reports.len().saturating_add(1),
-            )?;
-            self.query_fill_evidence.push((entry.seq, evidence));
-        }
-        Ok(())
-    }
-
-    // Check native capture-order states at or after observation, never superseded earlier states
-    fn order_recovered_after(
-        &self,
-        seq: u64,
-        order: &OrderAny,
-        recovered: &dyn Fn(&OrderAny) -> bool,
-    ) -> bool {
-        if recovered(order) {
-            return true;
-        }
-        let Ok(mut projection) = OrderAny::try_from(order.init_event().clone()) else {
-            return false;
         };
-        let mut reached_observation = false;
 
-        for event in order.events().into_iter().skip(1) {
-            let Some(event_seq) = self
-                .committed_order_sequences
-                .get(&extract_order_event_any_identity(event))
-            else {
-                return false;
-            };
-
-            if *event_seq >= seq {
-                reached_observation = true;
-
-                if recovered(&projection) {
-                    return true;
-                }
-            }
-
-            if projection.apply(event.clone()).is_err() {
-                return false;
-            }
-
-            if reached_observation && recovered(&projection) {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn has_complete_query_after(
-        &self,
-        seq: u64,
-        order: &OrderAny,
-        matches: &dyn Fn(&OrderStatusReport, &[FillReport]) -> bool,
-    ) -> bool {
-        self.query_fill_evidence
-            .iter()
-            .any(|(query_seq, evidence)| {
-                *query_seq > seq
-                    && !evidence.stream
-                    && matches(&evidence.order_report, &evidence.fill_reports)
-                    && self.order_recovered_after(*query_seq, order, &|projection| {
-                        query_fill_recovery_complete(
-                            projection,
-                            &evidence.order_report,
-                            &evidence.fill_reports,
-                            false,
-                        )
-                    })
-            })
-    }
-
-    fn require_complete(
-        seq: u64,
-        payload_type: &str,
-        message: String,
-        complete: bool,
-    ) -> Result<(), CacheReplayError> {
-        if complete {
-            Ok(())
-        } else {
-            Err(CacheReplayError::Apply {
-                seq,
-                payload_type: payload_type.to_string(),
-                message,
-            })
-        }
-    }
-
-    fn ensure_observation_complete(
-        cache: &Cache,
-        seq: u64,
-        payload_type: &str,
-        identity: (Option<ClientOrderId>, VenueOrderId),
-        message: String,
-        is_complete: impl FnOnce(&OrderAny) -> bool,
-    ) -> Result<(), CacheReplayError> {
-        let order = identity.0.and_then(|id| cache.order(&id)).or_else(|| {
-            cache
-                .client_order_id(&identity.1)
-                .and_then(|id| cache.order(id))
-        });
-        Self::require_complete(
-            seq,
-            payload_type,
-            message,
-            order.is_some_and(|order| is_complete(&order)),
-        )
-    }
-
-    fn ensure_fill_observations_complete(&self, cache: &Cache) -> Result<(), CacheReplayError> {
-        for (seq, observed) in &self.incomplete_fill_evidence {
-            Self::ensure_observation_complete(
-                cache,
-                *seq,
-                PAYLOAD_TYPE_INCOMPLETE_FILL,
-                (observed.client_order_id, observed.venue_order_id),
-                format!(
-                    "Unresolved persisted incomplete fill recovery for {}",
-                    observed.venue_order_id
-                ),
-                |order| {
-                    if observed
-                        .client_order_id
-                        .is_some_and(|id| id != order.client_order_id())
-                    {
-                        return false;
-                    }
-                    self.order_recovered_after(*seq, order, &|projection| {
-                        nautilus_execution::reconciliation::incomplete_fill_stream_recovery_complete(projection, observed)
-                    }) || self.has_complete_query_after(*seq, order, &|report, fills| {
-                            observed.matches_query(report, fills)
-                        })
-                },
-            )?;
-        }
-
-        for (seq, observed, requires_query) in &self.standalone_fill_evidence {
-            Self::ensure_observation_complete(
-                cache,
-                *seq,
-                PAYLOAD_TYPE_FILL_REPORT,
-                (observed.client_order_id, observed.venue_order_id),
-                format!(
-                    "Unresolved persisted standalone fill recovery for {}",
-                    observed.trade_id
-                ),
-                |order| {
-                    nautilus_execution::reconciliation::fill_evidence_is_committed(order, observed)
-                        && (!requires_query
-                            || self.has_complete_query_after(*seq, order, &|report, fills| {
-                                report.ts_init > observed.ts_init
-                                    && fills.iter().any(|fill| {
-                                        nautilus_execution::reconciliation::fill_evidence_matches_with_order(
-                                            order, fill, observed,
-                                        )
-                                    })
-                            }))
-                },
-            )?;
-        }
-
-        let peers: Vec<_> = self
-            .order_fee_evidence
-            .iter()
-            .map(|(_, report)| report.clone())
-            .collect();
-        let stream_fills: Vec<_> = self
-            .query_fill_evidence
-            .iter()
-            .filter(|(_, query)| query.stream)
-            .flat_map(|(_, query)| query.fill_reports.clone())
-            .collect();
-
-        for (seq, observed) in &self.order_fee_evidence {
-            let queries: Vec<_> = self
-                .query_fill_evidence
-                .iter()
-                .filter(|(query_seq, query)| {
-                    !query.stream && (!observed.requires_fresh_query || query_seq > seq)
-                })
-                .map(|(_, query)| (query.order_report.clone(), query.fill_reports.clone()))
-                .collect();
-            Self::ensure_observation_complete(
-                cache,
-                *seq,
-                PAYLOAD_TYPE_ORDER_FEE_EVIDENCE,
-                (observed.client_order_id, observed.venue_order_id),
-                format!(
-                    "Unresolved persisted cumulative commission recovery for {}",
-                    observed.venue_order_id
-                ),
-                |order| {
-                    self.order_recovered_after(*seq, order, &|projection| {
-                        nautilus_execution::reconciliation::order_fee_recovery_complete(
-                            observed,
-                            projection,
-                            &queries,
-                            &peers,
-                            &stream_fills,
-                        )
-                    })
-                },
-            )?;
-        }
-        Ok(())
-    }
-
-    fn ensure_order_projections_complete(&self, cache: &Cache) -> Result<(), CacheReplayError> {
-        for (event_id, (seq, _)) in &self.order_only_fills {
-            Self::require_complete(
-                *seq,
-                PAYLOAD_TYPE_ORDER_FILLED,
-                "Order-only projection has no committed fill".to_string(),
-                self.committed_order_sequences
-                    .get(event_id)
-                    .is_some_and(|committed| committed > seq),
-            )?;
-        }
-
-        if let Some(pending) = self.pending_flips.first() {
-            return Err(CacheReplayError::Apply {
-                seq: pending.source_seq,
-                payload_type: PAYLOAD_TYPE_ORDER_FILLED.to_string(),
-                message: format!(
-                    "position flip fill {} has no matching PositionOpened event",
-                    pending.opening_fill.trade_id,
-                ),
-            });
-        }
-
-        for (seq, evidence) in &self.query_fill_evidence {
-            let report = &evidence.order_report;
-            let order = report
-                .client_order_id
-                .and_then(|id| cache.order(&id))
-                .or_else(|| {
-                    cache
-                        .client_order_id(&report.venue_order_id)
-                        .and_then(|id| cache.order(id))
-                });
-
-            let complete = order.is_some_and(|order| {
-                let recovered = |projection: &OrderAny| {
-                    evidence.recovery_complete(projection, &order, &self.query_fill_evidence)
-                };
-
-                self.order_recovered_after(*seq, &order, &recovered)
-            });
-
-            Self::require_complete(
-                *seq,
-                PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
-                format!(
-                    "Unresolved persisted order fill recovery for {}",
-                    report.venue_order_id
-                ),
-                complete,
-            )?;
-        }
-        Ok(())
+        Err(CacheReplayError::Apply {
+            seq: pending.source_seq,
+            payload_type: PAYLOAD_TYPE_ORDER_FILLED.to_string(),
+            message: format!(
+                "position flip fill {} has no matching PositionOpened event",
+                pending.opening_fill.trade_id,
+            ),
+        })
     }
 }
 
@@ -1390,46 +766,11 @@ where
     F: FnOnce(&mut Cache, Option<&SnapshotAnchor>) -> Result<(), CacheReplayError>,
 {
     let (plan, scan) = reader.scan_snapshot_replay_tail()?;
-    let manifest = reader.manifest()?;
-    let committed_routes = manifest
-        .feature_flags
-        .iter()
-        .any(|flag| flag == ORDER_CAPTURE_CONTRACT);
-    let mut context = CacheReplayContext::for_snapshot_tail();
-    // Inspect the complete retained run, including observations before a snapshot:
-    // a cache snapshot does not serialize an ExecutionManager's pending obligations.
-    for entry in reader.scan_range(1, plan.to_seq, ScanDirection::Forward) {
-        let entry = entry?;
-        if !committed_routes && COMMITTED_ORDER_PAYLOAD_TYPES.contains(&entry.payload_type.as_str())
-        {
-            return Err(apply_error(
-                &entry,
-                "Unsupported legacy order capture contract: committed publication is not guaranteed",
-            ));
-        }
-
-        if COMMITTED_ORDER_PAYLOAD_TYPES.contains(&entry.payload_type.as_str()) {
-            let identity = decode_payload::<OrderReplayIdentity>(&entry)?;
-            if entry.topic.as_ref()
-                == switchboard::get_event_order_topic(identity.strategy_id).as_str()
-                && let Some(event_id) = identity.event_id
-            {
-                context
-                    .committed_order_sequences
-                    .entry(event_id)
-                    .or_insert(entry.seq);
-            }
-        }
-
-        context.record_order_fee_evidence(&entry)?;
-        context.record_incomplete_fill_evidence(&entry)?;
-        context.record_query_fill_evidence(&entry)?;
-        context.record_order_fill_projection(&entry)?;
-    }
     restore_snapshot(cache, plan.anchor.as_ref())?;
 
     let mut applied_entries = 0;
     let mut ignored_entries = 0;
+    let mut context = CacheReplayContext::for_snapshot_tail();
 
     for entry in scan {
         let entry = entry?;
@@ -1448,8 +789,7 @@ where
         }
     }
 
-    context.ensure_fill_observations_complete(cache)?;
-    context.ensure_order_projections_complete(cache)?;
+    context.ensure_complete()?;
 
     Ok(CacheReplayReport {
         plan,
@@ -1910,39 +1250,8 @@ pub fn apply_cache_replay_entry(
 ) -> Result<bool, CacheReplayError> {
     let mut context = CacheReplayContext::default();
     let applied = apply_cache_replay_entry_with_context(cache, entry, &mut context)?;
-    context.ensure_fill_observations_complete(cache)?;
-    context.ensure_order_projections_complete(cache)?;
+    context.ensure_complete()?;
     Ok(applied)
-}
-
-// Incoming execution messages, portfolio deliveries, instrument notifications and declined
-// fills are forensic observations. Only the strategy publication follows a successful
-// native order apply and contains its final position identity.
-const COMMITTED_ORDER_PAYLOAD_TYPES: &[&str] = &[
-    PAYLOAD_TYPE_ORDER_INITIALIZED,
-    PAYLOAD_TYPE_ORDER_DENIED,
-    PAYLOAD_TYPE_ORDER_EMULATED,
-    PAYLOAD_TYPE_ORDER_RELEASED,
-    PAYLOAD_TYPE_ORDER_SUBMITTED,
-    PAYLOAD_TYPE_ORDER_ACCEPTED,
-    PAYLOAD_TYPE_ORDER_REJECTED,
-    PAYLOAD_TYPE_ORDER_CANCELED,
-    PAYLOAD_TYPE_ORDER_EXPIRED,
-    PAYLOAD_TYPE_ORDER_TRIGGERED,
-    PAYLOAD_TYPE_ORDER_PENDING_UPDATE,
-    PAYLOAD_TYPE_ORDER_PENDING_CANCEL,
-    PAYLOAD_TYPE_ORDER_MODIFY_REJECTED,
-    PAYLOAD_TYPE_ORDER_CANCEL_REJECTED,
-    PAYLOAD_TYPE_ORDER_UPDATED,
-    PAYLOAD_TYPE_ORDER_FILLED,
-    PAYLOAD_TYPE_ORDER_FILL_VOIDED,
-];
-
-#[derive(Deserialize)]
-struct OrderReplayIdentity {
-    strategy_id: StrategyId,
-    #[serde(default)]
-    event_id: Option<UUID4>,
 }
 
 fn apply_cache_replay_entry_with_context(
@@ -1952,18 +1261,6 @@ fn apply_cache_replay_entry_with_context(
 ) -> Result<bool, CacheReplayError> {
     if apply_complete_cache_payload_entry(cache, entry)? {
         return Ok(true);
-    }
-    context.record_order_fee_evidence(entry)?;
-    context.record_incomplete_fill_evidence(entry)?;
-    context.record_query_fill_evidence(entry)?;
-    context.record_order_fill_projection(entry)?;
-
-    if COMMITTED_ORDER_PAYLOAD_TYPES.contains(&entry.payload_type.as_str()) {
-        let identity = decode_payload::<OrderReplayIdentity>(entry)?;
-        let committed_topic = switchboard::get_event_order_topic(identity.strategy_id);
-        if entry.topic.as_ref() != committed_topic.as_str() {
-            return Ok(false);
-        }
     }
 
     match entry.payload_type.as_str() {
@@ -2057,6 +1354,33 @@ fn apply_complete_cache_payload_entry(
     entry: &EventStoreEntry,
 ) -> Result<bool, CacheReplayError> {
     match entry.payload_type.as_str() {
+        crate::capture::builtins::PAYLOAD_TYPE_DATA_RESPONSE_ENVELOPE => {
+            let response =
+                decode_payload::<crate::capture::builtins::ResponseEnvelopeCapture>(entry)?;
+
+            let (Some(payload_type), Some(payload)) = (response.payload_type, response.payload)
+            else {
+                return Ok(false);
+            };
+
+            if payload_type.as_str()
+                == crate::capture::builtins::PAYLOAD_TYPE_DATA_RESPONSE_ENVELOPE
+            {
+                return Err(apply_error(
+                    entry,
+                    "Historical response payload cannot contain another envelope",
+                ));
+            }
+
+            let payload_entry = EventStoreEntry {
+                payload_type,
+                payload,
+                ..entry.clone()
+            };
+
+            return apply_complete_cache_payload_entry(cache, &payload_entry);
+        }
+
         PAYLOAD_TYPE_SUBMIT_ORDER_LIST => {
             let command = decode_payload::<SubmitOrderList>(entry)?;
             apply_result(entry, cache.add_order_list(command.order_list))?;
@@ -2072,15 +1396,15 @@ fn apply_complete_cache_payload_entry(
             }
         }
         PAYLOAD_TYPE_QUOTES_RESPONSE => {
-            let response = decode_payload::<QuotesResponse>(entry)?;
-            if !response.data.is_empty() {
-                apply_result(entry, cache.add_quotes(&response.data))?;
+            let data = decode_response_ticks(entry, |response: QuotesResponse| response.data)?;
+            if !data.is_empty() {
+                apply_result(entry, cache.add_quotes(&data))?;
             }
         }
         PAYLOAD_TYPE_TRADES_RESPONSE => {
-            let response = decode_payload::<TradesResponse>(entry)?;
-            if !response.data.is_empty() {
-                apply_result(entry, cache.add_trades(&response.data))?;
+            let data = decode_response_ticks(entry, |response: TradesResponse| response.data)?;
+            if !data.is_empty() {
+                apply_result(entry, cache.add_trades(&data))?;
             }
         }
         PAYLOAD_TYPE_FUNDING_RATES_RESPONSE => {
@@ -2124,7 +1448,11 @@ where
     Ok(wrap(decode_payload(entry)?))
 }
 
-fn decode_replay_order_fill(entry: &EventStoreEntry) -> Result<OrderFilled, CacheReplayError> {
+fn apply_order_filled(
+    cache: &mut Cache,
+    entry: &EventStoreEntry,
+    context: &mut CacheReplayContext,
+) -> Result<bool, CacheReplayError> {
     let replay_side = decode_payload::<OrderFilledReplaySide>(entry)?;
     if replay_side.order_side.is_none() {
         return Err(apply_error(
@@ -2132,26 +1460,14 @@ fn decode_replay_order_fill(entry: &EventStoreEntry) -> Result<OrderFilled, Cach
             "OrderFilled.order_side must be Buy or Sell, was NoOrderSide",
         ));
     }
-    decode_payload::<OrderFilled>(entry)
-}
-
-fn apply_order_filled(
-    cache: &mut Cache,
-    entry: &EventStoreEntry,
-    context: &mut CacheReplayContext,
-) -> Result<bool, CacheReplayError> {
-    let fill = decode_replay_order_fill(entry)?;
+    let fill = decode_payload::<OrderFilled>(entry)?;
     let event = OrderEventAny::Filled(fill.clone());
     let orderless_leg_fill = is_orderless_leg_fill(cache, &fill);
     if !orderless_leg_fill {
         apply_result(entry, cache.update_order(&event))?;
     }
 
-    if context.order_only_fills.contains_key(&fill.event_id) {
-        return Ok(true);
-    }
-
-    let flip_applied = apply_flip_fill(cache, entry, &fill, orderless_leg_fill, context)?;
+    let flip_applied = apply_flip_fill(cache, entry, &fill, context)?;
 
     if flip_applied {
         return Ok(true);
@@ -2170,7 +1486,6 @@ fn apply_flip_fill(
     cache: &mut Cache,
     entry: &EventStoreEntry,
     fill: &OrderFilled,
-    orderless: bool,
     context: &mut CacheReplayContext,
 ) -> Result<bool, CacheReplayError> {
     if context.contains_flip_source(fill) {
@@ -2207,19 +1522,13 @@ fn apply_flip_fill(
         position.clone()
     };
 
-    let mut oms_type = cache.oms_type(&position_id).unwrap_or(OmsType::Unspecified);
-    if oms_type == OmsType::Unspecified
-        && position_id.as_str() == format!("{}-{}", position.instrument_id, position.strategy_id)
-    {
-        // Match Cache's persisted-position OMS recovery for canonical netting IDs
-        oms_type = OmsType::Netting;
-    }
+    let oms_type = cache.oms_type(&position_id).unwrap_or(OmsType::Unspecified);
     let (closing_fill, opening_fill) = fill
         .split_for_position_flip(position.quantity, None, fill.event_id)
         .map_err(|e| apply_error(entry, e))?;
     apply_result(entry, position.try_apply(&closing_fill))?;
     apply_result(entry, cache.update_position(&position))?;
-    context.push_flip(entry.seq, position_id, oms_type, opening_fill, orderless);
+    context.push_flip(entry.seq, position_id, oms_type, opening_fill);
     Ok(true)
 }
 
@@ -2229,8 +1538,7 @@ fn apply_pending_flip_opened(
     opened: &PositionOpened,
     context: &mut CacheReplayContext,
 ) -> Result<Option<bool>, CacheReplayError> {
-    let Some((opening_fill, oms_type, orderless)) = context.take_opening_fill(entry, opened)?
-    else {
+    let Some((opening_fill, oms_type)) = context.take_opening_fill(entry, opened)? else {
         return Ok(None);
     };
     let instrument = cache
@@ -2246,7 +1554,7 @@ fn apply_pending_flip_opened(
             )
         })?;
 
-    let index_order = !orderless;
+    let index_order = !is_orderless_leg_fill(cache, &opening_fill);
     let position = apply_result(entry, Position::new_checked(&instrument, opening_fill))?;
     validate_position_opened(entry, &position, opened)?;
     if oms_type == OmsType::Netting
@@ -2818,6 +2126,37 @@ where
     })
 }
 
+fn decode_response_ticks<R, T>(
+    entry: &EventStoreEntry,
+    data: impl FnOnce(R) -> BatchView<T>,
+) -> Result<BatchView<T>, CacheReplayError>
+where
+    R: DeserializeOwned,
+    T: DeserializeOwned,
+{
+    decode_payload(entry).map(data).or_else(|original| {
+        decode_payload::<ScalarTickResponse<T>>(entry)
+            .map(|response| response.data.into())
+            .map_err(|_| original)
+    })
+}
+
+#[derive(Deserialize)]
+#[expect(
+    dead_code,
+    reason = "Metadata is decoded to preserve validation of the previous stored response schema"
+)]
+struct ScalarTickResponse<T> {
+    correlation_id: UUID4,
+    client_id: ClientId,
+    instrument_id: InstrumentId,
+    data: Vec<T>,
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
+    ts_init: UnixNanos,
+    params: Option<Params>,
+}
+
 fn apply_result<T, E>(entry: &EventStoreEntry, result: Result<T, E>) -> Result<T, CacheReplayError>
 where
     E: Display,
@@ -2847,15 +2186,12 @@ fn reject_quarantined_replay_source(
 
 #[cfg(test)]
 mod tests {
-    use std::{any::Any, cell::Cell, rc::Rc};
+    use std::{any::Any, cell::Cell, rc::Rc, sync::Arc};
 
     use ahash::AHashSet;
     use bytes::Bytes;
     use indexmap::IndexMap;
-    use nautilus_common::{
-        messages::ExecutionReport,
-        msgbus::{self, BusTap, Endpoint, MStr, Topic as BusTopic},
-    };
+    use nautilus_common::msgbus::{self, BusTap, Endpoint, MStr, Topic as BusTopic};
     use nautilus_core::{UUID4, UnixNanos};
     use nautilus_model::{
         accounts::AccountAny,
@@ -2896,8 +2232,8 @@ mod tests {
         backend::{AppendEntry, MemoryBackend, RedbBackend},
         capture::{
             builtins::{
-                DEFAULT_CAPTURE_PAYLOAD_TYPES, encode_execution_report, encode_instrument_close,
-                encode_order_event_any, encode_position_event,
+                DEFAULT_CAPTURE_PAYLOAD_TYPES, encode_instrument_close, encode_order_event_any,
+                encode_position_event,
             },
             encode_account_state,
         },
@@ -2916,7 +2252,7 @@ mod tests {
             binary_hash: "deadbeef".to_string(),
             schema_version: 1,
             crate_versions: "feedface".to_string(),
-            feature_flags: vec![ORDER_CAPTURE_CONTRACT.to_string()],
+            feature_flags: Vec::new(),
             adapter_versions: IndexMap::new(),
             config_hash: "cafebabe".to_string(),
             registered_components: RegisteredComponents::default(),
@@ -2943,15 +2279,7 @@ mod tests {
         payload_type: &str,
         payload: Bytes,
     ) -> AppendEntry {
-        let topic = if COMMITTED_ORDER_PAYLOAD_TYPES.contains(&payload_type) {
-            let strategy_id = rmp_serde::from_slice::<OrderReplayIdentity>(&payload).map_or_else(
-                |_| StrategyId::from("S-001"),
-                |identity| identity.strategy_id,
-            );
-            EntryTopic::from(switchboard::get_event_order_topic(strategy_id).as_str())
-        } else {
-            EntryTopic::from("events.account.SIM")
-        };
+        let topic = EntryTopic::from("events.account.SIM");
         let ts = UnixNanos::from(ts_init);
         let headers = Headers::empty();
         let hash = compute_entry_hash(
@@ -4174,6 +3502,46 @@ mod tests {
     }
 
     #[rstest]
+    fn historical_envelope_replays_payload_without_actor_completion_state() {
+        use nautilus_common::messages::data::{DataResponse, DataResponseEnvelope};
+        let instrument_id = InstrumentId::from("AUD/USD.SIM");
+
+        let quote = QuoteTick::new(
+            instrument_id,
+            Price::from("1.00000"),
+            Price::from("1.00010"),
+            Quantity::from("11"),
+            Quantity::from("13"),
+            UnixNanos::from(17),
+            UnixNanos::from(19),
+        );
+        let root = UUID4::new();
+
+        let response = QuotesResponse::new(
+            root,
+            ClientId::from("SOURCE"),
+            instrument_id,
+            vec![quote],
+            None,
+            None,
+            UnixNanos::from(23),
+            None,
+        );
+        let envelope =
+            DataResponseEnvelope::new(DataResponse::Quotes(response), false, Some(UUID4::new()));
+        let registry = crate::capture::builtins::default_registry();
+        let (tag, encoded) = registry.encode(&envelope).unwrap().unwrap();
+        let entry = append_payload(1, tag.as_str(), encoded.payload).entry;
+        let mut cache = Cache::default();
+        assert!(apply_cache_replay_entry(&mut cache, &entry).unwrap());
+        let terminal = DataResponseEnvelope::terminal(root, Some("later source failed".to_owned()));
+        let (tag, encoded) = registry.encode(&terminal).unwrap().unwrap();
+        let entry = append_payload(2, tag.as_str(), encoded.payload).entry;
+        assert!(!apply_cache_replay_entry(&mut cache, &entry).unwrap());
+        assert_eq!(cache.quote(&instrument_id), Some(&quote));
+    }
+
+    #[rstest]
     fn default_capture_payload_types_are_classified_for_cache_replay() {
         let mut classified = AHashSet::new();
         let mut overlap = Vec::new();
@@ -4552,6 +3920,205 @@ mod tests {
     }
 
     #[rstest]
+    #[case::quotes(true)]
+    #[case::trades(false)]
+    fn narrowed_response_envelope_capture_replays_only_visible_rows(
+        #[case] quotes: bool,
+        #[values(false, true)] empty: bool,
+    ) {
+        use nautilus_common::messages::data::{DataResponse, DataResponseEnvelope};
+
+        use crate::capture::builtins::{
+            PAYLOAD_TYPE_DATA_RESPONSE_ENVELOPE, ResponseEnvelopeCapture, default_registry,
+        };
+
+        let id = InstrumentId::from("AUD/USD.SIM");
+        let root = UUID4::new();
+        let child = UUID4::new();
+
+        let quote = QuoteTick {
+            instrument_id: id,
+            ts_init: UnixNanos::from(23),
+            ..Default::default()
+        };
+
+        let trade = TradeTick {
+            instrument_id: id,
+            ts_init: UnixNanos::from(29),
+            ..Default::default()
+        };
+
+        let end = if empty { 1 } else { 2 };
+
+        let response = if quotes {
+            DataResponse::Quotes(QuotesResponse::new(
+                child,
+                ClientId::from("HISTORY"),
+                id,
+                BatchView::new(Arc::new(vec![quote, quote, quote]), 1..end),
+                Some(UnixNanos::from(11)),
+                Some(UnixNanos::from(37)),
+                UnixNanos::from(41),
+                None,
+            ))
+        } else {
+            DataResponse::Trades(TradesResponse::new(
+                child,
+                ClientId::from("HISTORY"),
+                id,
+                BatchView::new(Arc::new(vec![trade, trade, trade]), 1..end),
+                Some(UnixNanos::from(11)),
+                Some(UnixNanos::from(37)),
+                UnixNanos::from(43),
+                None,
+            ))
+        };
+
+        let envelope =
+            DataResponseEnvelope::new(response, true, Some(child)).with_correlation_id(root);
+        let registry = default_registry();
+        let (tag, encoded) = registry.encode(&envelope).unwrap().unwrap();
+        let captured: ResponseEnvelopeCapture = rmp_serde::from_slice(&encoded.payload).unwrap();
+        let reader = reader_with_entries(
+            "narrowed-response-envelope",
+            &[append_payload(1, tag.as_str(), encoded.payload)],
+        );
+        let mut cache = Cache::default();
+
+        let report = replay_cache_snapshot_tail(&mut cache, &reader).unwrap();
+
+        assert_eq!(tag.as_str(), PAYLOAD_TYPE_DATA_RESPONSE_ENVELOPE);
+        assert_eq!(captured.correlation_id, root);
+        assert_eq!(captured.sub_correlation_id, Some(child));
+        assert!(captured.completed);
+        assert_eq!(captured.failure_reason, None);
+        assert_eq!(report.applied_entries, 1);
+        assert_eq!(report.ignored_entries, 0);
+        assert_eq!(cache.quotes(&id), (quotes && !empty).then(|| vec![quote]));
+        assert_eq!(cache.trades(&id), (!quotes && !empty).then(|| vec![trade]));
+    }
+
+    #[rstest]
+    fn scalar_tick_response_replay_restores_previous_payload_schema() {
+        #[derive(Serialize)]
+        struct ScalarResponse<T> {
+            correlation_id: UUID4,
+            client_id: ClientId,
+            instrument_id: InstrumentId,
+            data: Vec<T>,
+            start: Option<UnixNanos>,
+            end: Option<UnixNanos>,
+            ts_init: UnixNanos,
+            params: Option<nautilus_core::Params>,
+        }
+
+        let id = InstrumentId::from("AUD/USD.SIM");
+
+        let quote = QuoteTick::new(
+            id,
+            Price::from("1.00001"),
+            Price::from("1.00023"),
+            Quantity::from(17),
+            Quantity::from(31),
+            UnixNanos::from(43),
+            UnixNanos::from(47),
+        );
+
+        let trade = TradeTick::new(
+            id,
+            Price::from("1.00019"),
+            Quantity::from(23),
+            AggressorSide::Buy,
+            TradeId::from("OLD-TRADE"),
+            UnixNanos::from(53),
+            UnixNanos::from(59),
+        );
+
+        let quotes = ScalarResponse {
+            correlation_id: UUID4::new(),
+            client_id: ClientId::from("DATA"),
+            instrument_id: id,
+            data: vec![quote],
+            start: Some(UnixNanos::from(37)),
+            end: Some(UnixNanos::from(61)),
+            ts_init: UnixNanos::from(67),
+            params: None,
+        };
+
+        let trades = ScalarResponse {
+            correlation_id: UUID4::new(),
+            client_id: ClientId::from("DATA"),
+            instrument_id: id,
+            data: vec![trade],
+            start: Some(UnixNanos::from(41)),
+            end: Some(UnixNanos::from(71)),
+            ts_init: UnixNanos::from(73),
+            params: None,
+        };
+
+        let reader = reader_with_entries(
+            "scalar-tick-responses",
+            &[
+                append_serde_payload(1, PAYLOAD_TYPE_QUOTES_RESPONSE, &quotes),
+                append_serde_payload(2, PAYLOAD_TYPE_TRADES_RESPONSE, &trades),
+            ],
+        );
+        let mut cache = Cache::default();
+
+        let report = replay_cache_snapshot_tail(&mut cache, &reader).unwrap();
+
+        assert_eq!(report.applied_entries, 2);
+        assert_eq!(report.ignored_entries, 0);
+        assert_eq!(cache.quotes(&id), Some(vec![quote]));
+        assert_eq!(cache.trades(&id), Some(vec![trade]));
+    }
+
+    #[rstest]
+    fn scalar_tick_response_replay_rejects_incomplete_metadata() {
+        #[derive(Serialize)]
+        struct IncompleteResponse {
+            instrument_id: InstrumentId,
+            data: Vec<QuoteTick>,
+        }
+
+        let id = InstrumentId::from("AUD/USD.SIM");
+
+        let response = IncompleteResponse {
+            instrument_id: id,
+            data: vec![QuoteTick {
+                instrument_id: id,
+                ..Default::default()
+            }],
+        };
+
+        let reader = reader_with_entries(
+            "incomplete-scalar-response",
+            &[append_serde_payload(
+                1,
+                PAYLOAD_TYPE_QUOTES_RESPONSE,
+                &response,
+            )],
+        );
+        let mut cache = Cache::default();
+
+        let error = replay_cache_snapshot_tail(&mut cache, &reader).unwrap_err();
+
+        let CacheReplayError::Decode {
+            seq,
+            payload_type,
+            message,
+        } = error
+        else {
+            panic!("Expected invalid response metadata");
+        };
+
+        assert_eq!(seq, 1);
+        assert_eq!(payload_type, PAYLOAD_TYPE_QUOTES_RESPONSE);
+        assert_eq!(message, "missing field `correlation_id`");
+        assert_eq!(cache.quotes(&id), None);
+    }
+
+    #[rstest]
     fn empty_data_response_replay_is_noop() {
         let instrument_id = InstrumentAny::CurrencyPair(audusd_sim()).id();
         let client_id = ClientId::from("DATA");
@@ -4649,1041 +4216,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::complete_follow_up(true, true, false, false)]
-    #[case::incomplete_follow_up(false, true, false, false)]
-    #[case::stream_after_resolved_query(true, false, false, false)]
-    #[case::stale_query_after_stream(true, false, true, false)]
-    #[case::duplicate_initial_query(true, true, false, true)]
-    fn sealed_replay_uses_latest_query_obligation_with_shared_fill_time(
-        #[case] complete: bool,
-        #[case] follow_up_query: bool,
-        #[case] late_initial_query: bool,
-        #[case] repeat_initial_query: bool,
-        #[values(false, true)] conflicting_position: bool,
-    ) {
-        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
-        let initialized = OrderInitializedSpec::builder()
-            .instrument_id(instrument.id())
-            .quantity(Quantity::from("1000"))
-            .build();
-        let submitted = OrderSubmittedSpec::builder()
-            .instrument_id(instrument.id())
-            .client_order_id(initialized.client_order_id)
-            .build();
-        let accepted = OrderAcceptedSpec::builder()
-            .instrument_id(instrument.id())
-            .client_order_id(initialized.client_order_id)
-            .account_id(submitted.account_id)
-            .build();
-        let first = OrderFilledSpec::builder()
-            .instrument_id(instrument.id())
-            .client_order_id(initialized.client_order_id)
-            .account_id(submitted.account_id)
-            .venue_order_id(accepted.venue_order_id)
-            .position_id(PositionId::from("P-SHARED-TIME"))
-            .trade_id(TradeId::from("T-FIRST"))
-            .last_qty(Quantity::from("400"))
-            .commission(Money::from("0.01 USD"))
-            .build();
-        let mut second = first.clone();
-        second.event_id = UUID4::new();
-        second.trade_id = TradeId::from("T-SECOND");
-        second.last_qty = Quantity::from("600");
-        second.commission = Some(Money::from("0.02 USD"));
-        assert_eq!(first.ts_event, second.ts_event);
-        let mut fills: Vec<_> = [&first, &second]
-            .into_iter()
-            .map(|fill| {
-                FillReport::new(
-                    fill.account_id,
-                    fill.instrument_id,
-                    fill.venue_order_id,
-                    fill.trade_id,
-                    fill.order_side,
-                    fill.last_qty,
-                    fill.last_px,
-                    fill.commission.unwrap(),
-                    fill.liquidity_side,
-                    Some(fill.client_order_id),
-                    fill.position_id,
-                    fill.ts_event,
-                    fill.ts_init,
-                    None,
-                )
-            })
-            .collect();
-        let mut initial_report = OrderStatusReport::new(
-            first.account_id,
-            first.instrument_id,
-            Some(first.client_order_id),
-            first.venue_order_id,
-            Some(first.order_side),
-            first.order_type,
-            initialized.time_in_force,
-            OrderStatus::PartiallyFilled,
-            initialized.quantity,
-            first.last_qty,
-            first.ts_event,
-            first.ts_event,
-            first.ts_init,
-            None,
-        );
-        initial_report.venue_position_id = first.position_id;
-        let mut final_report = initial_report.clone();
-        final_report.order_status = OrderStatus::Filled;
-        final_report.filled_qty = initialized.quantity;
-
-        if conflicting_position {
-            fills[0].venue_position_id = Some(PositionId::from("P-CONTRADICTORY"));
-        }
-        let first_query = encode_execution_report(&ExecutionReport::OrderQueryWithFills(
-            Box::new(initial_report),
-            vec![fills[0].clone()],
-        ))
-        .unwrap();
-        let final_query = encode_execution_report(&ExecutionReport::OrderQueryWithFills(
-            Box::new(final_report),
-            if complete {
-                fills
-            } else {
-                vec![fills[1].clone()]
-            },
-        ))
-        .unwrap();
-        let tmp = TempDir::new().unwrap();
-        {
-            let mut backend = RedbBackend::new(tmp.path().to_path_buf());
-            backend.open_run(manifest("shared-fill-time")).unwrap();
-            let mut entries = vec![
-                append_order_event(1, &OrderEventAny::Initialized(initialized)),
-                append_order_event(2, &OrderEventAny::Submitted(submitted)),
-                append_order_event(3, &OrderEventAny::Accepted(accepted)),
-                append_order_event(4, &OrderEventAny::Filled(first)),
-            ];
-
-            if late_initial_query {
-                entries.push(append_order_event(5, &OrderEventAny::Filled(second)));
-                entries.push(append_payload(
-                    6,
-                    PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
-                    first_query.payload.clone(),
-                ));
-            } else {
-                entries.push(append_payload(
-                    5,
-                    PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
-                    first_query.payload.clone(),
-                ));
-                entries.push(append_order_event(6, &OrderEventAny::Filled(second)));
-            }
-
-            if follow_up_query {
-                entries.push(append_payload(
-                    7,
-                    PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
-                    final_query.payload,
-                ));
-            }
-
-            if repeat_initial_query {
-                entries.push(append_payload(
-                    8,
-                    PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
-                    first_query.payload,
-                ));
-            }
-            backend.append_batch(&entries).unwrap();
-            backend.seal(RunStatus::Ended).unwrap();
-        }
-        let mut cache = Cache::default();
-        cache.add_instrument(instrument).unwrap();
-        let result = restore_cache_from_sealed_run(
-            &mut cache,
-            tmp.path().to_path_buf(),
-            "trader-001",
-            "shared-fill-time",
-        );
-
-        if complete && !late_initial_query && !conflicting_position {
-            let restored = result.unwrap();
-            assert_eq!(restored.cache.applied_entries, 5);
-            let position = cache
-                .position_owned(&PositionId::from("P-SHARED-TIME"))
-                .unwrap();
-            assert_eq!(position.quantity, Quantity::from("1000"));
-            assert_eq!(position.commissions(), vec![Money::from("0.03 USD")]);
-        } else {
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("Unresolved persisted order fill recovery")
-            );
-        }
-    }
-
-    #[rstest]
-    #[case::matching(false, false)]
-    #[case::conflicting(true, false)]
-    #[case::mixed(false, true)]
-    fn cumulative_commission_before_snapshot_anchor_is_enforced(
-        #[case] conflict: bool,
-        #[case] mixed: bool,
-        #[values(false, true)] repeated_queries: bool,
-        #[values(false, true)] snapshot: bool,
-    ) {
-        use nautilus_common::messages::execution::{
-            CommissionBasis, CumulativeCommissionConstraint, OrderFeeOrigin,
-        };
-        use nautilus_model::enums::LiquiditySide;
-
-        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
-        let initialized = OrderInitializedSpec::builder()
-            .instrument_id(instrument.id())
-            .build();
-        let id = initialized.client_order_id;
-        let submitted = OrderSubmittedSpec::builder()
-            .instrument_id(instrument.id())
-            .client_order_id(id)
-            .build();
-        let accepted = OrderAcceptedSpec::builder()
-            .instrument_id(instrument.id())
-            .client_order_id(id)
-            .account_id(submitted.account_id)
-            .build();
-        let first = OrderFilledSpec::builder()
-            .instrument_id(instrument.id())
-            .client_order_id(id)
-            .venue_order_id(accepted.venue_order_id)
-            .account_id(submitted.account_id)
-            .last_qty(Quantity::from("40000"))
-            .trade_id(TradeId::from("FEE-1"))
-            .commission(Money::from("1 USD"))
-            .liquidity_side(LiquiditySide::Taker)
-            .ts_event(UnixNanos::from(10))
-            .build();
-        let second = OrderFilledSpec::builder()
-            .instrument_id(instrument.id())
-            .client_order_id(id)
-            .venue_order_id(accepted.venue_order_id)
-            .account_id(submitted.account_id)
-            .last_qty(Quantity::from("60000"))
-            .trade_id(TradeId::from("FEE-2"))
-            .commission(Money::from("2 USD"))
-            .liquidity_side(if mixed {
-                LiquiditySide::Maker
-            } else {
-                LiquiditySide::Taker
-            })
-            .ts_event(UnixNanos::from(20))
-            .build();
-        let observed = OrderFeeEvidence {
-            account_id: submitted.account_id,
-            instrument_id: instrument.id(),
-            venue_order_id: accepted.venue_order_id,
-            client_order_id: Some(id),
-            venue_position_id: None,
-            order_side: initialized.order_side,
-            boundary_quantity: Some("100000".parse().unwrap()),
-            boundary_time: Some(UnixNanos::from(20)),
-            anchor_trade_id: Some(second.trade_id),
-            anchor_trade_time: Some(second.ts_event),
-            origin: if repeated_queries {
-                OrderFeeOrigin::Query
-            } else {
-                OrderFeeOrigin::Stream
-            },
-            constraints: vec![CumulativeCommissionConstraint {
-                basis: Some(if mixed {
-                    CommissionBasis::UniformLiquidity
-                } else {
-                    CommissionBasis::ChargesOnly
-                }),
-                amount: Some(if conflict { "4" } else { "3" }.parse().unwrap()),
-                currency: Some(Currency::USD()),
-            }],
-            unrepresentable_values: false,
-            requires_fresh_query: false,
-            ts_init: UnixNanos::from(30),
-        };
-        let encoded = encode_execution_report(&ExecutionReport::OrderFeeEvidence(Box::new(
-            observed.clone(),
-        )))
-        .unwrap();
-        let mut cache = Cache::default();
-        cache.add_instrument(instrument).unwrap();
-        let events = [
-            OrderEventAny::Initialized(initialized),
-            OrderEventAny::Submitted(submitted),
-            OrderEventAny::Accepted(accepted),
-            OrderEventAny::Filled(first),
-            OrderEventAny::Filled(second),
-        ];
-        let mut entries: Vec<_> = events
-            .iter()
-            .enumerate()
-            .map(|(i, event)| append_order_event(i as u64 + 1, event))
-            .collect();
-        entries.push(append_payload(
-            6,
-            PAYLOAD_TYPE_ORDER_FEE_EVIDENCE,
-            encoded.payload,
-        ));
-
-        if repeated_queries {
-            for time in [50, 40].into_iter().chain(100..1100).chain([60]) {
-                let mut poll = observed.clone();
-                poll.ts_init = UnixNanos::from(time);
-                let encoded =
-                    encode_execution_report(&ExecutionReport::OrderFeeEvidence(Box::new(poll)))
-                        .unwrap();
-                entries.push(append_payload(
-                    entries.len() as u64 + 1,
-                    PAYLOAD_TYPE_ORDER_FEE_EVIDENCE,
-                    encoded.payload,
-                ));
-            }
-            let mut context = CacheReplayContext::default();
-            for entry in &entries {
-                context.record_order_fee_evidence(&entry.entry).unwrap();
-            }
-            let retained: Vec<_> = context
-                .order_fee_evidence
-                .iter()
-                .map(|(seq, report)| (*seq, report.ts_init.as_u64()))
-                .collect();
-            assert!(retained.len() <= 4);
-            assert!(retained.contains(&(6, 30)));
-            assert!(retained.contains(&(entries.len() as u64 - 1, 1099)));
-            assert!(retained.contains(&(entries.len() as u64, 60)));
-        }
-        let high_watermark = entries.len() as u64;
-        // Restore a real committed native order from the snapshot; its quantity is exact.
-        let OrderEventAny::Initialized(initialized) = &events[0] else {
-            unreachable!()
-        };
-        let mut order = OrderAny::try_from(initialized.clone()).unwrap();
-        for event in &events[1..] {
-            order.apply(event.clone()).unwrap();
-        }
-        let mut backend = MemoryBackend::new();
-        backend.open_run(manifest("fee-before-anchor")).unwrap();
-        backend.append_batch(&entries).unwrap();
-        if snapshot {
-            backend
-                .record_snapshot_anchor(SnapshotAnchor::new(high_watermark, "cache://fee", "hash"))
-                .unwrap();
-        }
-        let reader = EventStoreReader::new(backend);
-        let result =
-            restore_cache_snapshot_and_replay_tail(&mut cache, &reader, |cache, anchor| {
-                if snapshot {
-                    assert_eq!(anchor.unwrap().high_watermark, high_watermark);
-                    cache.add_order(order, None, None, false).unwrap();
-                } else {
-                    assert!(anchor.is_none());
-                }
-                Ok(())
-            });
-
-        if conflict || mixed {
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("Unresolved persisted cumulative commission recovery")
-            );
-        } else {
-            result.unwrap();
-        }
-    }
-
-    #[rstest]
-    fn execution_observation_replay_budget_matches_live(
-        #[values("query", "stream", "standalone", "requires_query")] source: &str,
-        #[values(false, true)] same_snapshot: bool,
-    ) {
-        use nautilus_model::enums::{LiquiditySide, OrderType, TimeInForce};
-        let cid = ClientOrderId::from("BUDGET");
-        let mut fill = FillReport::new(
-            AccountId::from("TEST-001"),
-            InstrumentId::from("ETHUSDT-PERP.BINANCE"),
-            VenueOrderId::from("BUDGET-VENUE"),
-            TradeId::from("TRADE"),
-            OrderSide::Buy,
-            Quantity::from("10.0"),
-            Price::from("100.0"),
-            Money::from("0.01 USDT"),
-            LiquiditySide::Taker,
-            Some(cid),
-            None,
-            UnixNanos::from(1),
-            UnixNanos::from(2),
-            None,
-        );
-        let mut context = CacheReplayContext::default();
-        let bundled = matches!(source, "query" | "stream");
-        let capacity = MAX_ORDER_FILL_OBSERVATIONS / if bundled { 2 } else { 1 };
-        for index in 0..=capacity {
-            fill.ts_init = UnixNanos::from(10 + index as u64);
-            if source == "standalone" {
-                fill.trade_id = TradeId::from(format!("TRADE-{index}").as_str());
-            }
-            let envelope = if bundled {
-                let report = OrderStatusReport::new(
-                    fill.account_id,
-                    fill.instrument_id,
-                    Some(cid),
-                    fill.venue_order_id,
-                    Some(fill.order_side),
-                    OrderType::Limit,
-                    TimeInForce::Gtc,
-                    OrderStatus::Filled,
-                    fill.last_qty,
-                    fill.last_qty,
-                    UnixNanos::default(),
-                    UnixNanos::from(if same_snapshot { 10 } else { 10 + index as u64 }),
-                    fill.ts_init,
-                    None,
-                );
-
-                if source == "stream" {
-                    ExecutionReport::OrderFillEvidence(Box::new(report), vec![fill.clone()])
-                } else {
-                    ExecutionReport::OrderQueryWithFills(Box::new(report), vec![fill.clone()])
-                }
-            } else if source == "requires_query" {
-                ExecutionReport::FillQueryRequired(Box::new(fill.clone()))
-            } else {
-                ExecutionReport::FillEvidence(Box::new(fill.clone()))
-            };
-            let encoded = encode_execution_report(&envelope).unwrap();
-            let mut entry = append_payload(
-                index as u64 + 1,
-                encoded.payload_type.unwrap().as_str(),
-                encoded.payload,
-            );
-
-            if source == "standalone" {
-                entry.entry.topic =
-                    switchboard::MessagingSwitchboard::reconciliation_fill_evidence_topic()
-                        .to_string()
-                        .into();
-            }
-            let result = context.record_query_fill_evidence(&entry.entry);
-
-            if index == capacity && !(source == "stream" && same_snapshot) {
-                assert!(
-                    result
-                        .unwrap_err()
-                        .to_string()
-                        .contains("Execution observation budget exhausted")
-                );
-            } else {
-                result.unwrap();
-                // The snapshot tail re-read is not a new receipt.
-                context.record_query_fill_evidence(&entry.entry).unwrap();
-            }
-        }
-        assert_eq!(
-            if bundled {
-                context.query_fill_evidence.len()
-            } else {
-                context.standalone_fill_evidence.len()
-            },
-            if source == "stream" && same_snapshot {
-                1
-            } else {
-                capacity
-            }
-        );
-    }
-
-    #[rstest]
-    fn sealed_replay_does_not_recount_queries_before_later_observations(
-        #[values(false, true)] standalone: bool,
-    ) {
-        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
-        let initialized = OrderInitializedSpec::builder()
-            .instrument_id(instrument.id())
-            .quantity(Quantity::from("1000"))
-            .build();
-        let submitted = OrderSubmittedSpec::builder()
-            .instrument_id(instrument.id())
-            .client_order_id(initialized.client_order_id)
-            .build();
-        let accepted = OrderAcceptedSpec::builder()
-            .instrument_id(instrument.id())
-            .client_order_id(initialized.client_order_id)
-            .account_id(submitted.account_id)
-            .build();
-        let first = OrderFilledSpec::builder()
-            .instrument_id(instrument.id())
-            .client_order_id(initialized.client_order_id)
-            .account_id(submitted.account_id)
-            .venue_order_id(accepted.venue_order_id)
-            .position_id(PositionId::from("P-SHARED-TIME"))
-            .trade_id(TradeId::from("T-FIRST"))
-            .last_qty(Quantity::from("400"))
-            .commission(Money::from("0.01 USD"))
-            .build();
-        let mut second = first.clone();
-        second.event_id = UUID4::new();
-        second.trade_id = TradeId::from("T-SECOND");
-        second.last_qty = Quantity::from("600");
-        second.commission = Some(Money::from("0.02 USD"));
-        assert_eq!(first.ts_event, second.ts_event);
-        let fills: Vec<_> = [&first, &second]
-            .into_iter()
-            .map(|fill| {
-                FillReport::new(
-                    fill.account_id,
-                    fill.instrument_id,
-                    fill.venue_order_id,
-                    fill.trade_id,
-                    fill.order_side,
-                    fill.last_qty,
-                    fill.last_px,
-                    fill.commission.unwrap(),
-                    fill.liquidity_side,
-                    Some(fill.client_order_id),
-                    fill.position_id,
-                    fill.ts_event,
-                    fill.ts_init,
-                    None,
-                )
-            })
-            .collect();
-        let mut initial_report = OrderStatusReport::new(
-            first.account_id,
-            first.instrument_id,
-            Some(first.client_order_id),
-            first.venue_order_id,
-            Some(first.order_side),
-            first.order_type,
-            initialized.time_in_force,
-            OrderStatus::PartiallyFilled,
-            initialized.quantity,
-            first.last_qty,
-            first.ts_event,
-            first.ts_event,
-            first.ts_init,
-            None,
-        );
-        initial_report.venue_position_id = first.position_id;
-        let mut final_report = initial_report.clone();
-        final_report.order_status = OrderStatus::Filled;
-        final_report.filled_qty = initialized.quantity;
-
-        final_report.ts_init = UnixNanos::from(10000);
-        let tmp = TempDir::new().unwrap();
-        {
-            let mut backend = RedbBackend::new(tmp.path().to_path_buf());
-            backend.open_run(manifest("query-budget-replay")).unwrap();
-            let mut entries = vec![
-                append_order_event(1, &OrderEventAny::Initialized(initialized.clone())),
-                append_order_event(2, &OrderEventAny::Submitted(submitted)),
-                append_order_event(3, &OrderEventAny::Accepted(accepted)),
-                append_order_event(4, &OrderEventAny::Filled(first)),
-            ];
-            // Each partial query costs two units. The later complete query costs
-            // three, and the standalone variant adds one: both remain within 4096.
-            for index in 0..(MAX_ORDER_FILL_OBSERVATIONS - 4) / 2 {
-                initial_report.ts_init = UnixNanos::from(100 + index as u64);
-                let encoded = encode_execution_report(&ExecutionReport::OrderQueryWithFills(
-                    Box::new(initial_report.clone()),
-                    vec![fills[0].clone()],
-                ))
-                .unwrap();
-                entries.push(append_payload(
-                    entries.len() as u64 + 1,
-                    PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
-                    encoded.payload,
-                ));
-            }
-            let mut observed = fills[1].clone();
-            observed.ts_init = UnixNanos::from(5000);
-            let evidence = if standalone {
-                ExecutionReport::FillQueryRequired(Box::new(observed))
-            } else {
-                ExecutionReport::IncompleteFill(Box::new(IncompleteFillReport {
-                    account_id: observed.account_id,
-                    instrument_id: observed.instrument_id,
-                    venue_order_id: observed.venue_order_id,
-                    client_order_id: observed.client_order_id,
-                    trade_id: Some(observed.trade_id),
-                    trade_id_placeholder: false,
-                    order_side: observed.order_side,
-                    last_qty: Some(observed.last_qty.as_decimal()),
-                    last_px: Some(observed.last_px.as_decimal()),
-                    commission_amount: None,
-                    commission_currency: Some(observed.commission.currency),
-                    unrepresentable_values: false,
-                    requires_fresh_query: true,
-                    order_snapshot: None,
-                    liquidity_side: Some(observed.liquidity_side),
-                    venue_position_id: observed.venue_position_id,
-                    ts_event: Some(observed.ts_event),
-                    ts_init: observed.ts_init,
-                }))
-            };
-            let encoded = encode_execution_report(&evidence).unwrap();
-            entries.push(append_payload(
-                entries.len() as u64 + 1,
-                encoded.payload_type.unwrap().as_str(),
-                encoded.payload,
-            ));
-            entries.push(append_order_event(
-                entries.len() as u64 + 1,
-                &OrderEventAny::Filled(second),
-            ));
-            let encoded = encode_execution_report(&ExecutionReport::OrderQueryWithFills(
-                Box::new(final_report),
-                fills,
-            ))
-            .unwrap();
-            entries.push(append_payload(
-                entries.len() as u64 + 1,
-                PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
-                encoded.payload,
-            ));
-            backend.append_batch(&entries).unwrap();
-            backend.seal(RunStatus::Ended).unwrap();
-        }
-        let mut cache = Cache::default();
-        cache.add_instrument(instrument).unwrap();
-        restore_cache_from_sealed_run(
-            &mut cache,
-            tmp.path().to_path_buf(),
-            "trader-001",
-            "query-budget-replay",
-        )
-        .unwrap();
-        let order = cache.order_owned(&initialized.client_order_id).unwrap();
-        assert_eq!(order.status(), OrderStatus::Filled);
-        assert_eq!(order.trade_ids().len(), 2);
-        let position = cache
-            .position_owned(&PositionId::from("P-SHARED-TIME"))
-            .unwrap();
-        assert_eq!(position.quantity, Quantity::from("1000"));
-        assert_eq!(position.commissions(), vec![Money::from("0.03 USD")]);
-    }
-
-    #[rstest]
-    #[case::repeated(1000, false, false, false)]
-    #[case::stale_proof(1000, false, true, false)]
-    #[case::exact_budget(MAX_INCOMPLETE_FILL_OBSERVATIONS, true, false, false)]
-    #[case::overflow(MAX_INCOMPLETE_FILL_OBSERVATIONS, true, false, true)]
-    fn malformed_observation_replay_preserves_freshness_and_retention_budget(
-        #[case] count: usize,
-        #[case] descending: bool,
-        #[case] stale_proof: bool,
-        #[case] overflow: bool,
-        #[values(false, true)] snapshot: bool,
-        #[values(false, true)] cumulative_fee: bool,
-    ) {
-        use nautilus_common::messages::execution::{
-            CommissionBasis, CumulativeCommissionConstraint, OrderFeeOrigin,
-        };
-        let encode_observation = |observed: &IncompleteFillReport| {
-            let report = if cumulative_fee {
-                ExecutionReport::OrderFeeEvidence(Box::new(OrderFeeEvidence {
-                    account_id: observed.account_id,
-                    instrument_id: observed.instrument_id,
-                    venue_order_id: observed.venue_order_id,
-                    client_order_id: observed.client_order_id,
-                    venue_position_id: observed.venue_position_id,
-                    order_side: observed.order_side,
-                    boundary_quantity: observed.last_qty,
-                    boundary_time: observed.ts_event,
-                    anchor_trade_id: observed.trade_id,
-                    anchor_trade_time: observed.ts_event,
-                    origin: OrderFeeOrigin::Stream,
-                    constraints: vec![CumulativeCommissionConstraint {
-                        basis: Some(CommissionBasis::ChargesOnly),
-                        amount: observed.commission_amount,
-                        currency: observed.commission_currency,
-                    }],
-                    unrepresentable_values: false,
-                    requires_fresh_query: true,
-                    ts_init: observed.ts_init,
-                }))
-            } else {
-                ExecutionReport::IncompleteFill(Box::new(observed.clone()))
-            };
-            encode_execution_report(&report).unwrap()
-        };
-        let payload_type = if cumulative_fee {
-            PAYLOAD_TYPE_ORDER_FEE_EVIDENCE
-        } else {
-            PAYLOAD_TYPE_INCOMPLETE_FILL
-        };
-        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
-        let initialized = OrderInitializedSpec::builder()
-            .instrument_id(instrument.id())
-            .build();
-        let cid = initialized.client_order_id;
-        let submitted = OrderSubmittedSpec::builder()
-            .instrument_id(instrument.id())
-            .client_order_id(cid)
-            .build();
-        let accepted = OrderAcceptedSpec::builder()
-            .instrument_id(instrument.id())
-            .client_order_id(cid)
-            .account_id(submitted.account_id)
-            .build();
-        let filled = OrderFilledSpec::builder()
-            .instrument_id(instrument.id())
-            .client_order_id(cid)
-            .account_id(submitted.account_id)
-            .venue_order_id(accepted.venue_order_id)
-            .last_qty(initialized.quantity)
-            .commission(Money::from("0.01 USD"))
-            .ts_event(UnixNanos::from(10))
-            .build();
-        let fill = FillReport::new(
-            filled.account_id,
-            filled.instrument_id,
-            filled.venue_order_id,
-            filled.trade_id,
-            filled.order_side,
-            filled.last_qty,
-            filled.last_px,
-            filled.commission.unwrap(),
-            filled.liquidity_side,
-            Some(cid),
-            filled.position_id,
-            filled.ts_event,
-            UnixNanos::from(20),
-            None,
-        );
-        let status = OrderStatusReport::new(
-            fill.account_id,
-            fill.instrument_id,
-            Some(cid),
-            fill.venue_order_id,
-            Some(fill.order_side),
-            initialized.order_type,
-            initialized.time_in_force,
-            OrderStatus::Filled,
-            initialized.quantity,
-            initialized.quantity,
-            UnixNanos::default(),
-            fill.ts_event,
-            UnixNanos::from(10000),
-            None,
-        );
-        let query = encode_execution_report(&ExecutionReport::OrderQueryWithFills(
-            Box::new(status),
-            vec![fill.clone()],
-        ))
-        .unwrap();
-        let mut observed = IncompleteFillReport {
-            account_id: fill.account_id,
-            instrument_id: fill.instrument_id,
-            venue_order_id: fill.venue_order_id,
-            client_order_id: None,
-            trade_id: Some(fill.trade_id),
-            trade_id_placeholder: false,
-            order_side: fill.order_side,
-            last_qty: Some(fill.last_qty.as_decimal()),
-            last_px: Some(fill.last_px.as_decimal()),
-            commission_amount: None,
-            commission_currency: Some(fill.commission.currency),
-            unrepresentable_values: false,
-            requires_fresh_query: true,
-            order_snapshot: None,
-            liquidity_side: Some(fill.liquidity_side),
-            venue_position_id: fill.venue_position_id,
-            ts_event: Some(fill.ts_event),
-            ts_init: UnixNanos::from(20),
-        };
-        let events = [
-            OrderEventAny::Initialized(initialized.clone()),
-            OrderEventAny::Submitted(submitted),
-            OrderEventAny::Accepted(accepted),
-            OrderEventAny::Filled(filled),
-        ];
-        let mut order = OrderAny::try_from(initialized).unwrap();
-        for event in &events[1..] {
-            order.apply(event.clone()).unwrap();
-        }
-        let mut entries: Vec<_> = events
-            .iter()
-            .enumerate()
-            .map(|(i, event)| append_order_event(i as u64 + 1, event))
-            .collect();
-
-        if stale_proof {
-            entries.push(append_payload(
-                entries.len() as u64 + 1,
-                PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
-                query.payload.clone(),
-            ));
-        }
-
-        for index in 0..count {
-            observed.ts_init =
-                UnixNanos::from(100 + if descending { count - index } else { index } as u64);
-            observed.client_order_id = if descending && index % 2 == 0 {
-                Some(cid)
-            } else {
-                None
-            };
-            let encoded = encode_observation(&observed);
-            entries.push(append_payload(
-                entries.len() as u64 + 1,
-                payload_type,
-                encoded.payload,
-            ));
-        }
-        let mut context = CacheReplayContext::default();
-        for entry in &entries {
-            context
-                .record_incomplete_fill_evidence(&entry.entry)
-                .unwrap();
-            context.record_order_fee_evidence(&entry.entry).unwrap();
-            context.record_query_fill_evidence(&entry.entry).unwrap();
-        }
-        assert_eq!(
-            if cumulative_fee {
-                context.order_fee_evidence.len()
-            } else {
-                context.incomplete_fill_evidence.len()
-            },
-            if descending || cumulative_fee {
-                count
-            } else {
-                2
-            }
-        );
-        assert_eq!(
-            if cumulative_fee {
-                context.order_fee_evidence.last().unwrap().0
-            } else {
-                context.incomplete_fill_evidence.last().unwrap().0
-            },
-            entries.len() as u64
-        );
-        // The snapshot path re-reads the tail; this must not create new obligations
-        for entry in &entries {
-            context
-                .record_incomplete_fill_evidence(&entry.entry)
-                .unwrap();
-            context.record_order_fee_evidence(&entry.entry).unwrap();
-            context.record_query_fill_evidence(&entry.entry).unwrap();
-        }
-        assert_eq!(
-            if cumulative_fee {
-                context.order_fee_evidence.len()
-            } else {
-                context.incomplete_fill_evidence.len()
-            },
-            if descending || cumulative_fee {
-                count
-            } else {
-                2
-            }
-        );
-
-        if overflow {
-            observed.commission_amount = Some("123".parse().unwrap());
-            let encoded = encode_observation(&observed);
-            entries.push(append_payload(
-                entries.len() as u64 + 1,
-                payload_type,
-                encoded.payload,
-            ));
-        }
-        let high_watermark = entries.len() as u64;
-        if !stale_proof {
-            entries.push(append_payload(
-                entries.len() as u64 + 1,
-                PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
-                query.payload,
-            ));
-        }
-        let mut backend = MemoryBackend::new();
-        backend.open_run(manifest("malformed-retention")).unwrap();
-        backend.append_batch(&entries).unwrap();
-        if snapshot {
-            backend
-                .record_snapshot_anchor(SnapshotAnchor::new(
-                    high_watermark,
-                    "cache://incomplete",
-                    "hash",
-                ))
-                .unwrap();
-        }
-        let reader = EventStoreReader::new(backend);
-        let mut cache = Cache::default();
-        cache.add_instrument(instrument).unwrap();
-        let result =
-            restore_cache_snapshot_and_replay_tail(&mut cache, &reader, |cache, anchor| {
-                if snapshot {
-                    assert_eq!(anchor.unwrap().high_watermark, high_watermark);
-                    cache.add_order(order, None, None, false).unwrap();
-                    cache.build_index();
-                } else {
-                    assert!(anchor.is_none());
-                }
-                Ok(())
-            });
-
-        if overflow {
-            assert!(result.unwrap_err().to_string().contains(if cumulative_fee {
-                "Cumulative fee observation budget exhausted"
-            } else {
-                "Incomplete fill observation budget exhausted"
-            }));
-        } else if stale_proof {
-            assert!(result.unwrap_err().to_string().contains(if cumulative_fee {
-                "Unresolved persisted cumulative commission recovery"
-            } else {
-                "Unresolved persisted incomplete fill recovery"
-            }));
-        } else {
-            result.unwrap();
-        }
-    }
-
-    #[rstest]
-    fn unresolved_query_before_snapshot_anchor_rejects_restore() {
-        let initialized = OrderInitializedSpec::builder().build();
-        let report = OrderStatusReport::new(
-            AccountId::from("SIM-001"),
-            initialized.instrument_id,
-            Some(initialized.client_order_id),
-            VenueOrderId::from("V-PENDING"),
-            Some(initialized.order_side),
-            initialized.order_type,
-            initialized.time_in_force,
-            OrderStatus::Filled,
-            initialized.quantity,
-            initialized.quantity,
-            UnixNanos::from(1),
-            UnixNanos::from(2),
-            UnixNanos::from(2),
-            None,
-        );
-        let encoded = encode_execution_report(&ExecutionReport::OrderQueryWithFills(
-            Box::new(report),
-            Vec::new(),
-        ))
-        .unwrap();
-        let mut backend = MemoryBackend::new();
-        backend.open_run(manifest("pending-before-anchor")).unwrap();
-        backend
-            .append_batch(&[append_payload(
-                1,
-                PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
-                encoded.payload,
-            )])
-            .unwrap();
-        backend
-            .record_snapshot_anchor(SnapshotAnchor::new(1, "cache://pending", "hash"))
-            .unwrap();
-        let reader = EventStoreReader::new(backend);
-        let mut cache = Cache::default();
-        let mut restored = false;
-        let result = restore_cache_snapshot_and_replay_tail(&mut cache, &reader, |_, anchor| {
-            assert_eq!(anchor.unwrap().high_watermark, 1);
-            restored = true;
-            Ok(())
-        });
-        assert!(restored);
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Unresolved persisted order fill recovery")
-        );
-    }
-
-    #[rstest]
-    fn legacy_order_capture_is_rejected_before_cache_restore() {
-        let initialized = OrderInitializedSpec::builder().build();
-        let id = initialized.client_order_id;
-        let mut legacy_manifest = manifest("legacy-orders");
-        legacy_manifest.feature_flags.clear();
-        let mut backend = MemoryBackend::new();
-        backend.open_run(legacy_manifest).unwrap();
-        backend
-            .append_batch(&[append_order_event(
-                1,
-                &OrderEventAny::Initialized(initialized),
-            )])
-            .unwrap();
-        let reader = EventStoreReader::new(backend);
-        let mut cache = Cache::default();
-        let result = replay_cache_snapshot_tail(&mut cache, &reader);
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Unsupported legacy order capture contract")
-        );
-        assert!(!cache.order_exists(&id));
-    }
-
-    #[rstest]
-    #[case::orphan(false, false, false)]
-    #[case::conflict(true, true, false)]
-    #[case::late_marker(true, false, true)]
-    #[case::matching(true, false, false)]
-    fn order_only_projection_requires_matching_later_commit(
-        #[case] committed: bool,
-        #[case] conflict: bool,
-        #[case] late_marker: bool,
-    ) {
-        let fill = OrderFilledSpec::builder().build();
-        let mut marker = append_order_event(
-            if late_marker { 3 } else { 1 },
-            &OrderEventAny::Filled(fill.clone()),
-        )
-        .entry;
-        marker.topic = EntryTopic::from(
-            switchboard::get_order_fill_order_only_topic(fill.instrument_id).as_str(),
-        );
-        let mut context = CacheReplayContext::for_snapshot_tail();
-        context.record_order_fill_projection(&marker).unwrap();
-
-        if committed {
-            let mut recorded = fill;
-            if conflict {
-                recorded.commission = Some(Money::from("99 USD"));
-            }
-            let entry = append_order_event(2, &OrderEventAny::Filled(recorded)).entry;
-            let result = context.record_order_fill_projection(&entry);
-
-            if conflict || late_marker {
-                assert!(
-                    result
-                        .unwrap_err()
-                        .to_string()
-                        .contains("does not match committed fill")
-                );
-                return;
-            }
-            result.unwrap();
-            context
-                .ensure_order_projections_complete(&Cache::default())
-                .unwrap();
-        } else {
-            assert!(
-                context
-                    .ensure_order_projections_complete(&Cache::default())
-                    .unwrap_err()
-                    .to_string()
-                    .contains("has no committed fill")
-            );
-        }
-    }
-
-    #[rstest]
-    #[case(false)]
-    #[case(true)]
-    fn order_fill_replay_updates_order_and_creates_position(#[case] forensic_copies: bool) {
+    fn order_fill_replay_updates_order_and_creates_position() {
         let instrument = InstrumentAny::CurrencyPair(audusd_sim());
         let position_id = PositionId::from("P-001");
         let initialized = OrderInitializedSpec::builder()
@@ -5707,43 +4240,16 @@ mod tests {
             .position_id(position_id)
             .commission(Money::from("1 USD"))
             .build();
-        let trade_id = filled.trade_id;
         let filled_event = OrderEventAny::Filled(filled.clone());
-        let mut entries = vec![
-            append_order_event(1, &OrderEventAny::Initialized(initialized)),
-            append_order_event(2, &OrderEventAny::Submitted(submitted)),
-            append_order_event(3, &OrderEventAny::Accepted(accepted)),
-        ];
-
-        if forensic_copies {
-            let mut unapplied = filled_event.clone();
-            if let OrderEventAny::Filled(fill) = &mut unapplied {
-                fill.position_id = None;
-                fill.commission = Some(Money::from("99 USD"));
-            }
-
-            for topic in [
-                "ExecEngine.process",
-                "Portfolio.update_order",
-                "events.order_fill_declined.AUD/USD.SIM",
-            ] {
-                let mut captured = append_order_event(entries.len() as u64 + 1, &unapplied);
-                let entry = &mut captured.entry;
-                entry.topic = EntryTopic::from(topic);
-                entry.entry_hash = compute_entry_hash(
-                    entry.seq,
-                    entry.ts_init,
-                    entry.ts_publish,
-                    entry.topic.as_ref(),
-                    entry.payload_type.as_str(),
-                    &entry.payload,
-                    &entry.headers,
-                );
-                entries.push(captured);
-            }
-        }
-        entries.push(append_order_event(entries.len() as u64 + 1, &filled_event));
-        let reader = reader_with_entries("run-order-replay", &entries);
+        let reader = reader_with_entries(
+            "run-order-replay",
+            &[
+                append_order_event(1, &OrderEventAny::Initialized(initialized)),
+                append_order_event(2, &OrderEventAny::Submitted(submitted)),
+                append_order_event(3, &OrderEventAny::Accepted(accepted)),
+                append_order_event(4, &filled_event),
+            ],
+        );
         let mut cache = Cache::default();
         cache.add_instrument(instrument).expect("add instrument");
 
@@ -5754,13 +4260,13 @@ mod tests {
             .expect("position replayed");
 
         assert_eq!(report.applied_entries, 4);
-        assert_eq!(report.ignored_entries, if forensic_copies { 3 } else { 0 });
+        assert_eq!(report.ignored_entries, 0);
         assert_eq!(order.status(), OrderStatus::Filled);
         assert_eq!(order.event_count(), 4);
         assert_eq!(order.last_event(), &filled_event);
         assert_eq!(position.event_count(), 1);
-        assert_eq!(position.last_event(), Some(filled));
-        assert_eq!(position.trade_ids(), vec![trade_id]);
+        assert_eq!(position.last_event(), Some(filled.clone()));
+        assert_eq!(position.trade_ids(), vec![filled.trade_id]);
         assert_eq!(position.commissions(), vec![Money::from("1 USD")]);
     }
 
@@ -7060,7 +5566,7 @@ mod tests {
         // The entry hash proves the stored bytes match what was written, not that the
         // producer wrote a valid fill; the legacy sentinel deserializes cleanly and
         // without the guard panics deep inside Position/Order application.
-        let payload = IndexMap::from([("order_side", "NO_ORDER_SIDE"), ("strategy_id", "S-001")]);
+        let payload = IndexMap::from([("order_side", "NO_ORDER_SIDE")]);
         let entry = append_serde_payload(1, PAYLOAD_TYPE_ORDER_FILLED, &payload).entry;
         let mut cache = Cache::default();
 
