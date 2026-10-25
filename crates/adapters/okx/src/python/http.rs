@@ -917,6 +917,10 @@ impl OKXHttpClient {
 
     /// Requests fill reports (transaction details) for the given parameters.
     ///
+    /// Start/end select OKX record-generation timestamps (`ts`), as on the REST endpoint.
+    /// Returned event timestamps require execution time (`fillTime`), so they can
+    /// precede the record window. Missing execution times fail report parsing.
+    ///
     /// # Errors
     ///
     /// Returns an error if the request fails.

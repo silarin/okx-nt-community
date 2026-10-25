@@ -134,9 +134,7 @@ use crate::{
     dispatch::drain_callbacks,
     execution::{
         client::LiveExecutionClient,
-        manager::{
-            ExecutionManager, ExecutionManagerConfig, TargetedOrderQuery, TargetedOrderReportResult,
-        },
+        manager::{ExecutionManager, ExecutionManagerConfig, TargetedOrderQuery},
     },
     runner::{AsyncRunner, AsyncRunnerChannels, PendingRunnerEvent},
     socket::{SocketReconnectLookup, SocketReconnectRegistry},
@@ -160,9 +158,9 @@ pub use metrics::{RunnerChannelMetricsSnapshot, RunnerMetricsDelta, RunnerMetric
 use metrics::{RunnerChannelQueueDepths, RunnerMetrics};
 use queue::{QueueMonitor, QueueStateTransition};
 use reconciliation::{
-    OpenOrderReportResult, OpenOrderReportTask, PositionReportTask, PositionReportTaskResult,
-    ReconciliationCheckIntervals, ReconciliationCheckState, ReportTaskOutcome,
-    TargetedOrderReportTask,
+    OpenOrderReportCollection, OpenOrderReportTask, PositionFillReportResult, PositionReportTask,
+    PositionReportTaskResult, ReconciliationCheckIntervals, ReconciliationCheckState,
+    ReportTaskOutcome, TargetedOrderReportTask,
 };
 use state::{EngineConnectionStatus, RunningTransition};
 pub use state::{LiveNodeHandle, NodeRunMode, NodeState};
@@ -1595,6 +1593,8 @@ impl LiveNode {
             .as_ref()
             .map(|config| QueueMonitor::new(config, metrics.snapshot()));
         let mut dispatches_since_yield = 0usize;
+        let mut skip_time = false;
+        let mut skip_data = false;
 
         let dispatch_result = loop {
             let callbacks_pending = match drain_callbacks().await {
@@ -1615,6 +1615,9 @@ impl LiveNode {
             let shutdown_deadline = self.shutdown_deadline;
             let is_shutting_down = self.state() == NodeState::ShuttingDown;
             let is_running = self.state() == NodeState::Running;
+            let commands_empty = channels.data_cmd.is_empty();
+            let poll_time = !skip_time || (channels.data_evt.is_empty() && commands_empty);
+            let poll_data = !skip_data || commands_empty;
 
             tokio::select! {
                 biased;
@@ -1655,7 +1658,7 @@ impl LiveNode {
                 result = async {
                     match open_order_report_task.as_mut() {
                         Some(task) => task.future.as_mut().await,
-                        None => std::future::pending::<ReportTaskOutcome<OpenOrderReportResult>>().await,
+                        None => std::future::pending::<ReportTaskOutcome<OpenOrderReportCollection>>().await,
                     }
                 }, if open_order_report_task.is_some() => {
                     let maintenance_start = dst::time::Instant::now();
@@ -1664,6 +1667,7 @@ impl LiveNode {
 
                     match result {
                         ReportTaskOutcome::Completed(result) => {
+                            let result = result.finish();
                             let client_refs = self
                                 .exec_clients
                                 .iter()
@@ -1709,36 +1713,13 @@ impl LiveNode {
                 result = async {
                     match targeted_order_report_task.as_mut() {
                         Some(task) => task.future.as_mut().await,
-                        None => std::future::pending::<ReportTaskOutcome<Vec<TargetedOrderReportResult>>>().await,
+                        None => std::future::pending::<ReportTaskOutcome<()>>().await,
                     }
                 }, if targeted_order_report_task.is_some() => {
                     let maintenance_start = dst::time::Instant::now();
 
-                    let planned_client_order_ids = targeted_order_report_task
-                        .as_ref()
-                        .map(|task| task.planned_client_order_ids.clone())
-                        .unwrap_or_default();
-                    drop(targeted_order_report_task.take());
-
-                    match result {
-                        ReportTaskOutcome::Completed(result) => {
-                            let client_refs = self
-                                .exec_clients
-                                .iter()
-                                .map(|client| client as &dyn ExecutionClient)
-                                .collect::<Vec<_>>();
-                            let events = self
-                                .exec_manager
-                                .reconcile_targeted_order_reports(result, &client_refs);
-                            self.process_reconciliation_events(&events);
-                        }
-                        ReportTaskOutcome::TimedOut => {
-                            self.cleanup_cancelled_report_tasks(&planned_client_order_ids);
-                            log::warn!(
-                                "Targeted order report collection expired after {:?}",
-                                self.config.timeout_reconciliation,
-                            );
-                        }
+                    if let Some(task) = targeted_order_report_task.take() {
+                        self.complete_targeted_order_report_check(task, &result);
                     }
                     record_runner_maintenance(&metrics, maintenance_start, metrics_start);
                 }
@@ -1757,11 +1738,18 @@ impl LiveNode {
                             if is_shutting_down {
                                 self.cleanup_cancelled_report_tasks(&[]);
                             } else {
+                                let result = result.finish();
                                 position_report_task = self.handle_position_report_result(result);
                             }
                         }
-                        ReportTaskOutcome::Completed(PositionReportTaskResult::Fills(result)) => {
-                            self.handle_position_fill_report_result(result);
+                        ReportTaskOutcome::Completed(PositionReportTaskResult::Fills { position_result, collection }) => {
+                            let result = collection.finish();
+                            self.handle_position_fill_report_result(PositionFillReportResult {
+                                position_result,
+                                reports: result.reports,
+                                sources: Box::new(result.sources),
+                                successful_keys: result.successful_keys,
+                            });
                         }
                         ReportTaskOutcome::TimedOut => {
                             self.cleanup_cancelled_report_tasks(&[]);
@@ -1855,7 +1843,8 @@ impl LiveNode {
                 // ordered ahead of data events so a strategy action (cancel,
                 // submit, etc.) is not delayed behind a market data backlog
                 // when the biased select polls receivers each iteration.
-                Some(handler) = channels.time_evt.recv() => {
+                Some(handler) = channels.time_evt.recv(), if poll_time => {
+                    skip_time = true;
                     let dispatch_start = dst::time::Instant::now();
                     let dispatched = AsyncRunner::handle_time_event(handler);
 
@@ -1874,6 +1863,8 @@ impl LiveNode {
                     }
                 }
                 Some(event) = channels.system_evt.recv() => {
+                    skip_time = false;
+
                     if is_shutting_down {
                         log::debug!("Residual system event: {event}");
                         residual_events += 1;
@@ -1881,6 +1872,8 @@ impl LiveNode {
                     event.dispatch(|event| self.process_system_event(event));
                 }
                 Some(command) = channels.system_cmd.recv() => {
+                    skip_time = false;
+
                     if is_shutting_down {
                         log::debug!("Residual system command: {command}");
                         residual_events += 1;
@@ -1888,6 +1881,7 @@ impl LiveNode {
                     command.dispatch(|command| self.process_system_command(command));
                 }
                 Some(evt) = channels.exec_evt.recv() => {
+                    skip_time = false;
                     let dispatch_start = dst::time::Instant::now();
 
                     if is_shutting_down {
@@ -1904,6 +1898,7 @@ impl LiveNode {
                     );
                 }
                 Some(cmd) = channels.exec_cmd.recv() => {
+                    skip_time = false;
                     let dispatch_start = dst::time::Instant::now();
 
                     if is_shutting_down {
@@ -1920,6 +1915,7 @@ impl LiveNode {
                     );
                 }
                 message = recv_external_msgbus_message(&mut external_msgbus_rx, &mut pending_external) => {
+                    skip_time = false;
                     let external_msgbus_start = dst::time::Instant::now();
 
                     match message {
@@ -1943,7 +1939,9 @@ impl LiveNode {
                         metrics_start,
                     );
                 }
-                Some(evt) = channels.data_evt.recv() => {
+                Some(evt) = channels.data_evt.recv(), if poll_data => {
+                    skip_time = false;
+                    skip_data = true;
                     let dispatch_start = dst::time::Instant::now();
 
                     if is_shutting_down {
@@ -1959,6 +1957,8 @@ impl LiveNode {
                     );
                 }
                 Some(cmd) = channels.data_cmd.recv() => {
+                    skip_time = false;
+                    skip_data = false;
                     let dispatch_start = dst::time::Instant::now();
 
                     if is_shutting_down {
@@ -1990,7 +1990,9 @@ impl LiveNode {
             &mut open_order_report_task,
             &mut targeted_order_report_task,
             &mut position_report_task,
+            dispatch_result.is_ok(),
         );
+
         drop(external_msgbus_rx.take());
         let _ = self.kernel.cache().borrow().check_residuals();
 
@@ -3888,6 +3890,7 @@ fn render_client_statuses(rows: Vec<ClientStatus>) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod report_acceptance;
     mod shutdown;
 
     use std::{
@@ -4443,7 +4446,9 @@ mod tests {
     #[tokio::test]
     async fn test_external_startup_dispatches_correlated_response_before_buffered_traffic() {
         use bytes::Bytes;
-        use nautilus_common::messages::data::{CustomDataResponse, DataResponse};
+        use nautilus_common::messages::data::{
+            CustomDataResponse, DataResponse, DataResponseEnvelope,
+        };
         use nautilus_model::data::DataType;
 
         let (egress, publications, _) = CapturingExternalEgress::new();
@@ -4485,7 +4490,11 @@ mod tests {
         let done = Rc::new(RefCell::new(Some(done)));
         msgbus::register_response_handler(
             &id,
-            ShareableMessageHandler::from_typed::<CustomDataResponse, _>(move |reply| {
+            TypedHandler::from(move |envelope: &DataResponseEnvelope| {
+                let Some(DataResponse::Data(reply)) = envelope.response() else {
+                    panic!("expected custom reply");
+                };
+
                 done.borrow_mut()
                     .take()
                     .unwrap()
@@ -5053,6 +5062,66 @@ mod tests {
     }
 
     #[rstest]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_run_dispatch_progress_under_load(
+        #[values(false, true)] execution: bool,
+        #[values(false, true)] slow: bool,
+    ) {
+        let config = LiveNodeConfig {
+            delay_post_stop: Duration::ZERO,
+            ..Default::default()
+        };
+        let mut node = LiveNode::build("FairDispatchNode".to_string(), Some(config)).unwrap();
+        let handle = node.handle();
+        let stop = handle.clone();
+        let callback = TimeEventCallback::RustLocal(Rc::new(move |event| {
+            if slow {
+                // Make housekeeping ready after each timer callback
+                std::thread::sleep(Duration::from_millis(110));
+            }
+
+            if event.ts_init == UnixNanos::from(8) {
+                // Check progress before shutdown can drain the queues
+                let snapshot = stop.metrics_snapshot();
+                assert_eq!(snapshot.time_events.dispatched, 7);
+
+                if execution {
+                    assert!((1..16).contains(&snapshot.exec_events.dispatched));
+                    assert_eq!(snapshot.data_events.dispatched, 0);
+                } else {
+                    assert!(snapshot.data_events.dispatched > 0);
+                    assert_eq!(snapshot.data_commands.dispatched, 1);
+                }
+                stop.stop();
+            }
+        }));
+
+        let drive = async {
+            wait_until_async(|| async { handle.is_running() }, Duration::from_secs(2)).await;
+
+            for ts in (1..=16_u64).map(UnixNanos::from) {
+                nautilus_common::runner::get_time_event_sender().send(TimeEventMessage::new(
+                    TimeEvent::new("fairness".into(), UUID4::new(), ts, ts),
+                    callback.clone(),
+                ));
+                get_data_event_sender().send(stub_data_event()).unwrap();
+
+                if execution {
+                    get_exec_event_sender().send(stub_exec_event()).unwrap();
+                }
+            }
+            nautilus_common::runner::get_data_cmd_sender().execute(stub_data_command());
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (result, ()) = tokio::join!(node.run(), drive);
+            result.unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(handle.should_stop());
+    }
+
+    #[rstest]
     fn test_observe_exec_event_before_dispatch_skips_recent_fill_report() {
         let config = LiveNodeConfig {
             exec_engine: crate::config::LiveExecutionEngineConfig {
@@ -5492,7 +5561,8 @@ mod tests {
                 command: command.clone(),
             }],
         )
-        .await;
+        .await
+        .finish();
 
         assert_eq!(*commands.borrow(), vec![command]);
         assert!(result.successful_keys.is_empty());
@@ -5555,7 +5625,8 @@ mod tests {
                 command,
             }],
         )
-        .await;
+        .await
+        .finish();
 
         assert_eq!(result.successful_keys, IndexSet::from([key]));
         assert_eq!(
@@ -5632,7 +5703,8 @@ mod tests {
                 command,
             }],
         )
-        .await;
+        .await
+        .finish();
 
         assert!(result.successful_keys.is_empty());
         assert!(result.reports.is_empty());
@@ -5701,7 +5773,8 @@ mod tests {
                 command,
             }],
         )
-        .await;
+        .await
+        .finish();
 
         assert_eq!(result.successful_keys, IndexSet::from([key]));
         assert_eq!(
@@ -5779,7 +5852,9 @@ mod tests {
 
         queries.push(healthy_query);
 
-        let result = request_position_fill_reports(clients, queries).await;
+        let result = request_position_fill_reports(clients, queries)
+            .await
+            .finish();
 
         assert_eq!(result.successful_keys, IndexSet::from([healthy_key]));
         assert_eq!(
@@ -5810,7 +5885,9 @@ mod tests {
                 command: query.command.clone(),
             });
         }
-        let result = request_position_fill_reports(clients, queries).await;
+        let result = request_position_fill_reports(clients, queries)
+            .await
+            .finish();
         assert!(result.successful_keys.is_empty());
         assert!(result.reports.is_empty());
     }
@@ -5864,7 +5941,9 @@ mod tests {
             commands: Rc::new(RefCell::new(Vec::new())),
         }));
 
-        let result = request_position_fill_reports(vec![client], vec![query]).await;
+        let result = request_position_fill_reports(vec![client], vec![query])
+            .await
+            .finish();
 
         if accepted {
             assert_eq!(result.successful_keys, IndexSet::from([key]));
@@ -8533,6 +8612,7 @@ mod tests {
                 panic!("position collection should complete despite one client failure");
             };
 
+            let result = result.finish();
             assert!(result.reports.is_empty());
             assert!(open_task.is_none());
             (result.queried_clients, result.failed_clients)
@@ -8540,6 +8620,8 @@ mod tests {
             let ReportTaskOutcome::Completed(result) = open_task.unwrap().future.await else {
                 panic!("order collection should complete despite one client failure");
             };
+
+            let result = result.finish();
 
             assert!(result.reports.is_empty());
             assert!(position_task.is_none());

@@ -790,8 +790,8 @@ The margin fraction uses venue ticks (1e-4 fraction): `500` is 5% initial margin
 and `1000` is 10% (10x).
 
 `UpdateLeverage`, `CancelAllOrders`, modify orders with integrator attributes, conditional create
-orders, and `CreateGroupedOrders` are byte-pinned against the signer distributed with the official
-`lighter-python` SDK version 1.1.4.
+orders, and `CreateGroupedOrders` are byte-pinned against the compiled `lighter-go` v1.0.12 signer.
+Create, cancel, modify, grouped orders, and leverage updates include market IDs above 16 and 32 bits.
 
 ### Order querying and reconciliation
 
@@ -896,11 +896,13 @@ neither spot borrowing nor collateral-mode changes; the spot-margin row describe
 | --------------------------- | ------- | ------------------------------------------------------------- |
 | Liquidation trades          | ✓       | Account trade rows can parse as fills, with no special event. |
 | Deleverage trades           | ✓       | Account trade rows can parse as fills, with no special event. |
-| Liquidation price reporting | -       | *Not currently implemented*; position reports omit the field. |
+| Liquidation price reporting | ✓       | Position reports include the venue-reported value.            |
 | ADL event stream            | -       | *Not currently implemented*; no notification subscription.    |
 
-The adapter parses `liquidation_price` in raw position payloads but omits it from Nautilus reports.
-It does not subscribe to the authenticated
+`PositionStatusReport.liquidation_price` preserves the venue's decimal value, including zero.
+Synthetic flat reports leave it unset.
+
+The adapter does not subscribe to the authenticated
 [`notification` stream](https://apidocs.lighter.xyz/docs/websocket-reference#notification) for liquidation
 and deleverage alerts. These trades use the normal fill-report path.
 
