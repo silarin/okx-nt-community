@@ -1199,7 +1199,8 @@ the trigger count resets at 00:00 UTC. Schedules survive disconnects, stops, and
 :::warning[Live validation]
 Successful arming, replacement, clearing, and expiry remain unverified live: mainnet requests were rejected
 because the account did not meet the volume requirement. If the feature fails or behaves unexpectedly,
-[report the issue on GitHub](https://github.com/nautechsystems/nautilus_trader/issues).
+[report the issue in this fork](https://github.com/silarin/okx-nt-community/issues), including the
+exact source commit. Submit a separate upstream report only after reproducing it on upstream source.
 :::
 
 #### Automatic refresh
@@ -1963,5 +1964,5 @@ variables.
 
 :::info
 For feature requests or contributions, see the
-[contributing guide](https://github.com/nautechsystems/nautilus_trader/blob/develop/CONTRIBUTING.md).
+[contributing guide](../../CONTRIBUTING.md).
 :::

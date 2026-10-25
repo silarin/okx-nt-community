@@ -18,11 +18,15 @@ or `.pdf`) exports a static image through Kaleido.
 
 :::note
 The visualization system requires the `visualization` extra. It installs Pandas for
-DataFrame handling, Plotly for interactive figures, and Kaleido for static image export:
+DataFrame handling, Plotly for interactive figures, and Kaleido for static image export.
+In this fork's source checkout, sync the extras and build the local package:
 
 ```bash
-uv pip install --pre "nautilus_trader[visualization]"
+make sync
+make build-debug
 ```
+
+Use `python/.venv` for examples. Installing the upstream package from PyPI would omit fork-only changes.
 
 :::
 

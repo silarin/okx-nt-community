@@ -1,7 +1,18 @@
 # Adapters and Integrations
 
-This document describes how NautilusTrader classifies adapters, the path between
-tiers, and how community adapters can be listed.
+## Fork support
+
+This fork maintains the OKX behavior described in [FORK.md](FORK.md). Other adapters are inherited
+source; their presence does not establish additional support commitments by this fork's maintainer.
+Report fork issues in [this repository](https://github.com/silarin/okx-nt-community/issues), with the
+exact source commit and reproduction details. New adapter work needs explicit maintenance and
+validation scope agreed with the fork maintainer.
+
+## Upstream classification reference
+
+The remaining sections describe how upstream NautilusTrader classifies adapters, the path between
+tiers, and upstream community listings. "Official" means official to upstream, not an endorsement
+of this fork or a support promise for its builds.
 
 For naming rules, disclaimer requirements, and trademark guidance, see [TRADEMARK.md](./TRADEMARK.md).
 
@@ -60,7 +71,8 @@ defined in [TRADEMARK.md](./TRADEMARK.md).
 
 ### Existing adapters
 
-All adapters currently in the core repository are Official by definition. This
+All adapters currently in the upstream core repository are Official by upstream
+definition. This
 framework applies going forward.
 
 ## Support
@@ -69,9 +81,10 @@ NautilusTrader maintainers provide support for official adapters only. Issues
 with community or external adapters should be directed to their respective
 maintainers.
 
-If you believe an issue originates in the NautilusTrader core rather than a
-third-party adapter, please file a minimal reproducible example against the
-[core repository](https://github.com/nautechsystems/nautilus_trader/issues).
+For an issue independently reproduced in unmodified upstream NautilusTrader, follow upstream's
+contribution process when filing a minimal reproducible example against the
+[upstream core repository](https://github.com/nautechsystems/nautilus_trader/issues).
+Fork-only issues belong in this fork's issue tracker.
 
 ## Official adapters
 

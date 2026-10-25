@@ -1,5 +1,12 @@
 # Security Architecture
 
+:::note[Upstream reference]
+This page describes the inherited upstream release architecture. It does not establish equivalent
+publishing or signing infrastructure for OKX NT Community. The verification commands intentionally
+identify upstream repositories and artifacts; changing those identities is not evidence that a fork
+artifact is trusted. For this fork's reporting and validation scope, see [SECURITY.md](../../SECURITY.md).
+:::
+
 This page describes the security model for the NautilusTrader release pipeline.
 It explains how release artifacts are built, published, attested, and verified.
 

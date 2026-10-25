@@ -1,73 +1,61 @@
 # Security Policy
 
-Security is a priority for the NautilusTrader project, and we value the work of
-those who help identify and resolve vulnerabilities. We apply layered controls across the
-development and release lifecycle, with signed and attested releases, continuous vulnerability management, and
-transparent development practices. If you have found a security issue, please follow the guidelines
-below.
-
-For our full security policies, see <https://nautilustrader.io/security/>.
+This policy covers **OKX NT Community**, the independent source fork maintained by
+[silarin](https://github.com/silarin). Nautech Systems and upstream NautilusTrader do not provide
+security support for this repository.
 
 ## Scope
 
-This policy covers:
+Report vulnerabilities in this fork's source and maintained changes. Include the exact commit,
+build configuration, and affected dependency versions. Third-party services, exchanges, data
+providers, and Nautech Systems websites are outside this fork's scope.
 
-- NautilusTrader open-source software and official repositories.
-- Nautech Systems websites (nautilustrader.io).
+## Reporting a vulnerability
 
-Third-party services, exchanges, and data providers are excluded.
+Use [this fork's private vulnerability reporting form](https://github.com/silarin/okx-nt-community/security/advisories/new).
+Private vulnerability reporting is enabled for this repository. Do not put vulnerability details,
+credentials, or private trading data in public issues, PRs, or conduct-contact requests.
 
-## Reporting a Vulnerability
+Include the impact, reproduction steps, affected commits, and suggested remediation if available.
+For a vulnerability reproduced in unmodified upstream software, coordinate with the fork maintainer
+and follow [upstream's security policy](https://github.com/nautechsystems/nautilus_trader/blob/develop/SECURITY.md)
+for a separate upstream disclosure.
 
-**Preferred method:** [GitHub Security Advisories](https://github.com/nautechsystems/nautilus_trader/security/advisories/new)
+## Response and disclosure
 
-This allows private disclosure and coordination before public release. You'll
-receive credit in the security advisory and release notes.
+The fork maintainer handles triage and coordinates remediation and disclosure with the reporter.
+Response and fix times depend on availability and the issue; this fork does not promise fixed
+response or remediation deadlines. There is no formal bug bounty program.
 
-**Alternative:** Email <security@nautechsystems.io>
-
-For sensitive reports via email, you may request our PGP key for encrypted communication.
-
-Please include: vulnerability description, reproduction steps, affected versions,
-and suggested remediation if available.
-
-## Response Timeline
-
-We commit to:
-
-- **Initial response**: Within 48 hours of report submission.
-- **Status update**: Within 7 days with initial assessment.
-- **Fix timeline**: Critical vulnerabilities patched within 30 days; other issues within 90 days.
-- **Coordinated disclosure**: We'll work with you to agree on a public disclosure date.
-
-## Responsible Disclosure
-
-We encourage responsible disclosure of any security vulnerabilities you may
-discover. When reporting, we ask that you:
-
-- Do not publicly disclose the vulnerability before a fix is available.
-- Only exploit the issue to the extent necessary to demonstrate it.
+- Keep vulnerability details private while coordinating disclosure.
+- Only reproduce an issue to the extent needed to demonstrate it.
 - Do not access unauthorized data or disrupt systems.
-- Comply with all applicable laws.
+- Follow applicable laws and avoid including secrets or personal data in reports.
 
-We will acknowledge your contribution in our security advisories and release
-notes unless you prefer to remain anonymous.
+## Supported source
 
-## Supported Versions
+Maintenance focuses on this fork's `develop` branch. Historical commits and upstream package-index
+releases are not separate supported releases of this fork. A version string alone does not identify
+fork changes; record the Git commit used to build the software.
 
-We only support the latest version of NautilusTrader. If you are using an older
-version, it is possible that vulnerabilities may have been fixed in a later
-release.
+## Fork validation controls
 
-## Bug Bounty Program
+The repository retains locked dependencies, dependency cooldown and audit policy files, pre-commit
+checks, and regression tests. Contributions must preserve these controls and report the checks
+actually run for their revision. See [CONTRIBUTING.md](CONTRIBUTING.md) and [Fork Maintenance](FORK.md).
 
-At this time, we do not have a formal bug bounty program. We
-appreciate any efforts to help us improve the security of our platform and will
-do our best to properly recognize and credit your contributions.
+The inherited workflow files and their documentation do not establish that this fork has
+upstream's deployment environments, signing identities, publication credentials, branch protections,
+or release guarantees. Verify a fork artifact against evidence published for that exact artifact.
 
-## Security Infrastructure
+## Security infrastructure
 
-The sections below detail the controls at each layer of that lifecycle.
+> [!NOTE]
+> This section describes inherited upstream infrastructure. Statements about the Core team,
+> repository settings, hosted services, and publication describe upstream NautilusTrader, not
+> independently verified deployment of those services for this fork.
+
+The sections below detail the upstream controls at each layer of that lifecycle.
 
 ### Public posture
 
@@ -170,7 +158,7 @@ The sections below detail the controls at each layer of that lifecycle.
   are identical in both modes; the FIPS module adds runtime self-tests and module boundary
   enforcement required for federal certification.
 
-For our full supply chain security policy, see <https://nautilustrader.io/security/supply-chain/>.
+For the upstream supply chain security policy, see <https://nautilustrader.io/security/supply-chain/>.
 
 For the end-to-end release supply chain model, see
 [Security Architecture](docs/developer_guide/security.md).
@@ -178,6 +166,9 @@ For the end-to-end release supply chain model, see
 For detailed CI/CD security practices, see [.github/OVERVIEW.md](.github/OVERVIEW.md#security).
 
 ## Known vulnerability management
+
+This section records upstream vulnerability-management policy, including upstream timelines.
+The fork uses the reporting and response process at the top of this document.
 
 Where a known advisory exists in a transitive dependency without an available
 fix, we document the risk assessment, context, and mitigation in our audit
@@ -198,6 +189,8 @@ the canonical repository.
 
 ## Advisories addressed
 
+These are inherited upstream advisory records, not a complete security assessment of the fork.
+
 Third-party security advisories we have addressed via dependency upgrades. Security scanning is
 not delayed by the dependency cooldowns described above. When an advisory requires a newer
 package, a reviewed fix can bypass the applicable cooldown.
@@ -212,6 +205,9 @@ package, a reviewed fix can bypass the applicable cooldown.
     `Retry.remove_headers_on_redirect` when redirecting cross-host. Upgraded `urllib3` to v2.7.0.
 
 ## Verifying releases
+
+The commands below verify upstream artifacts and upstream publisher identities. They do not
+verify a build of this fork. Do not substitute the fork name into an upstream trust identity.
 
 Python release artifacts and Docker images are signed or attested via Sigstore-backed workflows.
 Cargo crates are published through crates.io Trusted Publishing. The release verifier records

@@ -1,5 +1,8 @@
 # Environment Setup
 
+These instructions set up the independent OKX NT Community source fork. Upstream package-index
+wheels do not include its maintained changes. See [Fork Maintenance](../../FORK.md).
+
 Use an editor with current Rust and Python language support, such as PyCharm or Visual Studio Code.
 
 [uv](https://docs.astral.sh/uv) is the preferred tool for handling all Python virtual environments and dependencies.
@@ -42,8 +45,8 @@ xcode-select --install
 Then clone the repository and install the pinned project tools:
 
 ```bash
-git clone --branch develop https://github.com/nautechsystems/nautilus_trader
-cd nautilus_trader
+git clone --branch develop https://github.com/silarin/okx-nt-community.git
+cd okx-nt-community
 
 curl https://sh.rustup.rs -sSf | sh
 source "$HOME/.cargo/env"

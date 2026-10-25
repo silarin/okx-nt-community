@@ -1277,5 +1277,5 @@ Set `LiveExecutionEngineConfig.reconciliation_instrument_ids` to scope reconcili
 
 :::info
 To contribute to the Lighter adapter or request a feature, see the
-[contributing guide](https://github.com/nautechsystems/nautilus_trader/blob/develop/CONTRIBUTING.md).
+[contributing guide](../../CONTRIBUTING.md).
 :::

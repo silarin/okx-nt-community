@@ -359,11 +359,15 @@ fig.show()  # Display in browser
 fig.write_image("equity.png")  # Export to PNG (requires kaleido)
 ```
 
-Install visualization dependencies:
+Install visualization dependencies and build the fork from its source checkout:
 
 ```bash
-uv pip install --pre "nautilus_trader[visualization]"
+make sync
+make build-debug
 ```
+
+Run examples in `python/.venv`. See [Installation](../getting_started/installation.md#extras)
+for the fork's extras and the distinction from upstream packages.
 
 ## Report generation patterns
 

@@ -2,7 +2,9 @@
 
 **AI tools may assist with project work, but active human thinking and judgment remain essential.**
 
-NautilusTrader holds AI-assisted work to the same quality standard as any other contribution.
+OKX NT Community holds AI-assisted work to the same quality standard as any other contribution.
+This policy governs work in this independent fork. Submissions to upstream NautilusTrader must
+also follow upstream's own contribution and AI policies.
 
 ## Human responsibility
 
@@ -16,14 +18,16 @@ unnecessarily complex output for maintainers to validate.
 
 **A human must choose the work, direct the implementation, and verify the result. They must
 authorize every public interaction with GitHub and remain accountable for each one.** Agents acting
-for contributors must not take action in the NautilusTrader project on GitHub without explicit
+for contributors must not take action in this fork or the upstream project on GitHub without explicit
 human direction and authorization. This includes opening or editing issues or pull requests,
 requesting review, tagging or pinging maintainers, posting comments, or responding to maintainers.
 Fully autonomous contributions, where an agent acts without meaningful human direction and review,
 are not accepted.
 
-Do not use AI to copy, rewrite, or disguise third-party code that you could not otherwise submit
-under the [Contributor License Agreement](CLA.md).
+Do not use AI to copy, rewrite, or disguise third-party code that you do not have the right to
+contribute. Preserve applicable licenses, copyright notices, and attribution. The retained
+[CLA.md](CLA.md) is an upstream agreement; see [Contributing](CONTRIBUTING.md#licensing-and-upstream-submissions)
+for the distinction between fork and upstream submissions.
 
 AI tools and agents must not accept the Contributor License Agreement, certify authorship or
 licensing rights, or make equivalent legal representations on a contributor's behalf.
@@ -70,12 +74,12 @@ the result and make sure it preserves your intended meaning.
 
 ## Disclosure and attribution
 
-NautilusTrader does not require disclosure of AI assistance. This policy does not override any
+OKX NT Community does not require disclosure of AI assistance. This policy does not override any
 legal, contractual, or license obligation that applies to the contributor or submitted material.
 If you choose to disclose AI assistance in a commit message, keep the wording general, such as
 `Developed with assistance from AI.`
 
-NautilusTrader is neutral among AI labs, vendors, models, and tools. To keep the public
+OKX NT Community is neutral among AI labs, vendors, models, and tools. To keep the public
 contribution record neutral, do not name or promote one as part of attribution in commit messages,
 pull request titles, or pull request descriptions, including summaries. Do not add branded footers
 such as `Generated with ...`.

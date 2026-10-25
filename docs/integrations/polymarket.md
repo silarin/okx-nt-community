@@ -16,28 +16,22 @@ covers market data, trade execution, session key administration, and Deposit Wal
 
 The Python package includes the Polymarket adapter. No adapter-specific extra is required.
 
-To install the latest pre-release build:
-
-```bash
-uv pip install --pre nautilus_trader
-```
-
-To build the Python package from source, run from the repository root:
+To use this fork, build its Python package from source. Run from the repository root:
 
 ```bash
 make build-debug
 ```
 
-For development wheels and source-build prerequisites, see the
+For source-build prerequisites and the distinction from upstream wheels, see the
 [installation guide](../getting_started/installation.md).
 
 ## Examples
 
 The maintained examples are available in
-[`crates/adapters/polymarket/examples`](https://github.com/nautechsystems/nautilus_trader/tree/develop/crates/adapters/polymarket/examples)
-for Rust. For Python, use the Rust-native [data tester](https://github.com/nautechsystems/nautilus_trader/blob/develop/examples/live/polymarket/data_tester.py),
-[execution tester](https://github.com/nautechsystems/nautilus_trader/blob/develop/examples/live/polymarket/exec_tester.py),
-or [Up/Down smoke tester](https://github.com/nautechsystems/nautilus_trader/blob/develop/examples/live/polymarket/updown_smoke_tester.py).
+[`crates/adapters/polymarket/examples`](https://github.com/silarin/okx-nt-community/tree/develop/crates/adapters/polymarket/examples)
+for Rust. For Python, use the Rust-native [data tester](https://github.com/silarin/okx-nt-community/blob/develop/examples/live/polymarket/data_tester.py),
+[execution tester](https://github.com/silarin/okx-nt-community/blob/develop/examples/live/polymarket/exec_tester.py),
+or [Up/Down smoke tester](https://github.com/silarin/okx-nt-community/blob/develop/examples/live/polymarket/updown_smoke_tester.py).
 The exec tester configurations apply the
 [close precision](#exec-tester-close-residuals) needed for Polymarket market SELL orders.
 
@@ -3263,4 +3257,4 @@ Only live instruments carry this state. The historical data loader reports termi
 ## Contributing
 
 To contribute features or fixes to the Polymarket adapter, see the
-[contributing guide](https://github.com/nautechsystems/nautilus_trader/blob/develop/CONTRIBUTING.md).
+[contributing guide](../../CONTRIBUTING.md).

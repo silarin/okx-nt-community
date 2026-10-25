@@ -1,5 +1,21 @@
 # Roadmap
 
+## Fork scope
+
+OKX NT Community focuses on native OKX fill recovery, exact fee accounting, source evidence,
+and strategy order cleanup during managed exit. Preserve these behaviors while integrating
+upstream changes. See [Fork Maintenance](FORK.md) for the recorded baseline and synchronization process.
+
+Proposals for this fork belong in [its issue tracker](https://github.com/silarin/okx-nt-community/issues).
+New features or adapter commitments require agreement with this fork's maintainer. This repository
+does not promise upstream's roadmap, release schedule, commercial services, or adapter support.
+
+## Upstream roadmap reference
+
+The remaining sections preserve upstream NautilusTrader's roadmap and scope for context. Their
+references to project maintainers, channels, commitments, and plans concern upstream. Follow
+[CONTRIBUTING.md](CONTRIBUTING.md) when proposing work to this fork.
+
 This document outlines the key priorities and upcoming goals for **NautilusTrader**,
 charting its path as a production-grade, Rust-native trading engine.
 

@@ -1,12 +1,15 @@
 # Agent Instructions
 
+These instructions apply to **OKX NT Community**, the independent fork maintained by silarin.
+Read [FORK.md](FORK.md) for the upstream baseline and the behavior this fork preserves.
+
 Read [AI_POLICY.md](AI_POLICY.md) and [CONTRIBUTING.md](CONTRIBUTING.md) before making changes.
 Follow the [coding standards](docs/developer_guide/coding_standards.md) and the relevant developer
 guide for the area you change.
 
 ## Working rules
 
-**NautilusTrader can execute live trades involving real capital. Hold every change to a very high
+**This software can execute live trades involving real capital. Hold every change to a very high
 standard for correctness, reliability, testing, clarity, and maintainability.**
 
 ### Environment
@@ -79,6 +82,8 @@ contributor can push one coherent update.
 ## Git and public interaction
 
 - Base contributor work on `develop` and target `develop` when preparing a pull request.
+- Use `silarin/okx-nt-community` for this fork's issues and pull requests. Submitting work to
+  upstream is a separate action requiring explicit authorization and upstream's contribution rules.
 - Do not commit, amend, push, or change remote state unless the user explicitly asks.
 - Do not open, edit, comment on, review, or otherwise interact with GitHub issues or pull requests
   unless the user explicitly asks. The human contributor controls every public interaction and

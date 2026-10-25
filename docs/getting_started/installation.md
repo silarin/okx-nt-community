@@ -1,6 +1,11 @@
 # Installation
 
-NautilusTrader is officially supported for Python 3.13-3.14 on the following 64-bit platforms:
+Build **OKX NT Community from source** using the [source-build steps](#from-source) below. This
+preserves the fork's maintained changes. Upstream wheels, releases, and containers are documented
+as reference options and do not contain fork-only changes.
+
+The following Python 3.13-3.14 platform matrix is inherited from upstream NautilusTrader. Treat it
+as a compatibility reference, not a claim that this fork has been validated on every platform:
 
 | Operating System | Supported Versions | CPU Architecture |
 | ---------------- | ------------------ | ---------------- |
@@ -10,7 +15,8 @@ NautilusTrader is officially supported for Python 3.13-3.14 on the following 64-
 | Windows Server   | 2022 and later     | x86_64           |
 
 :::note
-NautilusTrader may work on other platforms, but only those listed above are regularly used by developers and tested in CI.
+Upstream regularly tests the listed platforms. Fork validation applies to the exact revision and
+environment recorded in its PR or build evidence.
 :::
 
 NautilusTrader follows the
@@ -19,7 +25,7 @@ Each Python minor version is supported for three years after its initial release
 ends in the first NautilusTrader release after that window and after the replacement Python version
 passes compatibility checks.
 
-Continuous CI coverage comes from the GitHub Actions runners we build on:
+The inherited upstream CI coverage uses these GitHub Actions runners:
 
 - `Linux (Ubuntu)` builds currently pin to `ubuntu-22.04` to keep glibc 2.35 compatibility even as `ubuntu-latest` moves ahead.
 - `macOS (ARM64)` builds run on `macos-latest`, so support tracks that runner image as it moves ahead.
@@ -27,12 +33,8 @@ Continuous CI coverage comes from the GitHub Actions runners we build on:
 
 On Linux, confirm your glibc version with `ldd --version` and ensure it reports 2.35 or newer before proceeding.
 
-We recommend using the latest supported version of Python and installing [nautilus_trader](https://pypi.org/project/nautilus_trader/) inside a virtual environment to isolate dependencies.
-
-**There are two supported ways to install**:
-
-1. Pre-built binary wheel from PyPI *or* the Nautech Systems package index.
-2. Build from source.
+For this fork, use the Python project environment at `python/.venv` and build from source.
+Upstream package-index commands below install upstream software into a separate environment.
 
 :::tip
 We highly recommend installing using the [uv](https://docs.astral.sh/uv) package manager with a "vanilla" CPython.
@@ -40,7 +42,163 @@ We highly recommend installing using the [uv](https://docs.astral.sh/uv) package
 Conda and other Python distributions *may* work but aren't officially supported.
 :::
 
+## From source
+
+Follow these steps to build this fork and install it in `python/.venv`. The Python project and
+its build dependencies are defined in `python/pyproject.toml`.
+
+### 1. Install rustup
+
+Install [rustup](https://rustup.rs/) (the Rust toolchain installer):
+
+```bash tab="Linux/macOS"
+curl https://sh.rustup.rs -sSf | sh
+```
+
+```powershell tab="Windows"
+# Download and install rustup-init.exe from https://win.rustup.rs/x86_64
+# Also install "Desktop development with C++" via Build Tools for Visual Studio 2022
+```
+
+Verify: `rustc --version`
+
+### 2. Enable cargo
+
+Enable `cargo` in the current shell:
+
+```bash tab="Linux/macOS"
+source $HOME/.cargo/env
+```
+
+```powershell tab="Windows"
+# Start a new PowerShell session
+```
+
+### 3. Install clang
+
+Install [clang](https://clang.llvm.org/) (a C language frontend for LLVM). On Linux this also installs [lld](https://lld.llvm.org/), which is configured as the Rust linker for faster builds:
+
+```bash tab="Linux"
+sudo apt-get install clang lld
+```
+
+```powershell tab="Windows"
+# 1. Add Clang via Visual Studio Installer:
+#    Modify > C++ Clang tools for Windows (latest) > Modify
+# 2. Add to PATH:
+[System.Environment]::SetEnvironmentVariable('path', "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Tools\Llvm\x64\bin\;" + $env:Path,"User")
+```
+
+Verify: `clang --version`
+
+### 4. Install uv
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation):
+
+```bash tab="Linux/macOS"
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+```powershell tab="Windows"
+irm https://astral.sh/uv/install.ps1 | iex
+```
+
+### 5. Clone and sync dependencies
+
+Clone the source with `git`, then sync its dependencies from the project root:
+
+```bash
+git clone --branch develop --depth 1 https://github.com/silarin/okx-nt-community.git
+cd okx-nt-community
+cargo install cargo-binstall --locked
+make install-tools
+make sync
+```
+
+For development hosts and CI runner images, see the
+[single source of truth for versions](../developer_guide/environment_setup.md#single-source-of-truth-for-versions)
+before installing pinned tools.
+
+:::note
+The `--depth 1` flag fetches just the latest commit for a faster, lightweight clone.
+:::
+
+### 6. Install Cap'n Proto for HyperSync
+
+The [Cap'n Proto](https://capnproto.org) compiler remains available for HyperSync schema development.
+The pinned HyperSync dependencies ship generated Rust bindings, so normal builds do not regenerate
+their schemas. Use the repository script on Linux or macOS to install the pinned compiler version
+from `.nautilus-engineering/tools.toml`:
+
+```bash
+./scripts/install-capnp.sh
+```
+
+Verify: `capnp --version`
+
+:::note
+Cap'n Proto is a development dependency. It is not required when installing pre-built wheels.
+:::
+
+### 7. Set environment variables
+
+The uv project environment lives at `python/.venv`, beside `python/pyproject.toml`. Run direct uv
+project commands from `python/` or pass `--project python` from the repository root.
+
+Set environment variables for PyO3 compilation (Linux and macOS only). Run these commands from
+the repository root after `make sync` in Bash or Zsh. For Fish commands, see the developer guide's
+[environment setup](../developer_guide/environment_setup.md#4-configure-environment-variables).
+Set `PYO3_PYTHON` in each shell to this checkout's `python/.venv/bin/python`; replace any saved
+export that still points to the root `.venv/bin/python`.
+
+```bash
+# Set the Python executable path for PyO3
+export PYO3_PYTHON="$PWD/python/.venv/bin/python"
+
+# Linux only: Set the library path for the uv-managed Python runtime
+PYTHON_LIB_DIR="$("$PYO3_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+export LD_LIBRARY_PATH="$PYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# Required for Rust tests when using uv-installed Python
+export PYTHONHOME="$("$PYO3_PYTHON" -c 'import sys; print(sys.base_prefix)')"
+```
+
+:::note
+The `LD_LIBRARY_PATH` export is Linux-specific and not needed on macOS.
+
+The `PYTHONHOME` variable is required when running `make cargo-test` with a `uv`-installed Python.
+Without it, tests that depend on PyO3 may fail to locate the Python runtime.
+:::
+
+### 8. Build Python from source
+
+This path builds the PyO3 package from the `python/` directory and installs it into `python/.venv`.
+Use this path from the OKX NT Community checkout to install the maintained fork changes.
+
+From the repository root:
+
+```bash
+make build-debug
+```
+
+This target syncs `python/.venv`, builds the Rust extension with maturin, and regenerates Python type
+stubs. It uses `target/` for Cargo artifacts.
+
+Run a Python example with the project environment:
+
+```bash
+uv run --project python --no-sync python examples/live/lighter/data_tester.py
+```
+
+The script connects to Lighter Testnet and starts streaming market data; stop it with Ctrl+C.
+
+For direct commands and test targets, see the [Python package README][python-readme].
+
+[python-readme]: ../../python/README.md
+
 ## From PyPI
+
+This section describes upstream NautilusTrader artifacts. For this fork, [build from source](#from-source).
 
 :::warning[Install the 2.x wheel for these docs]
 This documentation covers NautilusTrader 2.x. PyPI still resolves a plain
@@ -83,19 +241,22 @@ uv pip install nautilus_trader
 ```
 
 A 1.x install cannot run the examples on these pages. See
-[Migrate from v1 to v2](https://github.com/nautechsystems/nautilus_trader/blob/develop/MIGRATION_V2.md)
+[Migrate from v1 to v2](../../MIGRATION_V2.md)
 for the API differences.
 
 ## Extras
 
-Install the optional dependencies for Plotly-based interactive tearsheets and charts with the
-`visualization` extra:
+The `visualization` extra supplies Plotly-based tearsheets and charts. In this fork's checkout,
+`make sync` installs all configured extras, and `make build-debug` builds the local package:
 
 ```bash
-uv pip install --pre "nautilus_trader[visualization]"
+make sync
+make build-debug
 ```
 
 ## From the Nautech Systems package index
+
+These are upstream artifacts and upstream hosting policies, not fork builds or service commitments.
 
 The Nautech Systems package index (`packages.nautechsystems.io`) complies with
 [PEP-503](https://peps.python.org/pep-0503/) and hosts both stable and development binary wheels
@@ -198,159 +359,9 @@ and [cosign](https://github.com/sigstore/cosign) for Docker images.
 Development wheels from `develop` and `nightly` branches are also attested.
 :::
 
-## From source
-
-It's possible to install from source using pip if you first install the build dependencies as specified in the `pyproject.toml`.
-
-### 1. Install rustup
-
-Install [rustup](https://rustup.rs/) (the Rust toolchain installer):
-
-```bash tab="Linux/macOS"
-curl https://sh.rustup.rs -sSf | sh
-```
-
-```powershell tab="Windows"
-# Download and install rustup-init.exe from https://win.rustup.rs/x86_64
-# Also install "Desktop development with C++" via Build Tools for Visual Studio 2022
-```
-
-Verify: `rustc --version`
-
-### 2. Enable cargo
-
-Enable `cargo` in the current shell:
-
-```bash tab="Linux/macOS"
-source $HOME/.cargo/env
-```
-
-```powershell tab="Windows"
-# Start a new PowerShell session
-```
-
-### 3. Install clang
-
-Install [clang](https://clang.llvm.org/) (a C language frontend for LLVM). On Linux this also installs [lld](https://lld.llvm.org/), which is configured as the Rust linker for faster builds:
-
-```bash tab="Linux"
-sudo apt-get install clang lld
-```
-
-```powershell tab="Windows"
-# 1. Add Clang via Visual Studio Installer:
-#    Modify > C++ Clang tools for Windows (latest) > Modify
-# 2. Add to PATH:
-[System.Environment]::SetEnvironmentVariable('path', "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Tools\Llvm\x64\bin\;" + $env:Path,"User")
-```
-
-Verify: `clang --version`
-
-### 4. Install uv
-
-Install [uv](https://docs.astral.sh/uv/getting-started/installation):
-
-```bash tab="Linux/macOS"
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-```powershell tab="Windows"
-irm https://astral.sh/uv/install.ps1 | iex
-```
-
-### 5. Clone and sync dependencies
-
-Clone the source with `git`, then sync its dependencies from the project root:
-
-```bash
-git clone --branch develop --depth 1 https://github.com/nautechsystems/nautilus_trader
-cd nautilus_trader
-make sync
-```
-
-For development hosts and CI runner images, see the
-[single source of truth for versions](../developer_guide/environment_setup.md#single-source-of-truth-for-versions)
-before installing pinned tools.
-
-:::note
-The `--depth 1` flag fetches just the latest commit for a faster, lightweight clone.
-:::
-
-### 6. Install Cap'n Proto for HyperSync
-
-The [Cap'n Proto](https://capnproto.org) compiler remains available for HyperSync schema development.
-The pinned HyperSync dependencies ship generated Rust bindings, so normal builds do not regenerate
-their schemas. Use the repository script on Linux or macOS to install the pinned compiler version
-from `.nautilus-engineering/tools.toml`:
-
-```bash
-./scripts/install-capnp.sh
-```
-
-Verify: `capnp --version`
-
-:::note
-Cap'n Proto is a development dependency. It is not required when installing pre-built wheels.
-:::
-
-### 7. Set environment variables
-
-The uv project environment lives at `python/.venv`, beside `python/pyproject.toml`. Run direct uv
-project commands from `python/` or pass `--project python` from the repository root.
-
-Set environment variables for PyO3 compilation (Linux and macOS only). Run these commands from
-the repository root after `make sync` in Bash or Zsh. For Fish commands, see the developer guide's
-[environment setup](../developer_guide/environment_setup.md#4-configure-environment-variables).
-Set `PYO3_PYTHON` in each shell to this checkout's `python/.venv/bin/python`; replace any saved
-export that still points to the root `.venv/bin/python`.
-
-```bash
-# Set the Python executable path for PyO3
-export PYO3_PYTHON="$PWD/python/.venv/bin/python"
-
-# Linux only: Set the library path for the uv-managed Python runtime
-PYTHON_LIB_DIR="$("$PYO3_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
-export LD_LIBRARY_PATH="$PYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-
-# Required for Rust tests when using uv-installed Python
-export PYTHONHOME="$("$PYO3_PYTHON" -c 'import sys; print(sys.base_prefix)')"
-```
-
-:::note
-The `LD_LIBRARY_PATH` export is Linux-specific and not needed on macOS.
-
-The `PYTHONHOME` variable is required when running `make cargo-test` with a `uv`-installed Python.
-Without it, tests that depend on PyO3 may fail to locate the Python runtime.
-:::
-
-### 8. Build Python from source
-
-This path builds the PyO3 package from the `python/` directory and installs it into `python/.venv`.
-Use it from a NautilusTrader source checkout when a development wheel is not available for your
-platform or when you need local Rust changes.
-
-From the repository root:
-
-```bash
-make build-debug
-```
-
-This target syncs `python/.venv`, builds the Rust extension with maturin, and regenerates Python type
-stubs. It uses `target/` for Cargo artifacts.
-
-Run a Python example with the project environment:
-
-```bash
-uv run --project python --no-sync python examples/live/lighter/data_tester.py
-```
-
-The script connects to Lighter Testnet and starts streaming market data; stop it with Ctrl+C.
-
-For direct commands and test targets, see the [Python package README][python-readme].
-
-[python-readme]: https://github.com/nautechsystems/nautilus_trader/blob/develop/python/README.md
-
 ## From GitHub release
+
+This section describes upstream release assets. They do not contain fork-only changes.
 
 To install a binary wheel from GitHub, first navigate to the [releases](https://github.com/nautechsystems/nautilus_trader/releases)
 list and open the release matching the version you want.
@@ -376,21 +387,26 @@ These come from running 2.x documentation against a 1.x install. Check what you 
 python -c "import nautilus_trader; print(nautilus_trader.__version__)"
 ```
 
-A `1.` version means the resolver picked the stable line. Reinstall with `--pre`:
+A `1.` version indicates an upstream v1 installation. For this fork, rebuild in its source checkout
+and use the project environment:
 
 ```bash
-uv pip install -U --pre nautilus_trader
+make build-debug
+uv run --project python --no-sync python -c "import nautilus_trader; print(nautilus_trader.__version__)"
+git rev-parse HEAD
 ```
 
+A `2.` package version alone does not distinguish an upstream installation from this fork.
+
 The 1.x and 2.x Python APIs are not interchangeable. See
-[Migrate from v1 to v2](https://github.com/nautechsystems/nautilus_trader/blob/develop/MIGRATION_V2.md)
+[Migrate from v1 to v2](../../MIGRATION_V2.md)
 when porting a 1.x application.
 
 ### uv resolves an older version inside the repository
 
 The repository's `python/pyproject.toml` sets an `exclude-newer` policy for reproducible
-development, which hides recently published wheels. Run install commands from another directory, or
-[build from source](#from-source).
+development, which hides recently published wheels. Build this fork [from source](#from-source).
+Use a separate environment outside the checkout only when intentionally installing upstream wheels.
 
 ### Wheel not found for your platform
 
@@ -400,13 +416,10 @@ Linux, `ldd --version` must report glibc 2.35 or newer. Otherwise
 
 ## Versioning and releases
 
-NautilusTrader is still under active development. Some features may be incomplete, and while
-the API is becoming more stable, breaking changes can occur between releases.
-We strive to document these changes in the release notes on a **best-effort basis**.
-
-We aim to follow a **bi-weekly release schedule**, though experimental or larger features may cause delays.
-
-Use NautilusTrader only if you are prepared to adapt to these changes.
+This fork retains upstream version identifiers for source compatibility. Record the Git commit to
+identify the exact fork build. Upstream integrations can introduce breaking changes; review the
+integration PR, [Fork Maintenance](../../FORK.md), and inherited release notes before upgrading.
+This fork does not promise upstream's release schedule or published artifacts.
 
 ## Redis
 

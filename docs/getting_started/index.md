@@ -2,20 +2,22 @@
 
 ## 1. Install
 
-Set up a Python 3.13-3.14 environment and install the package:
+Build OKX NT Community from this repository. First follow the platform and toolchain prerequisites
+in [Environment Setup](../developer_guide/environment_setup.md), including Python 3.13-3.14,
+Rust, and `cargo-binstall`. Then:
 
 ```bash
-pip install -U --pre nautilus_trader
+git clone --branch develop https://github.com/silarin/okx-nt-community.git
+cd okx-nt-community
+make install-tools
+make build-debug
+uv run --project python --no-sync python -c "import nautilus_trader; print(nautilus_trader.__version__)"
+git rev-parse HEAD
 ```
 
-PyPI publishes NautilusTrader 2.x as `2.0.0rcN` pre-releases. Include `--pre` until `2.0.0` is
-released. Confirm the install with:
-
-```bash
-python -c "import nautilus_trader; print(nautilus_trader.__version__)"
-```
-
-See the [Installation](installation) guide for platform support and source builds.
+The build uses `python/.venv`. Record the Git commit as well as the package version to identify
+the fork's source. Upstream PyPI wheels and Nautech package-index wheels do not include fork-only
+changes. See [Installation](installation) for the complete source-build instructions.
 
 ## 2. Run the quickstart
 
@@ -70,17 +72,18 @@ API level.
 The online documentation shows a subset of examples. For the full set, see the
 repository on GitHub:
 
-| Directory                                                                            | Contains                                              |
-| :----------------------------------------------------------------------------------- | :---------------------------------------------------- |
-| [examples/](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples) | Runnable Python examples organized by environment     |
-| [docs/tutorials/](../tutorials/)                                                     | Tutorials demonstrating common workflows              |
-| [docs/concepts/](../concepts/)                                                       | Concept guides with illustrative code snippets        |
-| [python/tests/unit/](../../python/tests/unit/)                                       | Unit tests covering core functionality and edge cases |
+| Directory                                                                      | Contains                                              |
+| :----------------------------------------------------------------------------- | :---------------------------------------------------- |
+| [examples/](https://github.com/silarin/okx-nt-community/tree/develop/examples) | Runnable Python examples organized by environment     |
+| [docs/tutorials/](../tutorials/)                                               | Tutorials demonstrating common workflows              |
+| [docs/concepts/](../concepts/)                                                 | Concept guides with illustrative code snippets        |
+| [python/tests/unit/](../../python/tests/unit/)                                 | Unit tests covering core functionality and edge cases |
 
 ## Running in Docker
 
-A self-contained dockerized Jupyter notebook server provides the fastest way to try
-NautilusTrader with no local setup. Deleting the container deletes any data.
+The following upstream Jupyter image is an option for exploring upstream NautilusTrader. It does
+not contain this fork's changes. Use the source build above to test fork behavior. Deleting the
+container deletes any data.
 
 ```bash
 # Pull the latest image

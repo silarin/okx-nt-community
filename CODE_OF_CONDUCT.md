@@ -1,5 +1,8 @@
 # Contributor Covenant Code of Conduct
 
+This code applies to the OKX NT Community repository and community spaces operated by its maintainer,
+[silarin](https://github.com/silarin). Upstream NautilusTrader has its own community and enforcement process.
+
 ## Our Pledge
 
 We as members, contributors, and leaders pledge to make participation in our
@@ -58,10 +61,14 @@ representative at an online or offline event.
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement at
-<info@nautechsystems.io>.
-All complaints will be reviewed and investigated promptly and fairly.
+The maintainer responsible for enforcement is [silarin](https://github.com/silarin).
+To arrange private correspondence, open an issue in
+[this repository](https://github.com/silarin/okx-nt-community/issues) requesting a private contact channel.
+Include no incident details, names of involved people, logs, or other sensitive information in that
+public request. Share the report only after a private channel has been arranged.
+
+Complaints are reviewed by the fork maintainer. This project does not promise a fixed response time.
+For software vulnerabilities, use the private channel in [SECURITY.md](SECURITY.md).
 
 All community leaders are obligated to respect the privacy and security of the
 reporter of any incident.

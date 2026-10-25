@@ -847,5 +847,5 @@ The two authenticated binaries read `COINBASE_API_KEY` and
 
 :::info
 For additional features or to contribute to the Coinbase adapter, please see
-our [contributing guide](https://github.com/nautechsystems/nautilus_trader/blob/develop/CONTRIBUTING.md).
+our [contributing guide](../../CONTRIBUTING.md).
 :::

@@ -847,5 +847,5 @@ IDs for subscriptions.
 
 :::info
 To contribute to the CoinAPI adapter, see the
-[contributing guide](https://github.com/nautechsystems/nautilus_trader/blob/develop/CONTRIBUTING.md).
+[contributing guide](../../CONTRIBUTING.md).
 :::

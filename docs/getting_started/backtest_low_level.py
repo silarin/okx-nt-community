@@ -6,16 +6,15 @@
 # every step. This tutorial backtests an EMA cross strategy with a TWAP execution
 # algorithm on a simulated Binance Spot exchange using historical trade tick data.
 #
-# [View source on GitHub](https://github.com/nautechsystems/nautilus_trader/blob/develop/docs/getting_started/backtest_low_level.py).
+# [View source on GitHub](https://github.com/silarin/okx-nt-community/blob/develop/docs/getting_started/backtest_low_level.py).
 
 # %% [markdown]
 # ## Prerequisites
 # - Python 3.13-3.14
-# - [NautilusTrader](https://pypi.org/project/nautilus_trader/) 2.x installed
-#   (`pip install -U --pre nautilus_trader`). The `--pre` flag is required while 2.x
-#   ships as `2.0.0rcN`.
-# - pandas (`pip install pandas`), used by the reports at the end. The wheel
-#   declares no runtime dependencies.
+# - [OKX NT Community built from source](installation.md#from-source).
+# - Run `make sync` and `make build-debug` in this fork's checkout, then use
+#   `python/.venv` for the tutorial. The sync includes NumPy and pandas.
+# - Upstream package-index wheels do not contain fork-only changes.
 
 # %%
 from decimal import Decimal

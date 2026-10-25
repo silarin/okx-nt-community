@@ -1,5 +1,11 @@
 # GitHub Actions Overview
 
+> [!NOTE]
+> This is an inherited reference for upstream NautilusTrader's workflows and infrastructure.
+> The files are present in this fork, but descriptions of hosted runners, rulesets, environments,
+> registry publication, signing, and deployment do not confirm those services are configured here.
+> See [Fork Maintenance](../FORK.md) and the fork's [Security Policy](../SECURITY.md) for local scope.
+
 The `.github` directory contains NautilusTrader's composite actions and workflows for continuous
 integration, scheduled checks, and publication.
 
