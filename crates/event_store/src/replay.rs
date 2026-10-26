@@ -1044,7 +1044,7 @@ impl CacheReplayContext {
                     && order.is_closed()
                     && !evidence.conflicts_with_order(&order)
                     && match evidence {
-                        OrderTerminalEvidence::Report(report) => order.filled_qty()
+                        OrderTerminalEvidence::Report(report) | OrderTerminalEvidence::StreamReport(report) => order.filled_qty()
                             >= report.filled_qty
                             && (report.filled_qty.is_zero()
                                 || self.order_recovered_after(*seq, &order, &|projection| {
@@ -1071,7 +1071,7 @@ impl CacheReplayContext {
                 .any(|(_, query)| evidence.conflicts_with_report(&query.order_report))
                 && !self.terminal_order_evidence.iter().any(|(_, other)| {
                     matches!(other,
-                    OrderTerminalEvidence::Report(report) if evidence.conflicts_with_report(report))
+                    OrderTerminalEvidence::Report(report) | OrderTerminalEvidence::StreamReport(report) if evidence.conflicts_with_report(report))
                 });
             Self::require_complete(
                 *seq,
@@ -5953,6 +5953,7 @@ mod tests {
     fn terminal_evidence_crash_prefix_requires_accounted_quantity(
         #[values(false, true)] snapshot_anchor: bool,
         #[values(false, true)] missing_fills: bool,
+        #[values(false, true)] stream: bool,
     ) {
         use nautilus_model::events::order::spec::OrderCanceledSpec;
 
@@ -5995,7 +5996,11 @@ mod tests {
             4.into(),
             None,
         );
-        let evidence = OrderTerminalEvidence::Report(Box::new(report));
+        let evidence = if stream {
+            OrderTerminalEvidence::StreamReport(Box::new(report))
+        } else {
+            OrderTerminalEvidence::Report(Box::new(report))
+        };
         let encoded = encode_order_terminal_evidence(&evidence).unwrap();
         let order = OrderAny::from_events(vec![
             OrderEventAny::Initialized(initialized),

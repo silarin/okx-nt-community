@@ -992,7 +992,7 @@ impl ExecutionManager {
                 .flatten()
                 .any(|(other, _, _)| {
                     matches!(other,
-                    OrderTerminalEvidence::Report(report) if evidence.conflicts_with_report(report))
+                    OrderTerminalEvidence::Report(report) | OrderTerminalEvidence::StreamReport(report) if evidence.conflicts_with_report(report))
                 })
             {
                 self.terminal_snapshot_conflicts.insert(id);
