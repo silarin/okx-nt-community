@@ -107,7 +107,7 @@ impl OrderFeeEvidence {
     /// Compares fully specified cumulative query facts independently of receipt time.
     /// This does not establish complete execution history or transfer recovery proof.
     #[must_use]
-    pub fn same_complete_query_facts(&self, other: &Self) -> bool {
+    fn same_complete_query_facts(&self, other: &Self) -> bool {
         if self.origin != OrderFeeOrigin::Query
             || self.requires_fresh_query
             || self.unrepresentable_values
