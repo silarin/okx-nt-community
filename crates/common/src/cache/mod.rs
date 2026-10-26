@@ -138,6 +138,7 @@ pub struct Cache {
     external_exec_clients: AHashSet<ClientId>,
     accounts: AHashMap<AccountId, SharedCell<AccountAny>>,
     orders: AHashMap<ClientOrderId, SharedCell<OrderAny>>,
+    pending_order_executions: AHashMap<ClientOrderId, (InstrumentId, Option<StrategyId>)>,
     orders_dispatched: AHashSet<ClientOrderId>,
     order_lists: AHashMap<OrderListId, OrderList>,
     positions: AHashMap<PositionId, SharedCell<Position>>,
@@ -194,6 +195,67 @@ impl Default for Cache {
 }
 
 impl Cache {
+    /// Updates the live reconciliation hold without changing native order or accounting state.
+    /// Pending evidence is restored through event-store admission, which fails closed until complete.
+    pub fn set_order_execution_pending(
+        &mut self,
+        id: ClientOrderId,
+        instrument_id: InstrumentId,
+        strategy_id: Option<StrategyId>,
+        pending: bool,
+    ) {
+        if pending {
+            self.pending_order_executions
+                .insert(id, (instrument_id, strategy_id));
+        } else {
+            self.pending_order_executions.remove(&id);
+        }
+    }
+
+    /// Returns whether unresolved executions prevent this strategy from sizing a managed close.
+    /// Unclaimed evidence conservatively holds every strategy using that instrument.
+    #[must_use]
+    pub fn has_pending_order_executions(
+        &self,
+        strategy_id: StrategyId,
+        instrument_id: Option<InstrumentId>,
+    ) -> bool {
+        self.pending_order_executions
+            .values()
+            .any(|(instrument, owner)| {
+                instrument_id.is_none_or(|id| id == *instrument)
+                    && owner.map_or_else(
+                        || {
+                            instrument_id.is_some()
+                                || !self
+                                    .positions_open(
+                                        None,
+                                        Some(instrument),
+                                        Some(&strategy_id),
+                                        None,
+                                        None,
+                                    )
+                                    .is_empty()
+                                || self.has_orders_open(
+                                    None,
+                                    Some(instrument),
+                                    Some(&strategy_id),
+                                    None,
+                                    None,
+                                )
+                                || self.has_orders_inflight(
+                                    None,
+                                    Some(instrument),
+                                    Some(&strategy_id),
+                                    None,
+                                    None,
+                                )
+                        },
+                        |id| id == strategy_id,
+                    )
+            })
+    }
+
     /// Creates a new [`Cache`] instance with optional configuration and database adapter.
     #[must_use]
     /// # Note
@@ -252,6 +314,7 @@ impl Cache {
             external_exec_clients: AHashSet::new(),
             accounts: AHashMap::new(),
             orders: AHashMap::new(),
+            pending_order_executions: AHashMap::new(),
             orders_dispatched: AHashSet::new(),
             order_lists: AHashMap::new(),
             positions: AHashMap::new(),
@@ -1461,6 +1524,9 @@ impl Cache {
         let mut purged_client_order_ids: AHashSet<ClientOrderId> = AHashSet::new();
 
         'outer: for client_order_id in self.index.orders_closed.clone() {
+            if self.pending_order_executions.contains_key(&client_order_id) {
+                continue;
+            }
             let purge_target = self.orders.get(&client_order_id).and_then(|order_cell| {
                 let order = order_cell.borrow();
                 if order.is_closed()
@@ -2079,6 +2145,7 @@ impl Cache {
         self.bars.clear();
         self.accounts.clear();
         self.orders.clear();
+        self.pending_order_executions.clear();
         self.orders_dispatched.clear();
         self.order_lists.clear();
         self.positions.clear();

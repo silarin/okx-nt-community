@@ -421,6 +421,11 @@ event has not arrived. It uses the existing command cleanup rules. For example, 
 status report stops a pending cancel's timeout under both policies. That cleanup rule does not apply to
 standalone fill reports.
 
+In this fork, `RetainUnresolved` (or client-required retention) also prevents exhausted pending cancel/update
+checks from synthesizing a cancellation. Their automatic queries stop until authoritative evidence resolves
+the command or a newly dispatched command starts a fresh budget. Unresolved retained commands make node
+shutdown return an error after teardown.
+
 Without submission tracking (`ResolveLocally` and no client-required retention), command dispatch
 starts a fresh recovery budget, and native fill or `Triggered` events do not retire the pending
 command's timeout.

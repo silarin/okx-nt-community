@@ -45,7 +45,8 @@ use nautilus_common::{
         },
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecutionReport,
-            ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+            ModifyOrder, OrderTerminalEvidence, QueryAccount, QueryOrder, SubmitOrder,
+            SubmitOrderList, TradingCommand,
         },
     },
     timer::TimeEvent,
@@ -147,6 +148,8 @@ pub const PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS: &str = "OrderQueryWithFills";
 pub const PAYLOAD_TYPE_ORDER_FILL_CONFLICT: &str = "OrderFillConflict";
 /// Canonical tag for individual stream evidence constraining native accounting.
 pub const PAYLOAD_TYPE_ORDER_FILL_EVIDENCE: &str = "OrderFillEvidence";
+/// Immutable terminal observation awaiting native execution accounting.
+pub const PAYLOAD_TYPE_ORDER_TERMINAL_EVIDENCE: &str = "OrderTerminalEvidence";
 /// The canonical `payload_type` tag for [`PositionStatusReport`].
 pub const PAYLOAD_TYPE_POSITION_STATUS_REPORT: &str = "PositionStatusReport";
 /// The canonical `payload_type` tag for [`ExecutionMassStatus`].
@@ -261,6 +264,7 @@ pub(crate) const DEFAULT_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_ORDER_FEE_EVIDENCE,
     PAYLOAD_TYPE_ORDER_FILL_CONFLICT,
     PAYLOAD_TYPE_ORDER_FILL_EVIDENCE,
+    PAYLOAD_TYPE_ORDER_TERMINAL_EVIDENCE,
     PAYLOAD_TYPE_POSITION_STATUS_REPORT,
     PAYLOAD_TYPE_EXECUTION_MASS_STATUS,
     PAYLOAD_TYPE_POSITION_OPENED,
@@ -325,6 +329,10 @@ pub fn default_registry() -> EncoderRegistry {
 /// `publish_any` on `reconciliation.raw.*` topics before any state mutation. The
 /// bare-type registration is what captures those raw inputs for forensic replay.
 pub fn register_default(registry: &mut EncoderRegistry) {
+    registry.register::<OrderTerminalEvidence, _>(
+        payload_type(PAYLOAD_TYPE_ORDER_TERMINAL_EVIDENCE),
+        encode_order_terminal_evidence,
+    );
     registry
         .register::<SubmitOrder, _>(payload_type(PAYLOAD_TYPE_SUBMIT_ORDER), encode_submit_order);
     registry
@@ -724,6 +732,28 @@ pub fn encode_execution_report(report: &ExecutionReport) -> Result<EncodedPayloa
         ExecutionReport::Position(r) => encode_position_status_report(r),
         ExecutionReport::MassStatus(s) => encode_execution_mass_status(s),
     }
+}
+
+/// Encodes an immutable terminal observation without projecting order state.
+///
+/// # Errors
+/// Returns an error if MessagePack rejects the original observation.
+pub fn encode_order_terminal_evidence(
+    evidence: &OrderTerminalEvidence,
+) -> Result<EncodedPayload, EncodeError> {
+    let mut indexes = Vec::new();
+    if let Some(id) = evidence.client_order_id() {
+        indexes.push(IndexKey::new(IndexKind::ClientOrderId, id.to_string()));
+    }
+
+    if let Some(id) = evidence.venue_order_id() {
+        indexes.push(IndexKey::new(IndexKind::VenueOrderId, id.to_string()));
+    }
+    Ok(EncodedPayload::with_payload_type(
+        payload_type(PAYLOAD_TYPE_ORDER_TERMINAL_EVIDENCE),
+        encode_serde(evidence)?,
+        indexes,
+    ))
 }
 
 /// Encodes a [`FillReport`] into canonical bytes plus its `venue_order_id` index and,
@@ -1818,6 +1848,10 @@ mod tests {
             (
                 "send_execution_report / ExecutionReport",
                 registry.contains::<ExecutionReport>(),
+            ),
+            (
+                "reconciliation.raw.order_query / OrderTerminalEvidence",
+                registry.contains::<OrderTerminalEvidence>(),
             ),
             (
                 "publish_position_event / PositionEvent",

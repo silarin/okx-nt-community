@@ -19,7 +19,9 @@ always tracks the newest upstream commit. Update this record with each upstream 
 - Preserve exact fee accounting, fill ownership, and record-time filtering.
 - Reject incomplete or contradictory required per-order fill histories. Bulk startup history
   limits must not truncate required per-order recovery.
-- Preserve strategy order cleanup during managed exit.
+- Wait for strategy order cleanup and unresolved execution evidence before sizing managed exits.
+- Retain pending cancel/update commands when the configured recovery policy requires venue evidence.
+- Admit terminal observations only after native fill accounting; reject unresolved event-store restores.
 - Identify this repository and its documentation as an independent fork.
 
 The [OKX integration guide](docs/integrations/okx.md) describes the adapter's behavior and configuration.

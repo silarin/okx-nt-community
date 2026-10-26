@@ -47,7 +47,8 @@ use nautilus_common::{
         ExecutionReport,
         execution::{
             IncompleteFillReport, MAX_INCOMPLETE_FILL_OBSERVATIONS, MAX_ORDER_FEE_OBSERVATIONS,
-            MAX_ORDER_FILL_OBSERVATIONS, OrderFeeEvidence, QueryOrder, TradingCommand,
+            MAX_ORDER_FILL_OBSERVATIONS, OrderFeeEvidence, OrderTerminalEvidence, QueryOrder,
+            TradingCommand,
             report::{
                 GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
                 GeneratePositionStatusReports,
@@ -361,10 +362,14 @@ pub struct ExecutionManager {
     order_inflight_checks: IndexMap<ClientOrderId, InflightCheck>,
     submissions: IndexMap<ClientOrderId, SubmissionRecoveryState>,
     submission_exhaustions: Vec<SubmissionRecoveryExhausted>,
+    retained_commands: IndexSet<ClientOrderId>,
     submission_retention: IndexMap<ClientId, AccountId>,
     order_query_recency: RecencyMap<ClientOrderId>,
     order_query_pending: IndexSet<ClientOrderId>,
     order_query_fill_reports: IndexMap<ClientOrderId, PendingQueryFills>,
+    terminal_order_evidence: IndexMap<ClientOrderId, Vec<(OrderTerminalEvidence, bool, bool)>>,
+    terminal_evidence_exhausted: IndexSet<ClientOrderId>,
+    terminal_snapshot_conflicts: IndexSet<ClientOrderId>,
     standalone_fill_reports: IndexMap<ClientOrderId, Vec<StandaloneFillObligation>>,
     incomplete_fill_reports: IndexMap<ClientOrderId, Vec<IncompleteFillObligation>>,
     order_evidence_exhausted: IndexSet<OrderEvidenceKey>,
@@ -396,10 +401,14 @@ impl Debug for ExecutionManager {
             .field("order_inflight_checks", &self.order_inflight_checks)
             .field("submissions", &self.submissions)
             .field("submission_exhaustions", &self.submission_exhaustions)
+            .field("retained_commands", &self.retained_commands)
             .field("submission_retention", &self.submission_retention)
             .field("order_query_recency", &self.order_query_recency)
             .field("order_query_pending", &self.order_query_pending)
             .field("order_query_fill_reports", &self.order_query_fill_reports)
+            .field("terminal_order_evidence", &self.terminal_order_evidence)
+            .field("terminal_evidence_exhausted", &self.terminal_evidence_exhausted)
+            .field("terminal_snapshot_conflicts", &self.terminal_snapshot_conflicts)
             .field("standalone_fill_reports", &self.standalone_fill_reports)
             .field("incomplete_fill_reports", &self.incomplete_fill_reports)
             .field("order_evidence_exhausted", &self.order_evidence_exhausted)
@@ -441,10 +450,14 @@ impl ExecutionManager {
             order_inflight_checks: IndexMap::new(),
             submissions: IndexMap::new(),
             submission_exhaustions: Vec::new(),
+            retained_commands: IndexSet::new(),
             submission_retention: IndexMap::new(),
             order_query_recency: RecencyMap::default(),
             order_query_pending: IndexSet::new(),
             order_query_fill_reports: IndexMap::new(),
+            terminal_order_evidence: IndexMap::new(),
+            terminal_evidence_exhausted: IndexSet::new(),
+            terminal_snapshot_conflicts: IndexSet::new(),
             standalone_fill_reports: IndexMap::new(),
             incomplete_fill_reports: IndexMap::new(),
             order_evidence_exhausted: IndexSet::new(),
@@ -484,6 +497,7 @@ impl ExecutionManager {
     /// Skips filtered orders and preserves an active submission's remaining budget.
     /// Submission identity and duplicate suppression require [`Self::register_submission`].
     pub fn register_inflight(&mut self, client_order_id: ClientOrderId) {
+        self.retained_commands.shift_remove(&client_order_id);
         self.confirm_submission_outcome(&client_order_id);
 
         if self.query_fill_recovery_pending(client_order_id) {
@@ -618,7 +632,32 @@ impl ExecutionManager {
             .collect()
     }
 
+    /// Returns retained acknowledged commands still lacking a native outcome.
+    #[cfg(feature = "node")]
+    pub(crate) fn unresolved_command_ids(&self) -> Vec<ClientOrderId> {
+        self.cache
+            .borrow()
+            .orders_inflight(None, None, None, None, None)
+            .iter()
+            .filter(|order| {
+                matches!(
+                    order.status(),
+                    OrderStatus::PendingCancel | OrderStatus::PendingUpdate
+                ) && !self
+                    .config
+                    .filtered_client_order_ids
+                    .contains(&order.client_order_id())
+                    && self.submission_retention_enabled(order.client_order_id(), None)
+            })
+            .map(|order| order.client_order_id())
+            .collect()
+    }
+
     fn query_fill_recovery_pending(&self, client_order_id: ClientOrderId) -> bool {
+        if self.terminal_evidence_conflicts(client_order_id) {
+            return true;
+        }
+
         if self.order_evidence_exhausted.iter().any(|key| {
             self.order_evidence_ids
                 .get(key)
@@ -712,7 +751,56 @@ impl ExecutionManager {
         {
             return false;
         }
-        pending.is_pending(self.get_order(client_order_id).as_ref())
+        let order = self.get_execution_evidence_order(client_order_id);
+        let bounds = order.as_ref().map_or_else(Vec::new, |order| {
+            self.execution_query_bounds(client_order_id, order)
+        });
+        pending.conflict
+            || pending.obligations.iter().any(|obligation| {
+                !obligation.complete
+                    && order
+                        .as_ref()
+                        .is_none_or(|order| !obligation.is_complete(order, &bounds))
+            })
+    }
+
+    fn get_execution_evidence_order(&self, id: ClientOrderId) -> Option<OrderAny> {
+        if let Some(order) = self.get_order(id) {
+            return Some(order);
+        }
+        let mut resolved = None;
+
+        for ((account, instrument, venue), ids) in &self.order_evidence_ids {
+            if !ids.contains(&id) {
+                continue;
+            }
+            let Some(order) = self.get_order_by_venue_order_id(*venue).filter(|order| {
+                order.account_id() == Some(*account) && order.instrument_id() == *instrument
+            }) else {
+                continue;
+            };
+
+            if resolved
+                .as_ref()
+                .is_some_and(|known: &OrderAny| known.client_order_id() != order.client_order_id())
+            {
+                return None;
+            }
+            resolved = Some(order);
+        }
+        resolved
+    }
+
+    fn execution_query_bounds(
+        &self,
+        id: ClientOrderId,
+        order: &OrderAny,
+    ) -> Vec<(Quantity, UnixNanos)> {
+        self.terminal_evidence_ids(id)
+            .iter()
+            .filter_map(|id| self.order_query_fill_reports.get(id))
+            .flat_map(|pending| pending.complete_query_bounds(order))
+            .collect()
     }
 
     fn order_fee_obligation_complete(
@@ -774,6 +862,224 @@ impl ExecutionManager {
                 .is_none_or(|total| total != report.filled_qty)
     }
 
+    /// Exposes retained execution uncertainty to native strategy close sizing and order purging.
+    #[cfg(feature = "node")]
+    pub(crate) fn sync_order_execution_hold(&self, id: ClientOrderId) {
+        for id in self.terminal_evidence_ids(id) {
+            let pending = self.terminal_admission_pending(id);
+            let key = self
+                .order_evidence_ids
+                .iter()
+                .find(|(_, ids)| ids.contains(&id))
+                .map(|(key, _)| *key);
+            let order = self
+                .get_order(id)
+                .or_else(|| key.and_then(|key| self.get_order_by_venue_order_id(key.2)));
+            let scope = order
+                .map(|order| (order.instrument_id(), Some(order.strategy_id())))
+                .or_else(|| {
+                    key.map(|key| (key.1, self.cache.borrow().external_order_claim(&key.1)))
+                });
+
+            if let Some((instrument, strategy)) = scope {
+                self.cache
+                    .borrow_mut()
+                    .set_order_execution_pending(id, instrument, strategy, pending);
+            }
+        }
+    }
+
+    fn terminal_evidence_conflicts(&self, id: ClientOrderId) -> bool {
+        if self.terminal_evidence_exhausted.contains(&id)
+            || self.terminal_snapshot_conflicts.contains(&id)
+        {
+            return true;
+        }
+        let Some(observations) = self.terminal_order_evidence.get(&id) else {
+            return false;
+        };
+        let order = self.get_execution_evidence_order(id);
+        let mut ids = self.terminal_evidence_ids(id);
+        if let Some(order) = &order
+            && let Some((account, venue)) = order.account_id().zip(order.venue_order_id())
+            && let Some(owners) =
+                self.order_evidence_ids
+                    .get(&(account, order.instrument_id(), venue))
+        {
+            ids.extend(owners);
+        }
+        observations.iter().any(|(evidence, _, _)| {
+            order.as_ref().is_some_and(|order| {
+                !evidence.matches_order(order) || evidence.conflicts_with_order(order)
+            }) || ids
+                .iter()
+                .filter_map(|id| self.order_query_fill_reports.get(id))
+                .flat_map(|pending| &pending.obligations)
+                .any(|query| evidence.conflicts_with_report(&query.report))
+                || evidence.conflicts_with_fills(
+                    ids.iter()
+                        .filter_map(|id| self.standalone_fill_reports.get(id))
+                        .flatten()
+                        .map(|obligation| &obligation.report)
+                        .chain(
+                            ids.iter()
+                                .filter_map(|id| self.order_query_fill_reports.get(id))
+                                .flat_map(|pending| &pending.obligations)
+                                .flat_map(|query| &query.fills),
+                        ),
+                )
+        })
+    }
+
+    fn terminal_evidence_ids(&self, id: ClientOrderId) -> IndexSet<ClientOrderId> {
+        let mut ids = IndexSet::from([id]);
+        for owners in self
+            .order_evidence_ids
+            .values()
+            .filter(|owners| owners.contains(&id))
+        {
+            ids.extend(owners);
+        }
+
+        if let Some(order) = self.get_order(id)
+            && let Some((account, venue)) = order.account_id().zip(order.venue_order_id())
+            && let Some(owners) =
+                self.order_evidence_ids
+                    .get(&(account, order.instrument_id(), venue))
+        {
+            ids.extend(owners);
+        }
+
+        for (evidence, _, _) in self.terminal_order_evidence.get(&id).into_iter().flatten() {
+            if let Some(key) = evidence.order_key()
+                && let Some(owners) = self.order_evidence_ids.get(&key)
+            {
+                ids.extend(owners);
+            }
+        }
+        ids
+    }
+
+    fn terminal_admission_pending(&self, id: ClientOrderId) -> bool {
+        self.terminal_evidence_ids(id)
+            .iter()
+            .any(|id| self.query_fill_recovery_pending(*id))
+    }
+
+    /// Retains an immutable terminal observation and decides whether native accounting admits it.
+    #[cfg(feature = "node")]
+    pub(crate) fn admit_terminal_evidence(&mut self, evidence: &OrderTerminalEvidence) -> bool {
+        let id = evidence.client_order_id().or_else(|| {
+            evidence.venue_order_id().map(|venue| {
+                self.cache
+                    .borrow()
+                    .client_order_id(&venue)
+                    .copied()
+                    .unwrap_or_else(|| ClientOrderId::from(venue.as_str()))
+            })
+        });
+        let Some(id) = id else {
+            return true;
+        };
+
+        if let Some(key) = evidence.order_key() {
+            self.order_evidence_ids.entry(key).or_default().insert(id);
+            // Immutable snapshot contradictions cannot be repaired by later polling.
+            // Compare each new observation once instead of rescanning all pairs on every tick.
+            if self.order_evidence_ids[&key]
+                .iter()
+                .filter_map(|id| self.terminal_order_evidence.get(id))
+                .flatten()
+                .any(|(other, _, _)| {
+                    matches!(other,
+                    OrderTerminalEvidence::Report(report) if evidence.conflicts_with_report(report))
+                })
+            {
+                self.terminal_snapshot_conflicts.insert(id);
+            }
+        }
+        let duplicate = self
+            .terminal_order_evidence
+            .get(&id)
+            .is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|(previous, _, _)| previous.same_observation(evidence))
+            });
+
+        if !duplicate && !self.terminal_evidence_exhausted.contains(&id) {
+            msgbus::publish_any(
+                MessagingSwitchboard::reconciliation_raw_order_query_topic(),
+                evidence,
+            );
+            let entries = self.terminal_order_evidence.entry(id).or_default();
+            if entries.len() >= MAX_ORDER_FILL_OBSERVATIONS {
+                self.terminal_evidence_exhausted.insert(id);
+                log::error!(
+                    "Terminal observation budget exhausted for {id}; recovery remains held"
+                );
+                return false;
+            }
+            entries.push((evidence.clone(), false, false));
+        }
+
+        if self.terminal_admission_pending(id) {
+            return false;
+        }
+
+        if let Some(entries) = self.terminal_order_evidence.get_mut(&id) {
+            for (previous, dispatched, _) in entries {
+                if previous.same_observation(evidence) {
+                    *dispatched = true;
+                }
+            }
+        }
+        true
+    }
+
+    /// Returns buffered terminal observations whose execution obligations have completed.
+    #[cfg(feature = "node")]
+    pub(crate) fn take_ready_terminal_evidence(
+        &mut self,
+        ids: &[ClientOrderId],
+    ) -> Vec<OrderTerminalEvidence> {
+        let ids: IndexSet<_> = ids
+            .iter()
+            .flat_map(|id| self.terminal_evidence_ids(*id))
+            .collect();
+
+        for id in &ids {
+            self.confirm_submission_outcome(id);
+        }
+        let ready: Vec<_> = ids
+            .iter()
+            .copied()
+            .filter(|id| self.terminal_order_evidence.contains_key(id))
+            .filter(|id| !self.terminal_admission_pending(*id))
+            .collect();
+        let mut result = Vec::new();
+
+        for id in ready {
+            let closed = self
+                .get_execution_evidence_order(id)
+                .is_some_and(|order| order.is_closed());
+
+            for (evidence, dispatched, complete) in self
+                .terminal_order_evidence
+                .get_mut(&id)
+                .expect("retained identity")
+            {
+                *complete |= closed;
+                if !*dispatched && !*complete {
+                    *dispatched = true;
+                    result.push(evidence.clone());
+                }
+            }
+        }
+        result.sort_by_key(OrderTerminalEvidence::timestamp);
+        result
+    }
+
     /// Returns orders whose queried executions still lack authoritative fill accounting.
     #[cfg(feature = "node")]
     pub(crate) fn unresolved_query_fill_ids(&self) -> Vec<ClientOrderId> {
@@ -782,10 +1088,18 @@ impl ExecutionManager {
             .chain(self.standalone_fill_reports.keys())
             .chain(self.incomplete_fill_reports.keys())
             .chain(self.order_fee_reports.keys())
+            .chain(self.terminal_order_evidence.keys())
+            .chain(self.terminal_evidence_exhausted.iter())
             .copied()
             .collect::<IndexSet<_>>()
             .into_iter()
-            .filter(|id| self.query_fill_recovery_pending(*id))
+            .filter(|id| {
+                self.query_fill_recovery_pending(*id)
+                    || self
+                        .terminal_order_evidence
+                        .get(id)
+                        .is_some_and(|entries| entries.iter().any(|(_, _, complete)| !complete))
+            })
             .collect()
     }
 
@@ -794,6 +1108,17 @@ impl ExecutionManager {
     /// An acknowledgement ends the submission budget, including recovery for commands
     /// dispatched before acknowledgement. A later command starts its own inflight check.
     pub fn confirm_submission_outcome(&mut self, client_order_id: &ClientOrderId) {
+        if self.retained_commands.contains(client_order_id)
+            && self.get_order(*client_order_id).is_some_and(|order| {
+                !matches!(
+                    order.status(),
+                    OrderStatus::PendingCancel | OrderStatus::PendingUpdate
+                )
+            })
+        {
+            self.retained_commands.shift_remove(client_order_id);
+        }
+
         if let Some(reports) = self.order_fee_reports.get(client_order_id) {
             let completed: Vec<_> = reports
                 .iter()
@@ -860,10 +1185,14 @@ impl ExecutionManager {
                     .iter()
                     .any(|obligation| !obligation.complete)
             })
-            && let Some(order) = self.get_order(*client_order_id)
-            && let Some(pending) = self.order_query_fill_reports.get_mut(client_order_id)
+            && let Some(order) = self.get_execution_evidence_order(*client_order_id)
         {
-            let query_bounds = pending.complete_query_bounds(&order);
+            let query_bounds = self.execution_query_bounds(*client_order_id, &order);
+            let pending = self.order_query_fill_reports.get_mut(client_order_id);
+            let Some(pending) = pending else {
+                return;
+            };
+
             for obligation in pending
                 .obligations
                 .iter_mut()
@@ -1295,8 +1624,10 @@ impl ExecutionManager {
         // A complete order history is required before any startup projection. Keep all
         // trades in the existing globally sorted mass-status path, including orphan fills.
         let mut histories_complete = true;
+        let startup_orders = mass_status.order_reports();
         let startup_fills = mass_status.fill_reports();
-        for report in mass_status.order_reports().values() {
+
+        for report in startup_orders.values() {
             if report.filled_qty.is_zero() || self.should_skip_order_report(report) {
                 continue;
             }
@@ -1349,8 +1680,7 @@ impl ExecutionManager {
             if !self.should_reconcile_instrument(&fill.instrument_id)
                 || client_order_id
                     .is_some_and(|id| self.config.filtered_client_order_ids.contains(&id))
-                || mass_status
-                    .order_reports()
+                || startup_orders
                     .get(&fill.venue_order_id)
                     .is_some_and(|report| self.should_skip_order_report(report))
             {
@@ -1403,9 +1733,6 @@ impl ExecutionManager {
                 histories_complete = false;
             }
         }
-
-        histories_complete &=
-            !fills_have_ambiguous_position_order(&self.cache.borrow(), &scoped_startup_fills, true);
 
         if !histories_complete {
             log::error!("Startup reconciliation requires complete compatible order fill histories");
@@ -1481,6 +1808,29 @@ impl ExecutionManager {
                 })
                 .map(|fill| (fill.account_id, fill.instrument_id, fill.trade_id)),
         );
+
+        // Complete order-only history cannot allocate fills to position episodes,
+        // retain the full ordering context if any retained order or orphan can affect them.
+        let affects_positions = scoped_startup_fills.iter().any(|fill| {
+            !order_only_ids.contains(&fill.venue_order_id)
+                || startup_orders
+                    .get(&fill.venue_order_id)
+                    .is_none_or(|report| report.filled_qty.is_zero())
+        });
+
+        if affects_positions
+            && fills_have_ambiguous_position_order(
+                &self.cache.borrow(),
+                &scoped_startup_fills,
+                true,
+            )
+        {
+            log::error!("Startup reconciliation requires unambiguous position fill histories");
+            return ReconciliationResult {
+                order_fill_history_incomplete: true,
+                ..Default::default()
+            };
+        }
 
         let mut events = Vec::new();
         let mut external_orders = Vec::new();
@@ -2661,6 +3011,16 @@ impl ExecutionManager {
                             }
                         }
                         OrderStatus::PendingUpdate | OrderStatus::PendingCancel => {
+                            if self.submission_retention_enabled(client_order_id, None) {
+                                self.retained_commands.insert(client_order_id);
+                                log::warn!(
+                                    "Command recovery exhausted for {client_order_id} after {retry_count} checks; retaining {} pending venue evidence",
+                                    order.status(),
+                                );
+                                self.clear_recon_tracking(&client_order_id, true);
+                                continue;
+                            }
+
                             // Generate cancellation for orders stuck in pending modify/cancel
                             result
                                 .events
@@ -2813,6 +3173,9 @@ impl ExecutionManager {
     }
 
     fn submission_is_retained(&self, client_order_id: ClientOrderId) -> bool {
+        if self.retained_commands.contains(&client_order_id) {
+            return true;
+        }
         self.submissions
             .get(&client_order_id)
             .is_some_and(|submission| submission.exhausted)
@@ -8552,6 +8915,124 @@ mod tests {
             manager.order_query_pending.contains(&client_order_id),
             expect_inflight,
         );
+    }
+
+    #[rstest]
+    #[case(OrderStatus::PendingUpdate)]
+    #[case(OrderStatus::PendingCancel)]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn test_pending_command_timeout_preserves_retained_order(
+        #[case] pending_status: OrderStatus,
+        #[values(false, true)] retain_policy: bool,
+        #[values(false, true)] retain_client: bool,
+    ) {
+        let client_order_id = ClientOrderId::from("O-PENDING-COMMAND");
+        let venue_order_id = VenueOrderId::from("V-PENDING-COMMAND");
+        let account_id = AccountId::from("TEST-001");
+        let client_id = ClientId::from("TEST");
+        let instrument_id = crypto_perpetual_ethusdt().id();
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        insert_accepted_limit_order(
+            &cache,
+            client_order_id,
+            venue_order_id,
+            instrument_id,
+            client_id,
+        );
+
+        let order = cache.borrow().order_owned(&client_order_id).unwrap();
+
+        let event = match pending_status {
+            OrderStatus::PendingUpdate => OrderEventAny::PendingUpdate(
+                OrderPendingUpdateSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(instrument_id)
+                    .client_order_id(client_order_id)
+                    .account_id(account_id)
+                    .venue_order_id(venue_order_id)
+                    .build(),
+            ),
+            OrderStatus::PendingCancel => OrderEventAny::PendingCancel(
+                OrderPendingCancelSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(instrument_id)
+                    .client_order_id(client_order_id)
+                    .account_id(account_id)
+                    .venue_order_id(venue_order_id)
+                    .build(),
+            ),
+            _ => unreachable!(),
+        };
+
+        cache.borrow_mut().update_order(&event).unwrap();
+
+        let mut manager = ExecutionManager::new(
+            clock,
+            cache.clone(),
+            ExecutionManagerConfig {
+                inflight_threshold_ms: 100,
+                inflight_max_retries: 2,
+                submission_recovery_policy: if retain_policy {
+                    SubmissionRecoveryPolicy::RetainUnresolved
+                } else {
+                    SubmissionRecoveryPolicy::ResolveLocally
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        if retain_client {
+            manager.submission_retention.insert(client_id, account_id);
+        }
+        manager.register_inflight(client_order_id);
+        dst::time::sleep(Duration::from_millis(101)).await;
+        let first = manager.check_inflight_orders();
+        assert_eq!(first.queries.len(), 1);
+        assert!(first.events.is_empty());
+        dst::time::sleep(Duration::from_millis(101)).await;
+        let exhausted = manager.check_inflight_orders();
+        assert!(exhausted.queries.is_empty());
+        assert!(!manager.order_inflight_checks.contains_key(&client_order_id));
+        assert!(!manager.order_recon_retries.contains_key(&client_order_id));
+
+        if retain_policy || retain_client {
+            assert!(exhausted.events.is_empty());
+            assert_eq!(
+                cache.borrow().order(&client_order_id).unwrap().status(),
+                pending_status
+            );
+            #[cfg(feature = "node")]
+            assert_eq!(manager.unresolved_command_ids(), vec![client_order_id]);
+            dst::time::sleep(Duration::from_secs(1)).await;
+            let after = manager.check_inflight_orders();
+            assert!(after.events.is_empty());
+            assert!(after.queries.is_empty());
+            assert!(
+                manager
+                    .prepare_missing_order_query(client_order_id)
+                    .is_none()
+            );
+            assert!(manager.filtered_open_orders_for_reconciliation().is_empty());
+            let order = cache.borrow().order_owned(&client_order_id).unwrap();
+            let canceled = TestOrderEventStubs::canceled(&order, account_id, None);
+            manager.observe_order_event(&canceled);
+            cache.borrow_mut().update_order(&canceled).unwrap();
+            manager.confirm_submission_outcome(&client_order_id);
+            #[cfg(feature = "node")]
+            assert!(manager.unresolved_command_ids().is_empty());
+        } else {
+            assert!(
+                matches!(&exhausted.events[..], [OrderEventAny::Canceled(event)] if event.client_order_id == client_order_id)
+            );
+        }
     }
 
     #[rstest]

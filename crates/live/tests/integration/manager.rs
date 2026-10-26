@@ -7230,7 +7230,9 @@ async fn test_inflight_increments_retry_count_before_max() {
     tokio::test(start_paused = true)
 )]
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
-async fn test_inflight_pending_update_generates_canceled(#[case] policy: SubmissionRecoveryPolicy) {
+async fn test_inflight_pending_update_respects_recovery_policy(
+    #[case] policy: SubmissionRecoveryPolicy,
+) {
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 1,
@@ -7266,15 +7268,29 @@ async fn test_inflight_pending_update_generates_canceled(#[case] policy: Submiss
             .take_submission_recovery_exhaustions()
             .is_empty()
     );
-    assert_eq!(result.events.len(), 1);
-    assert!(
-        matches!(result.events[0], OrderEventAny::Canceled(_)),
-        "Expected Canceled for PendingUpdate, was {:?}",
-        result.events[0]
-    );
 
-    if let OrderEventAny::Canceled(canceled) = &result.events[0] {
-        assert_eq!(canceled.client_order_id, client_order_id);
+    if policy == SubmissionRecoveryPolicy::RetainUnresolved {
+        assert!(result.events.is_empty());
+        assert!(result.queries.is_empty());
+        assert_eq!(
+            ctx.cache.borrow().order(&client_order_id).unwrap().status(),
+            OrderStatus::PendingUpdate
+        );
+        ctx.advance_both(dst::time::Duration::from_secs(1)).await;
+        let later = ctx.manager.check_inflight_orders();
+        assert!(later.events.is_empty());
+        assert!(later.queries.is_empty());
+    } else {
+        assert_eq!(result.events.len(), 1);
+        assert!(
+            matches!(result.events[0], OrderEventAny::Canceled(_)),
+            "Expected Canceled for PendingUpdate, was {:?}",
+            result.events[0]
+        );
+
+        if let OrderEventAny::Canceled(canceled) = &result.events[0] {
+            assert_eq!(canceled.client_order_id, client_order_id);
+        }
     }
 }
 
@@ -7286,7 +7302,9 @@ async fn test_inflight_pending_update_generates_canceled(#[case] policy: Submiss
     tokio::test(start_paused = true)
 )]
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
-async fn test_inflight_pending_cancel_generates_canceled(#[case] policy: SubmissionRecoveryPolicy) {
+async fn test_inflight_pending_cancel_respects_recovery_policy(
+    #[case] policy: SubmissionRecoveryPolicy,
+) {
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 1,
@@ -7322,15 +7340,29 @@ async fn test_inflight_pending_cancel_generates_canceled(#[case] policy: Submiss
             .take_submission_recovery_exhaustions()
             .is_empty()
     );
-    assert_eq!(result.events.len(), 1);
-    assert!(
-        matches!(result.events[0], OrderEventAny::Canceled(_)),
-        "Expected Canceled for PendingCancel, was {:?}",
-        result.events[0]
-    );
 
-    if let OrderEventAny::Canceled(canceled) = &result.events[0] {
-        assert_eq!(canceled.client_order_id, client_order_id);
+    if policy == SubmissionRecoveryPolicy::RetainUnresolved {
+        assert!(result.events.is_empty());
+        assert!(result.queries.is_empty());
+        assert_eq!(
+            ctx.cache.borrow().order(&client_order_id).unwrap().status(),
+            OrderStatus::PendingCancel
+        );
+        ctx.advance_both(dst::time::Duration::from_secs(1)).await;
+        let later = ctx.manager.check_inflight_orders();
+        assert!(later.events.is_empty());
+        assert!(later.queries.is_empty());
+    } else {
+        assert_eq!(result.events.len(), 1);
+        assert!(
+            matches!(result.events[0], OrderEventAny::Canceled(_)),
+            "Expected Canceled for PendingCancel, was {:?}",
+            result.events[0]
+        );
+
+        if let OrderEventAny::Canceled(canceled) = &result.events[0] {
+            assert_eq!(canceled.client_order_id, client_order_id);
+        }
     }
 }
 

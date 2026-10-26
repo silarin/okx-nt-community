@@ -19,10 +19,11 @@ use nautilus_core::UnixNanos;
 use nautilus_model::identifiers::{ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId};
 use serde::{Deserialize, Serialize};
 
-/// Policy when recovery queries cannot establish a submission's venue outcome.
+/// Policy when recovery queries cannot establish an order command's venue outcome.
 ///
 /// When a registered client's `ExecutionClient::retain_unresolved_submissions` returns `true`,
-/// the manager retains its unacknowledged orders regardless of this setting. `LiveNode` registers
+/// the manager retains its unacknowledged orders and pending cancel/update commands regardless
+/// of this setting. `LiveNode` registers
 /// this requirement automatically. Retention stops the manager's automatic per-order recovery
 /// queries; later venue events and reports can still resolve the order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,7 +47,8 @@ pub enum SubmissionRecoveryPolicy {
     /// Selects local resolution using the existing timeout and missing-order policies.
     #[default]
     ResolveLocally,
-    /// Retains unacknowledged orders without further automatic per-order recovery queries.
+    /// Retains unacknowledged orders and pending cancel/update commands after retry exhaustion.
+    /// No further automatic inflight queries are scheduled; native venue evidence can resolve them.
     RetainUnresolved,
 }
 

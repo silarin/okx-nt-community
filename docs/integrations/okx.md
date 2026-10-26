@@ -1572,8 +1572,29 @@ evidence without resubmitting the order. See
 [submission recovery](../concepts/execution/reconciliation.md#submission-recovery) for confirmation and
 query-budget rules. Retained submissions still unresolved at the node's `delay_post_stop` boundary produce an
 [incomplete-recovery shutdown error](../concepts/live.md#submission-recovery-at-shutdown) after teardown. The
-policy does not change timeout resolution for commands on already accepted orders, provide crash-durable
-recovery, or prove that positions are flat.
+policy also retains pending cancel/update commands on accepted orders after their query budget exhausts.
+Later authoritative evidence or a newly dispatched command can resolve or restart that command's recovery.
+This does not provide crash-durable command recovery or prove that positions are flat.
+
+### Terminal observations and managed exits
+
+This fork retains canceled, expired, rejected, and denied observations while native execution evidence
+remains unresolved. An authoritative terminal snapshot with zero cumulative fills cannot erase earlier fill
+evidence. Other adapters' status deltas that omit cumulative quantities retain their existing semantics.
+Exact authoritative fills still update orders, positions, and fees; even a fully filled native order holds
+managed exit sizing when its fee or history evidence is incomplete. Contradictory cumulative snapshots and
+exhausted evidence budgets remain unresolved. An ordinary terminal observation without outstanding evidence
+can complete immediately.
+
+Managed exit waits for the strategy's orders and execution obligations before sizing a residual close.
+Unclaimed execution evidence holds strategies using the affected instrument. The existing managed-exit
+attempt limit still applies; reaching it does not prove flatness. Incomplete recovery makes node shutdown
+return an error after teardown.
+
+The event store captures retained terminal observations and rejects restoration when their execution
+accounting is unresolved, including when a snapshot anchor would otherwise hide the observation. This
+protection requires event-store capture and restore. A cache database alone does not persist these live
+recovery obligations.
 
 ## Configuration
 

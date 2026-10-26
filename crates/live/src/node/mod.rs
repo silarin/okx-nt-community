@@ -102,7 +102,7 @@ use nautilus_common::{
     messages::{
         DataEvent, ExecutionEvent, ExecutionReport, SystemCommand, SystemEvent,
         data::DataCommand,
-        execution::{IncompleteFillReport, TradingCommand},
+        execution::{IncompleteFillReport, OrderTerminalEvidence, TradingCommand},
         system::{QueueStateChanged, ReconnectSocket, SocketStateChange, SocketStateChanged},
     },
     msgbus::{self, BusMessage, MessagingSwitchboard},
@@ -2165,6 +2165,8 @@ impl LiveNode {
     }
 
     fn process_reconciliation_events(&mut self, events: &[OrderEventAny]) {
+        use nautilus_common::messages::execution::OrderTerminalEvidence;
+
         if events.is_empty() {
             self.publish_submission_recovery_exhaustions();
             return;
@@ -2177,6 +2179,23 @@ impl LiveNode {
         );
 
         for event in events {
+            let terminal = match event {
+                OrderEventAny::Canceled(event) => Some(OrderTerminalEvidence::Canceled(*event)),
+                OrderEventAny::Expired(event) => Some(OrderTerminalEvidence::Expired(*event)),
+                OrderEventAny::Rejected(event) => {
+                    Some(OrderTerminalEvidence::Rejected(event.clone()))
+                }
+                OrderEventAny::Denied(event) => Some(OrderTerminalEvidence::Denied(event.clone())),
+                _ => None,
+            };
+
+            if let Some(terminal) = terminal
+                && !self.exec_manager.admit_terminal_evidence(&terminal)
+            {
+                self.exec_manager
+                    .sync_order_execution_hold(event.client_order_id());
+                continue;
+            }
             self.exec_manager
                 .record_local_activity(event.client_order_id());
             if let OrderEventAny::Filled(fill) = event {
@@ -2184,9 +2203,14 @@ impl LiveNode {
                     .record_position_activity(fill.instrument_id, fill.account_id);
             }
 
+            self.exec_manager
+                .sync_order_execution_hold(event.client_order_id());
             self.kernel.exec_engine.borrow_mut().process(event);
             self.exec_manager
                 .confirm_submission_outcome(&event.client_order_id());
+            self.exec_manager
+                .sync_order_execution_hold(event.client_order_id());
+            self.dispatch_ready_terminal_evidence(&[event.client_order_id()]);
             if let OrderEventAny::Filled(fill) = event {
                 self.exec_manager.commit_recent_fill_if_applied(fill);
             }
@@ -2276,6 +2300,18 @@ impl LiveNode {
         Ok(())
     }
 
+    fn sync_event_execution_hold(&self, event: &ExecutionEvent) {
+        let id = match event {
+            ExecutionEvent::Report(report) => self.order_report_client_order_id(report),
+            ExecutionEvent::Order(event) => Some(event.client_order_id()),
+            _ => None,
+        };
+
+        if let Some(id) = id {
+            self.exec_manager.sync_order_execution_hold(id);
+        }
+    }
+
     fn process_exec_event(&mut self, message: impl Into<DispatchMessage<ExecutionEvent>>) {
         let message = message.into();
         let rooted = message.is_rooted();
@@ -2287,6 +2323,7 @@ impl LiveNode {
                     report.client_order_id,
                 );
                 self.exec_manager.retain_order_fee_report(report, client_id);
+                self.sync_event_execution_hold(&event);
                 return;
             }
 
@@ -2298,6 +2335,7 @@ impl LiveNode {
                 );
                 self.exec_manager
                     .retain_incomplete_fill_report(report, client_id);
+                self.sync_event_execution_hold(&event);
                 return;
             }
 
@@ -2316,6 +2354,7 @@ impl LiveNode {
                     client_id,
                     matches!(report, ExecutionReport::FillQueryRequired(_)),
                 );
+                self.sync_event_execution_hold(&event);
                 return;
             }
 
@@ -2448,6 +2487,18 @@ impl LiveNode {
                     _ => {}
                 }
 
+                if let ExecutionEvent::OrderCanceledBatch(batch) = &event {
+                    for canceled in &batch.events {
+                        self.exec_manager
+                            .admit_terminal_evidence(&OrderTerminalEvidence::Canceled(*canceled));
+                        self.exec_manager
+                            .sync_order_execution_hold(canceled.client_order_id);
+                    }
+                } else if let Some(terminal) = self.terminal_evidence(&event) {
+                    self.exec_manager.admit_terminal_evidence(&terminal);
+                }
+                self.sync_event_execution_hold(&event);
+
                 if !self.startup_reconciliation_failed
                     && actor::callback_failure().is_none()
                     && let Some(events) = self.startup_exec_events.as_mut()
@@ -2464,8 +2515,126 @@ impl LiveNode {
         });
     }
 
+    fn terminal_evidence(&self, event: &ExecutionEvent) -> Option<OrderTerminalEvidence> {
+        use nautilus_common::messages::execution::OrderTerminalEvidence;
+
+        match event {
+            ExecutionEvent::Order(OrderEventAny::Canceled(event)) => {
+                Some(OrderTerminalEvidence::Canceled(*event))
+            }
+            ExecutionEvent::Order(OrderEventAny::Rejected(event)) => {
+                Some(OrderTerminalEvidence::Rejected(event.clone()))
+            }
+            ExecutionEvent::Order(OrderEventAny::Denied(event)) => {
+                Some(OrderTerminalEvidence::Denied(event.clone()))
+            }
+            ExecutionEvent::Order(OrderEventAny::Expired(event)) => {
+                Some(OrderTerminalEvidence::Expired(*event))
+            }
+            ExecutionEvent::Report(
+                ExecutionReport::Order(report)
+                | ExecutionReport::OrderWithFills(report, _)
+                | ExecutionReport::OrderQueryWithFills(report, _)
+                | ExecutionReport::OrderFillEvidence(report, _),
+            ) if report.order_status.is_closed() => {
+                let cumulative = matches!(
+                    event,
+                    ExecutionEvent::Report(
+                        ExecutionReport::OrderQueryWithFills(..)
+                            | ExecutionReport::OrderFillEvidence(..)
+                    )
+                ) || self.kernel.exec_engine.borrow().requires_order_query_fills(
+                    report.account_id,
+                    report.instrument_id,
+                    report.client_order_id,
+                );
+                Some(if cumulative {
+                    OrderTerminalEvidence::Report(report.clone())
+                } else {
+                    OrderTerminalEvidence::Status(report.clone())
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn dispatch_observed_exec_event(&mut self, event: ExecutionEvent, observed: bool) {
         if actor::callback_failure().is_some() || self.startup_reconciliation_failed {
+            return;
+        }
+
+        if let ExecutionEvent::OrderCanceledBatch(batch) = event {
+            for canceled in batch.events {
+                self.dispatch_observed_exec_event(
+                    ExecutionEvent::Order(OrderEventAny::Canceled(canceled)),
+                    observed,
+                );
+            }
+            return;
+        }
+        let terminal = self.terminal_evidence(&event);
+        // Observe query facts before terminal admission; raw terminal events must not clear recovery.
+        let observed = if terminal.is_some() && !observed {
+            if let ExecutionEvent::Report(report) = &event {
+                self.exec_manager.observe_execution_report(report);
+                if let Some(id) = self.order_report_client_order_id(report) {
+                    self.exec_manager.sync_order_execution_hold(id);
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            observed
+        };
+
+        if let Some(terminal) = terminal
+            && !self.exec_manager.admit_terminal_evidence(&terminal)
+        {
+            self.sync_event_execution_hold(&event);
+            if let ExecutionEvent::Report(report) = &event {
+                msgbus::publish_any(
+                    MessagingSwitchboard::reconciliation_raw_order_query_topic(),
+                    report,
+                );
+
+                if let ExecutionReport::OrderFillEvidence(status, _)
+                | ExecutionReport::Order(status) = report
+                {
+                    // Preserve external identity/acceptance without projecting terminal state
+                    // or treating stream companion evidence as an executable fill bundle.
+                    self.kernel
+                        .exec_engine
+                        .borrow_mut()
+                        .reconcile_order_query_executions(status, &[]);
+                }
+
+                if let ExecutionReport::OrderQueryWithFills(status, fills)
+                | ExecutionReport::OrderWithFills(status, fills) = report
+                    && self
+                        .exec_manager
+                        .query_fills_respect_observations(status, fills)
+                {
+                    self.kernel
+                        .exec_engine
+                        .borrow_mut()
+                        .reconcile_order_query_executions(status, fills);
+
+                    if let Some(id) = self.order_report_client_order_id(report) {
+                        self.exec_manager.confirm_submission_outcome(&id);
+                        self.exec_manager.sync_order_execution_hold(id);
+                    }
+                }
+            }
+            let ids = match &event {
+                ExecutionEvent::Report(report) => self
+                    .order_report_client_order_id(report)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                ExecutionEvent::Order(event) => vec![event.client_order_id()],
+                _ => Vec::new(),
+            };
+            self.dispatch_ready_terminal_evidence(&ids);
             return;
         }
         let clear_closed_orders = matches!(
@@ -2489,6 +2658,8 @@ impl LiveNode {
         for client_order_id in &order_ids {
             self.exec_manager
                 .confirm_submission_outcome(client_order_id);
+            self.exec_manager
+                .sync_order_execution_hold(*client_order_id);
             let is_closed = self
                 .kernel
                 .cache()
@@ -2500,6 +2671,35 @@ impl LiveNode {
                 self.exec_manager
                     .clear_recon_tracking(client_order_id, true);
             }
+        }
+        self.dispatch_ready_terminal_evidence(&order_ids);
+    }
+
+    fn dispatch_ready_terminal_evidence(&mut self, ids: &[ClientOrderId]) {
+        use nautilus_common::messages::execution::OrderTerminalEvidence;
+
+        for evidence in self.exec_manager.take_ready_terminal_evidence(ids) {
+            let event = match evidence {
+                OrderTerminalEvidence::Canceled(event) => {
+                    ExecutionEvent::Order(OrderEventAny::Canceled(event))
+                }
+                OrderTerminalEvidence::Rejected(event) => {
+                    ExecutionEvent::Order(OrderEventAny::Rejected(event))
+                }
+                OrderTerminalEvidence::Denied(event) => {
+                    ExecutionEvent::Order(OrderEventAny::Denied(event))
+                }
+                OrderTerminalEvidence::Expired(event) => {
+                    ExecutionEvent::Order(OrderEventAny::Expired(event))
+                }
+                OrderTerminalEvidence::Report(report) => {
+                    ExecutionEvent::Report(ExecutionReport::OrderQueryWithFills(report, Vec::new()))
+                }
+                OrderTerminalEvidence::Status(report) => {
+                    ExecutionEvent::Report(ExecutionReport::Order(report))
+                }
+            };
+            self.dispatch_observed_exec_event(event, true);
         }
     }
 
@@ -2811,6 +3011,7 @@ impl LiveNode {
         }
         // Capture recovery at the grace-period boundary, before disconnection can queue more
         // evidence. A later drain must not turn incomplete recovery into a successful shutdown.
+        let mut unresolved_commands = self.exec_manager.unresolved_command_ids();
         let mut unresolved_submissions = self.exec_manager.unresolved_submission_ids();
         let mut unresolved_query_fills = self.exec_manager.unresolved_query_fill_ids();
         self.close_external_ingress();
@@ -2850,6 +3051,9 @@ impl LiveNode {
         } else {
             self.drain_runner_pending();
         }
+        unresolved_commands.extend(self.exec_manager.unresolved_command_ids());
+        unresolved_commands.sort_unstable();
+        unresolved_commands.dedup();
         unresolved_submissions.extend(self.exec_manager.unresolved_submission_ids());
         unresolved_submissions.sort_unstable();
         unresolved_submissions.dedup();
@@ -2859,6 +3063,12 @@ impl LiveNode {
         let kernel_result = self.kernel.finalize_stop().await;
 
         self.handle.set_stopped();
+
+        if !unresolved_commands.is_empty() {
+            errors.push(format!(
+                "Command recovery incomplete at shutdown: unresolved client order IDs {unresolved_commands:?}"
+            ));
+        }
 
         if !unresolved_query_fills.is_empty() {
             errors.push(format!("Order fill recovery incomplete at shutdown: unresolved client order IDs {unresolved_query_fills:?}"));
@@ -3058,6 +3268,9 @@ impl LiveNode {
 
                 if !observed {
                     self.exec_manager.observe_execution_report(report);
+                    if let Some(id) = self.order_report_client_order_id(report) {
+                        self.exec_manager.sync_order_execution_hold(id);
+                    }
                 }
 
                 if let ExecutionReport::OrderQueryWithFills(status, fills) = report
@@ -3086,43 +3299,61 @@ impl LiveNode {
             ExecutionEvent::Account(_) => {}
         }
 
+        for id in &order_ids {
+            self.exec_manager.sync_order_execution_hold(*id);
+        }
         Some(order_ids)
     }
 
     fn order_report_client_order_id(&self, report: &ExecutionReport) -> Option<ClientOrderId> {
         match report {
-            ExecutionReport::IncompleteFill(report) => report.client_order_id.or_else(|| {
-                self.kernel
-                    .cache
-                    .borrow()
-                    .client_order_id(&report.venue_order_id)
-                    .copied()
-            }),
+            ExecutionReport::OrderFeeEvidence(report) => report
+                .client_order_id
+                .or_else(|| {
+                    self.kernel
+                        .cache
+                        .borrow()
+                        .client_order_id(&report.venue_order_id)
+                        .copied()
+                })
+                .or_else(|| Some(ClientOrderId::from(report.venue_order_id.as_str()))),
+            ExecutionReport::IncompleteFill(report) => report
+                .client_order_id
+                .or_else(|| {
+                    self.kernel
+                        .cache
+                        .borrow()
+                        .client_order_id(&report.venue_order_id)
+                        .copied()
+                })
+                .or_else(|| Some(ClientOrderId::from(report.venue_order_id.as_str()))),
 
             ExecutionReport::Order(order_report)
             | ExecutionReport::OrderWithFills(order_report, _)
             | ExecutionReport::OrderQueryWithFills(order_report, _)
             | ExecutionReport::OrderFillEvidence(order_report, _)
-            | ExecutionReport::OrderFillConflict(order_report) => {
-                order_report.client_order_id.or_else(|| {
+            | ExecutionReport::OrderFillConflict(order_report) => order_report
+                .client_order_id
+                .or_else(|| {
                     self.kernel
                         .cache
                         .borrow()
                         .client_order_id(&order_report.venue_order_id)
                         .copied()
                 })
-            }
+                .or_else(|| Some(ClientOrderId::from(order_report.venue_order_id.as_str()))),
             ExecutionReport::Fill(fill_report)
             | ExecutionReport::FillEvidence(fill_report)
-            | ExecutionReport::FillQueryRequired(fill_report) => {
-                fill_report.client_order_id.or_else(|| {
+            | ExecutionReport::FillQueryRequired(fill_report) => fill_report
+                .client_order_id
+                .or_else(|| {
                     self.kernel
                         .cache
                         .borrow()
                         .client_order_id(&fill_report.venue_order_id)
                         .copied()
                 })
-            }
+                .or_else(|| Some(ClientOrderId::from(fill_report.venue_order_id.as_str()))),
             _ => None,
         }
     }
@@ -5138,7 +5369,8 @@ mod tests {
         let trade_id = TradeId::from("T-001");
 
         let close_ids = node.observe_exec_event_before_dispatch(&event, false);
-        assert_eq!(close_ids, Some(Vec::new()));
+        // Retain the venue identity until an external order receives its native client binding.
+        assert_eq!(close_ids, Some(vec![ClientOrderId::from("V-001")]));
         assert!(
             !node
                 .exec_manager
@@ -8410,10 +8642,18 @@ mod tests {
         advance_clock(Duration::from_millis(101)).await;
         let exhausted = node.exec_manager.check_inflight_orders();
         assert!(exhausted.queries.is_empty());
-        assert!(
-            matches!(&exhausted.events[..], [OrderEventAny::Canceled(event)]
+        if policy == SubmissionRecoveryPolicy::RetainUnresolved {
+            assert!(exhausted.events.is_empty());
+            assert_eq!(
+                node.exec_manager.unresolved_command_ids(),
+                vec![client_order_id]
+            );
+        } else {
+            assert!(
+                matches!(&exhausted.events[..], [OrderEventAny::Canceled(event)]
             if event.client_order_id == client_order_id)
-        );
+            );
+        }
         assert!(
             node.exec_manager
                 .take_submission_recovery_exhaustions()
@@ -8427,7 +8667,11 @@ mod tests {
                 .order(&client_order_id)
                 .unwrap()
                 .status(),
-            OrderStatus::Canceled
+            if policy == SubmissionRecoveryPolicy::RetainUnresolved {
+                pending_status
+            } else {
+                OrderStatus::Canceled
+            }
         );
     }
 
@@ -12860,7 +13104,7 @@ mod tests {
         advance_clock(Duration::from_millis(101)).await;
         let second = node.exec_manager.check_inflight_orders();
         assert!(second.queries.is_empty());
-        if repeated_report {
+        if repeated_report || policy == SubmissionRecoveryPolicy::RetainUnresolved {
             assert!(second.events.is_empty());
         } else {
             assert!(
@@ -13074,10 +13318,18 @@ mod tests {
         advance_clock(Duration::from_millis(101)).await;
         let exhausted = node.exec_manager.check_inflight_orders();
         assert!(exhausted.queries.is_empty());
-        assert!(
-            matches!(&exhausted.events[..], [OrderEventAny::Canceled(event)]
+        if policy == SubmissionRecoveryPolicy::RetainUnresolved {
+            assert!(exhausted.events.is_empty());
+            assert_eq!(
+                node.exec_manager.unresolved_command_ids(),
+                vec![client_order_id]
+            );
+        } else {
+            assert!(
+                matches!(&exhausted.events[..], [OrderEventAny::Canceled(event)]
                 if event.client_order_id == client_order_id)
-        );
+            );
+        }
         assert!(
             node.exec_manager
                 .take_submission_recovery_exhaustions()
@@ -13091,7 +13343,15 @@ mod tests {
                 .order(&client_order_id)
                 .unwrap()
                 .status(),
-            OrderStatus::Canceled,
+            if policy == SubmissionRecoveryPolicy::RetainUnresolved {
+                if cancel {
+                    OrderStatus::PendingCancel
+                } else {
+                    OrderStatus::PendingUpdate
+                }
+            } else {
+                OrderStatus::Canceled
+            },
         );
     }
 
@@ -13572,7 +13832,7 @@ mod tests {
         let exhausted = node.exec_manager.check_inflight_orders();
         assert!(exhausted.queries.is_empty());
 
-        if cancel.is_some() {
+        if cancel.is_some() && policy == SubmissionRecoveryPolicy::ResolveLocally {
             assert!(
                 matches!(&exhausted.events[..], [OrderEventAny::Canceled(event)]
                 if event.client_order_id == client_order_id)
@@ -14116,6 +14376,552 @@ mod tests {
                 TradingCommand::ModifyOrder(modify)
             }
         }
+    }
+
+    #[rstest]
+    #[case::canceled("cancel")]
+    #[case::expired("expire")]
+    #[case::rejected("reject")]
+    #[case::denied("deny")]
+    #[case::reconciliation("reconciliation")]
+    #[case::mixed_batch("batch")]
+    #[tokio::test(start_paused = true)]
+    async fn test_terminal_evidence_retains_raw_events_until_fills(#[case] kind: &str) {
+        use nautilus_model::events::{
+            OrderCanceledBatch,
+            order::spec::{
+                OrderCanceledSpec, OrderDeniedSpec, OrderExpiredSpec, OrderRejectedSpec,
+            },
+        };
+        let (mut node, order, instrument) =
+            venue_evidence_node(SubmissionRecoveryPolicy::RetainUnresolved);
+        let id = order.client_order_id();
+        let account = AccountId::from("TEST-001");
+        let venue = VenueOrderId::from("V-TERMINAL");
+        node.process_exec_event(ExecutionEvent::Order(TestOrderEventStubs::accepted(
+            &order, account, venue,
+        )));
+        let report = OrderStatusReport::new(
+            account,
+            instrument.id(),
+            Some(id),
+            venue,
+            Some(order.order_side()),
+            order.order_type(),
+            order.time_in_force(),
+            OrderStatus::Canceled,
+            order.quantity(),
+            Quantity::from("0.400"),
+            1.into(),
+            20.into(),
+            30.into(),
+            None,
+        )
+        .with_price(order.price().unwrap())
+        .with_avg_px(dec!(100));
+        node.process_exec_event(ExecutionEvent::Report(
+            ExecutionReport::OrderQueryWithFills(Box::new(report.clone()), Vec::new()),
+        ));
+        let canceled = OrderCanceledSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(instrument.id())
+            .client_order_id(id)
+            .account_id(account)
+            .venue_order_id(venue)
+            .ts_event(20.into())
+            .build();
+        let event = match kind {
+            "deny" => ExecutionEvent::Order(OrderEventAny::Denied(
+                OrderDeniedSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(instrument.id())
+                    .client_order_id(id)
+                    .ts_event(20.into())
+                    .build(),
+            )),
+            "expire" => ExecutionEvent::Order(OrderEventAny::Expired(
+                OrderExpiredSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(instrument.id())
+                    .client_order_id(id)
+                    .account_id(account)
+                    .venue_order_id(venue)
+                    .ts_event(20.into())
+                    .build(),
+            )),
+            "reject" => ExecutionEvent::Order(OrderEventAny::Rejected(
+                OrderRejectedSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(instrument.id())
+                    .client_order_id(id)
+                    .account_id(account)
+                    .ts_event(20.into())
+                    .build(),
+            )),
+            "batch" => {
+                let sibling = OrderTestBuilder::new(OrderType::Limit)
+                    .trader_id(order.trader_id())
+                    .strategy_id(StrategyId::from("SIBLING-001"))
+                    .instrument_id(instrument.id())
+                    .client_order_id(ClientOrderId::from("O-TERMINAL-SIBLING"))
+                    .quantity(Quantity::from("1.000"))
+                    .price(order.price().unwrap())
+                    .build();
+                node.kernel
+                    .cache
+                    .borrow_mut()
+                    .add_order(sibling.clone(), None, None, false)
+                    .unwrap();
+                node.process_exec_event(ExecutionEvent::Order(TestOrderEventStubs::submitted(
+                    &sibling, account,
+                )));
+                node.process_exec_event(ExecutionEvent::Order(TestOrderEventStubs::accepted(
+                    &sibling,
+                    account,
+                    VenueOrderId::from("V-SIBLING"),
+                )));
+                let other = OrderCanceledSpec::builder()
+                    .trader_id(sibling.trader_id())
+                    .strategy_id(sibling.strategy_id())
+                    .instrument_id(instrument.id())
+                    .client_order_id(sibling.client_order_id())
+                    .account_id(account)
+                    .venue_order_id(VenueOrderId::from("V-SIBLING"))
+                    .ts_event(20.into())
+                    .build();
+                ExecutionEvent::OrderCanceledBatch(OrderCanceledBatch::new(vec![canceled, other]))
+            }
+            _ => ExecutionEvent::Order(OrderEventAny::Canceled(canceled)),
+        };
+
+        if kind == "reconciliation" {
+            node.process_reconciliation_events(&[OrderEventAny::Canceled(canceled)]);
+        } else {
+            node.process_exec_event(event);
+        }
+        assert!(!node.kernel.cache.borrow().order(&id).unwrap().is_closed());
+        assert!(
+            node.kernel
+                .cache
+                .borrow()
+                .has_pending_order_executions(order.strategy_id(), Some(instrument.id()))
+        );
+
+        if kind == "batch" {
+            assert!(
+                node.kernel
+                    .cache
+                    .borrow()
+                    .order(&ClientOrderId::from("O-TERMINAL-SIBLING"))
+                    .unwrap()
+                    .is_closed()
+            );
+        }
+        let fill = FillReport::new(
+            account,
+            instrument.id(),
+            venue,
+            TradeId::from("T-TERMINAL"),
+            order.order_side(),
+            Quantity::from("0.400"),
+            order.price().unwrap(),
+            Money::from("0 USDT"),
+            LiquiditySide::Taker,
+            Some(id),
+            None,
+            10.into(),
+            30.into(),
+            None,
+        );
+        node.process_exec_event(ExecutionEvent::Report(
+            ExecutionReport::OrderQueryWithFills(Box::new(report), vec![fill]),
+        ));
+        assert!(node.kernel.cache.borrow().order(&id).unwrap().is_closed());
+        assert_eq!(
+            node.kernel.cache.borrow().order(&id).unwrap().filled_qty(),
+            Quantity::from("0.400")
+        );
+        assert!(
+            !node
+                .kernel
+                .cache
+                .borrow()
+                .has_pending_order_executions(order.strategy_id(), Some(instrument.id()))
+        );
+        assert!(node.exec_manager.unresolved_query_fill_ids().is_empty());
+        node.kernel
+            .cache
+            .borrow_mut()
+            .purge_closed_orders(1_000_000_000.into(), 0);
+        assert!(node.exec_manager.unresolved_query_fill_ids().is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_terminal_evidence_full_fill_keeps_unresolved_fee_hold() {
+        use nautilus_common::messages::execution::{OrderFeeEvidence, fees::OrderFeeOrigin};
+        let (mut node, order, instrument) =
+            venue_evidence_node(SubmissionRecoveryPolicy::RetainUnresolved);
+        let id = order.client_order_id();
+        let account = AccountId::from("TEST-001");
+        let venue = VenueOrderId::from("V-TERMINAL");
+        node.process_exec_event(ExecutionEvent::Order(TestOrderEventStubs::accepted(
+            &order, account, venue,
+        )));
+        node.process_exec_event(ExecutionEvent::Report(ExecutionReport::OrderFeeEvidence(
+            Box::new(OrderFeeEvidence {
+                account_id: account,
+                instrument_id: instrument.id(),
+                venue_order_id: venue,
+                client_order_id: Some(id),
+                venue_position_id: None,
+                order_side: order.order_side(),
+                boundary_quantity: Some(dec!(1)),
+                boundary_time: Some(20.into()),
+                anchor_trade_id: None,
+                anchor_trade_time: None,
+                origin: OrderFeeOrigin::Stream,
+                constraints: Vec::new(),
+                unrepresentable_values: true,
+                requires_fresh_query: true,
+                ts_init: 30.into(),
+            }),
+        )));
+        let report = OrderStatusReport::new(
+            account,
+            instrument.id(),
+            Some(id),
+            venue,
+            Some(order.order_side()),
+            order.order_type(),
+            order.time_in_force(),
+            OrderStatus::Filled,
+            order.quantity(),
+            order.quantity(),
+            1.into(),
+            20.into(),
+            40.into(),
+            None,
+        )
+        .with_price(order.price().unwrap())
+        .with_avg_px(dec!(100));
+        let fill = FillReport::new(
+            account,
+            instrument.id(),
+            venue,
+            TradeId::from("T-TERMINAL"),
+            order.order_side(),
+            order.quantity(),
+            order.price().unwrap(),
+            Money::from("0 USDT"),
+            LiquiditySide::Taker,
+            Some(id),
+            None,
+            10.into(),
+            40.into(),
+            None,
+        );
+        node.process_exec_event(ExecutionEvent::Report(
+            ExecutionReport::OrderQueryWithFills(Box::new(report), vec![fill]),
+        ));
+        assert_eq!(
+            node.kernel.cache.borrow().order(&id).unwrap().status(),
+            OrderStatus::Filled
+        );
+        assert!(
+            node.kernel
+                .cache
+                .borrow()
+                .has_pending_order_executions(order.strategy_id(), Some(instrument.id()))
+        );
+        assert_eq!(node.exec_manager.unresolved_query_fill_ids(), vec![id]);
+        node.kernel
+            .cache
+            .borrow_mut()
+            .purge_closed_orders(1_000_000_000.into(), 0);
+        assert!(node.kernel.cache.borrow().order_exists(&id));
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_terminal_evidence_completes_prebinding_venue_alias() {
+        use nautilus_common::messages::execution::{
+            MAX_ORDER_FILL_OBSERVATIONS, OrderTerminalEvidence,
+        };
+        use nautilus_model::events::order::spec::OrderCanceledSpec;
+        let (mut node, order, instrument) =
+            venue_evidence_node(SubmissionRecoveryPolicy::RetainUnresolved);
+        let id = order.client_order_id();
+        let account = AccountId::from("TEST-001");
+        let venue = VenueOrderId::from("V-PREBINDING");
+        let mut report = OrderStatusReport::new(
+            account,
+            instrument.id(),
+            None,
+            venue,
+            Some(order.order_side()),
+            order.order_type(),
+            order.time_in_force(),
+            OrderStatus::Canceled,
+            order.quantity(),
+            Quantity::from("0.400"),
+            1.into(),
+            20.into(),
+            30.into(),
+            None,
+        )
+        .with_price(order.price().unwrap())
+        .with_avg_px(dec!(100));
+        // Startup ingress retains the unidentified observation before native acceptance binds it.
+        node.startup_exec_events = Some(Vec::new());
+        node.process_exec_event(ExecutionEvent::Report(ExecutionReport::OrderFillEvidence(
+            Box::new(report.clone()),
+            Vec::new(),
+        )));
+        assert_eq!(
+            node.exec_manager.unresolved_query_fill_ids(),
+            vec![ClientOrderId::from(venue.as_str())]
+        );
+        node.startup_exec_events = None;
+        node.process_exec_event(ExecutionEvent::Order(TestOrderEventStubs::accepted(
+            &order, account, venue,
+        )));
+        assert!(
+            node.kernel
+                .cache
+                .borrow()
+                .has_pending_order_executions(order.strategy_id(), Some(instrument.id()))
+        );
+        report.client_order_id = Some(id);
+        let fill = FillReport::new(
+            account,
+            instrument.id(),
+            venue,
+            TradeId::from("T-PREBINDING"),
+            order.order_side(),
+            Quantity::from("0.400"),
+            order.price().unwrap(),
+            Money::from("0 USDT"),
+            LiquiditySide::Taker,
+            Some(id),
+            None,
+            10.into(),
+            40.into(),
+            None,
+        );
+        node.process_exec_event(ExecutionEvent::Report(
+            ExecutionReport::OrderQueryWithFills(Box::new(report), vec![fill]),
+        ));
+        assert_eq!(
+            node.kernel.cache.borrow().order(&id).unwrap().filled_qty(),
+            Quantity::from("0.400")
+        );
+        assert!(node.kernel.cache.borrow().order(&id).unwrap().is_closed());
+        assert!(node.exec_manager.unresolved_query_fill_ids().is_empty());
+        assert!(
+            !node
+                .kernel
+                .cache
+                .borrow()
+                .has_pending_order_executions(order.strategy_id(), Some(instrument.id()))
+        );
+        // Repeated raw venue facts have fresh local IDs but must not exhaust retention.
+        let canceled = OrderCanceledSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(instrument.id())
+            .client_order_id(id)
+            .account_id(account)
+            .venue_order_id(venue)
+            .ts_event(20.into())
+            .build();
+
+        for index in 0..=MAX_ORDER_FILL_OBSERVATIONS {
+            let mut repeated = canceled;
+            repeated.event_id = UUID4::new();
+            repeated.ts_init = (100 + index as u64).into();
+            assert!(
+                node.exec_manager
+                    .admit_terminal_evidence(&OrderTerminalEvidence::Canceled(repeated))
+            );
+        }
+        node.exec_manager.take_ready_terminal_evidence(&[id]);
+        assert!(node.exec_manager.unresolved_query_fill_ids().is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_terminal_evidence_is_captured_during_failure_drain(
+        #[values(false, true)] callback_failure: bool,
+        #[values(false, true)] raw_event: bool,
+    ) {
+        use nautilus_common::messages::execution::OrderTerminalEvidence;
+        use nautilus_model::events::order::spec::OrderCanceledSpec;
+        let (mut node, order, instrument) =
+            venue_evidence_node(SubmissionRecoveryPolicy::RetainUnresolved);
+        let id = order.client_order_id();
+        let account = AccountId::from("TEST-001");
+        let venue = VenueOrderId::from("V-DRAIN");
+        node.process_exec_event(ExecutionEvent::Order(TestOrderEventStubs::accepted(
+            &order, account, venue,
+        )));
+        let captured = Rc::new(RefCell::new(Vec::new()));
+        let observations = captured.clone();
+        let handler =
+            ShareableMessageHandler::from_typed(move |evidence: &OrderTerminalEvidence| {
+                observations.borrow_mut().push(evidence.clone());
+            });
+        let topic = MessagingSwitchboard::reconciliation_raw_order_query_topic();
+        msgbus::subscribe_any(topic.into(), handler.clone(), None);
+
+        if callback_failure {
+            crate::dispatch::tests::latch_callback_failure();
+        } else {
+            node.startup_reconciliation_failed = true;
+        }
+
+        if raw_event {
+            let canceled = OrderCanceledSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(instrument.id())
+                .client_order_id(id)
+                .account_id(account)
+                .venue_order_id(venue)
+                .ts_event(20.into())
+                .build();
+            node.process_exec_event(ExecutionEvent::Order(OrderEventAny::Canceled(canceled)));
+        } else {
+            let report = OrderStatusReport::new(
+                account,
+                instrument.id(),
+                Some(id),
+                venue,
+                Some(order.order_side()),
+                order.order_type(),
+                order.time_in_force(),
+                OrderStatus::Canceled,
+                order.quantity(),
+                Quantity::zero(order.quantity().precision),
+                1.into(),
+                20.into(),
+                30.into(),
+                None,
+            );
+            node.process_exec_event(ExecutionEvent::Report(ExecutionReport::Order(Box::new(
+                report,
+            ))));
+        }
+        assert_eq!(captured.borrow().len(), 1);
+        assert!(!node.kernel.cache.borrow().order(&id).unwrap().is_closed());
+        assert_eq!(node.exec_manager.unresolved_query_fill_ids(), vec![id]);
+        msgbus::unsubscribe_any(topic.into(), &handler);
+        node.dispose();
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_terminal_evidence_budget_exhaustion_remains_held() {
+        use nautilus_common::messages::execution::{
+            MAX_ORDER_FILL_OBSERVATIONS, OrderTerminalEvidence,
+        };
+        use nautilus_model::events::order::spec::OrderCanceledSpec;
+        let (mut node, order, instrument) =
+            venue_evidence_node(SubmissionRecoveryPolicy::RetainUnresolved);
+        let id = order.client_order_id();
+        let account = AccountId::from("TEST-001");
+        let venue = VenueOrderId::from("V-BUDGET");
+        node.process_exec_event(ExecutionEvent::Order(TestOrderEventStubs::accepted(
+            &order, account, venue,
+        )));
+        let mut canceled = OrderCanceledSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(instrument.id())
+            .client_order_id(id)
+            .account_id(account)
+            .venue_order_id(venue)
+            .build();
+
+        for index in 0..MAX_ORDER_FILL_OBSERVATIONS {
+            canceled.ts_event = (index as u64 + 1).into();
+            assert!(
+                node.exec_manager
+                    .admit_terminal_evidence(&OrderTerminalEvidence::Canceled(canceled))
+            );
+        }
+        canceled.ts_event = (MAX_ORDER_FILL_OBSERVATIONS as u64 + 1).into();
+        node.process_exec_event(ExecutionEvent::Order(OrderEventAny::Canceled(canceled)));
+        assert!(!node.kernel.cache.borrow().order(&id).unwrap().is_closed());
+        assert!(
+            node.kernel
+                .cache
+                .borrow()
+                .has_pending_order_executions(order.strategy_id(), Some(instrument.id()))
+        );
+        assert_eq!(node.exec_manager.unresolved_query_fill_ids(), vec![id]);
+        canceled.ts_event = 1.into();
+        assert!(
+            !node
+                .exec_manager
+                .admit_terminal_evidence(&OrderTerminalEvidence::Canceled(canceled))
+        );
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_terminal_status_delta_preserves_partial_fill_without_cumulative_claim() {
+        let (mut node, order, instrument) =
+            venue_evidence_node(SubmissionRecoveryPolicy::RetainUnresolved);
+        let id = order.client_order_id();
+        let account = AccountId::from("TEST-001");
+        let venue = VenueOrderId::from("V-DELTA");
+        node.process_exec_event(ExecutionEvent::Order(TestOrderEventStubs::accepted(
+            &order, account, venue,
+        )));
+        let accepted = node.kernel.cache.borrow().order_owned(&id).unwrap();
+        let filled = OrderFilledTestBuilder::new(&accepted, &instrument)
+            .last_qty(Quantity::from("0.400"))
+            .last_px(order.price().unwrap())
+            .commission(Money::from("0 USDT"))
+            .without_position_id()
+            .build();
+        node.process_exec_event(ExecutionEvent::Order(filled));
+        // Kraken futures cancel deltas omit side and use zero as an unavailable cumulative field.
+        let report = OrderStatusReport::new(
+            account,
+            instrument.id(),
+            Some(id),
+            venue,
+            None,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Canceled,
+            order.quantity(),
+            Quantity::zero(0),
+            100.into(),
+            100.into(),
+            100.into(),
+            None,
+        );
+        node.process_exec_event(ExecutionEvent::Report(ExecutionReport::Order(Box::new(
+            report,
+        ))));
+        let cached = node.kernel.cache.borrow().order_owned(&id).unwrap();
+        assert_eq!(cached.status(), OrderStatus::Canceled);
+        assert_eq!(cached.filled_qty(), Quantity::from("0.400"));
+        assert!(node.exec_manager.unresolved_query_fill_ids().is_empty());
+        assert!(
+            !node
+                .kernel
+                .cache
+                .borrow()
+                .has_pending_order_executions(order.strategy_id(), Some(instrument.id()))
+        );
     }
 
     fn venue_evidence_node(

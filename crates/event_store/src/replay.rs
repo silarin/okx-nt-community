@@ -32,7 +32,7 @@ use nautilus_common::{
         },
         execution::{
             IncompleteFillReport, MAX_INCOMPLETE_FILL_OBSERVATIONS, MAX_ORDER_FEE_OBSERVATIONS,
-            MAX_ORDER_FILL_OBSERVATIONS, OrderFeeEvidence, SubmitOrderList,
+            MAX_ORDER_FILL_OBSERVATIONS, OrderFeeEvidence, OrderTerminalEvidence, SubmitOrderList,
         },
     },
     msgbus::switchboard,
@@ -95,9 +95,10 @@ use crate::{
         PAYLOAD_TYPE_ORDER_MODIFY_REJECTED, PAYLOAD_TYPE_ORDER_PENDING_CANCEL,
         PAYLOAD_TYPE_ORDER_PENDING_UPDATE, PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
         PAYLOAD_TYPE_ORDER_REJECTED, PAYLOAD_TYPE_ORDER_RELEASED, PAYLOAD_TYPE_ORDER_SUBMITTED,
-        PAYLOAD_TYPE_ORDER_TRIGGERED, PAYLOAD_TYPE_ORDER_UPDATED, PAYLOAD_TYPE_POSITION_ADJUSTED,
-        PAYLOAD_TYPE_POSITION_CHANGED, PAYLOAD_TYPE_POSITION_CLOSED, PAYLOAD_TYPE_POSITION_OPENED,
-        PAYLOAD_TYPE_QUOTES_RESPONSE, PAYLOAD_TYPE_SUBMIT_ORDER_LIST, PAYLOAD_TYPE_TRADES_RESPONSE,
+        PAYLOAD_TYPE_ORDER_TERMINAL_EVIDENCE, PAYLOAD_TYPE_ORDER_TRIGGERED,
+        PAYLOAD_TYPE_ORDER_UPDATED, PAYLOAD_TYPE_POSITION_ADJUSTED, PAYLOAD_TYPE_POSITION_CHANGED,
+        PAYLOAD_TYPE_POSITION_CLOSED, PAYLOAD_TYPE_POSITION_OPENED, PAYLOAD_TYPE_QUOTES_RESPONSE,
+        PAYLOAD_TYPE_SUBMIT_ORDER_LIST, PAYLOAD_TYPE_TRADES_RESPONSE,
         extract_order_event_any_identity,
     },
     entry::EventStoreEntry,
@@ -196,6 +197,7 @@ pub(crate) const CACHE_REPLAY_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_INCOMPLETE_FILL,
     PAYLOAD_TYPE_ORDER_FEE_EVIDENCE,
     PAYLOAD_TYPE_ORDER_FILL_EVIDENCE,
+    PAYLOAD_TYPE_ORDER_TERMINAL_EVIDENCE,
     PAYLOAD_TYPE_ORDER_FILL_CONFLICT,
     PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
     PAYLOAD_TYPE_SUBMIT_ORDER_LIST,
@@ -703,6 +705,7 @@ struct CacheReplayContext {
     allow_deferred_flips: bool,
     pending_flips: Vec<PendingFlip>,
     query_fill_evidence: Vec<(u64, QueryFillEvidence)>,
+    terminal_order_evidence: Vec<(u64, OrderTerminalEvidence)>,
     standalone_fill_evidence: Vec<(u64, FillReport, bool)>,
     incomplete_fill_evidence: Vec<(u64, IncompleteFillReport)>,
     order_fee_evidence: Vec<(u64, OrderFeeEvidence)>,
@@ -990,6 +993,95 @@ impl CacheReplayContext {
                 entry,
                 format!("Execution observation budget exhausted for {}", key.2),
             ));
+        }
+        Ok(())
+    }
+
+    fn record_terminal_evidence(
+        &mut self,
+        entry: &EventStoreEntry,
+    ) -> Result<(), CacheReplayError> {
+        if entry.payload_type.as_str() != PAYLOAD_TYPE_ORDER_TERMINAL_EVIDENCE {
+            return Ok(());
+        }
+        let evidence = decode_payload::<OrderTerminalEvidence>(entry)?;
+
+        if self
+            .terminal_order_evidence
+            .iter()
+            .any(|(_, previous)| previous.same_observation(&evidence))
+        {
+            return Ok(());
+        }
+        let count = self
+            .terminal_order_evidence
+            .iter()
+            .filter(|(_, previous)| {
+                previous.client_order_id() == evidence.client_order_id()
+                    && previous.venue_order_id() == evidence.venue_order_id()
+            })
+            .count();
+        if count >= MAX_ORDER_FILL_OBSERVATIONS {
+            return Err(apply_error(entry, "Terminal observation budget exhausted"));
+        }
+        self.terminal_order_evidence.push((entry.seq, evidence));
+        Ok(())
+    }
+
+    fn ensure_terminals_complete(&self, cache: &Cache) -> Result<(), CacheReplayError> {
+        for (seq, evidence) in &self.terminal_order_evidence {
+            let order = evidence
+                .client_order_id()
+                .and_then(|id| cache.order(&id))
+                .or_else(|| {
+                    evidence
+                        .venue_order_id()
+                        .and_then(|venue| cache.client_order_id(&venue))
+                        .and_then(|id| cache.order(id))
+                });
+            let complete = order.is_some_and(|order| {
+                evidence.matches_order(&order)
+                    && order.is_closed()
+                    && !evidence.conflicts_with_order(&order)
+                    && match evidence {
+                        OrderTerminalEvidence::Report(report) => order.filled_qty()
+                            >= report.filled_qty
+                            && (report.filled_qty.is_zero()
+                                || self.order_recovered_after(*seq, &order, &|projection| {
+                                    nautilus_execution::reconciliation::order_fill_evidence_matches(
+                                        projection,
+                                        report,
+                                        &[],
+                                    )
+                                })),
+                        _ => true,
+                    }
+            }) && !evidence.conflicts_with_fills(
+                self.standalone_fill_evidence
+                    .iter()
+                    .map(|(_, fill, _)| fill)
+                    .chain(
+                        self.query_fill_evidence
+                            .iter()
+                            .flat_map(|(_, query)| &query.fill_reports),
+                    ),
+            ) && !self
+                .query_fill_evidence
+                .iter()
+                .any(|(_, query)| evidence.conflicts_with_report(&query.order_report))
+                && !self.terminal_order_evidence.iter().any(|(_, other)| {
+                    matches!(other,
+                    OrderTerminalEvidence::Report(report) if evidence.conflicts_with_report(report))
+                });
+            Self::require_complete(
+                *seq,
+                PAYLOAD_TYPE_ORDER_TERMINAL_EVIDENCE,
+                format!(
+                    "Unresolved persisted terminal evidence for {:?}",
+                    evidence.client_order_id()
+                ),
+                complete,
+            )?;
         }
         Ok(())
     }
@@ -1360,6 +1452,7 @@ impl CacheReplayContext {
                 complete,
             )?;
         }
+        self.ensure_terminals_complete(cache)?;
         Ok(())
     }
 }
@@ -1427,6 +1520,7 @@ where
         context.record_order_fee_evidence(&entry)?;
         context.record_incomplete_fill_evidence(&entry)?;
         context.record_query_fill_evidence(&entry)?;
+        context.record_terminal_evidence(&entry)?;
         context.record_order_fill_projection(&entry)?;
     }
     restore_snapshot(cache, plan.anchor.as_ref())?;
@@ -1959,6 +2053,7 @@ fn apply_cache_replay_entry_with_context(
     context.record_order_fee_evidence(entry)?;
     context.record_incomplete_fill_evidence(entry)?;
     context.record_query_fill_evidence(entry)?;
+    context.record_terminal_evidence(entry)?;
     context.record_order_fill_projection(entry)?;
 
     if COMMITTED_ORDER_PAYLOAD_TYPES.contains(&entry.payload_type.as_str()) {
@@ -3195,6 +3290,13 @@ mod tests {
     }
 
     const CACHE_MUTATION_COVERAGE: &[CacheMutationCoverage] = &[
+        cache_mutation(
+            // Live derived hold: event-store restore checks its evidence and refuses unresolved
+            // runs; cache-database-only bootstrap cannot reconstruct the manager obligations.
+            "set_order_execution_pending",
+            CacheMutationRecoveryClass::MissingLiveRecovery,
+            &[],
+        ),
         cache_mutation(
             // Startup configuration is reapplied during strategy registration, but runtime claim
             // changes are not captured or persisted for recovery.
@@ -5842,6 +5944,95 @@ mod tests {
             } else {
                 "Unresolved persisted incomplete fill recovery"
             }));
+        } else {
+            result.unwrap();
+        }
+    }
+
+    #[rstest]
+    fn terminal_evidence_crash_prefix_requires_accounted_quantity(
+        #[values(false, true)] snapshot_anchor: bool,
+        #[values(false, true)] missing_fills: bool,
+    ) {
+        use nautilus_model::events::order::spec::OrderCanceledSpec;
+
+        use crate::capture::builtins::encode_order_terminal_evidence;
+        let initialized = OrderInitializedSpec::builder().build();
+        let id = initialized.client_order_id;
+        let submitted = OrderSubmittedSpec::builder()
+            .client_order_id(id)
+            .instrument_id(initialized.instrument_id)
+            .build();
+        let accepted = OrderAcceptedSpec::builder()
+            .client_order_id(id)
+            .instrument_id(initialized.instrument_id)
+            .account_id(submitted.account_id)
+            .build();
+        let canceled = OrderCanceledSpec::builder()
+            .client_order_id(id)
+            .instrument_id(initialized.instrument_id)
+            .account_id(submitted.account_id)
+            .venue_order_id(accepted.venue_order_id)
+            .ts_event(2.into())
+            .build();
+        let report = OrderStatusReport::new(
+            submitted.account_id,
+            initialized.instrument_id,
+            Some(id),
+            accepted.venue_order_id,
+            Some(initialized.order_side),
+            initialized.order_type,
+            initialized.time_in_force,
+            OrderStatus::Canceled,
+            initialized.quantity,
+            if missing_fills {
+                initialized.quantity
+            } else {
+                Quantity::zero(initialized.quantity.precision)
+            },
+            1.into(),
+            3.into(),
+            4.into(),
+            None,
+        );
+        let evidence = OrderTerminalEvidence::Report(Box::new(report));
+        let encoded = encode_order_terminal_evidence(&evidence).unwrap();
+        let order = OrderAny::from_events(vec![
+            OrderEventAny::Initialized(initialized),
+            OrderEventAny::Submitted(submitted),
+            OrderEventAny::Accepted(accepted),
+            OrderEventAny::Canceled(canceled),
+        ])
+        .unwrap();
+        let mut backend = MemoryBackend::new();
+        backend.open_run(manifest("terminal-prefix")).unwrap();
+        backend
+            .append_batch(&[append_payload(
+                1,
+                PAYLOAD_TYPE_ORDER_TERMINAL_EVIDENCE,
+                encoded.payload,
+            )])
+            .unwrap();
+
+        if snapshot_anchor {
+            backend
+                .record_snapshot_anchor(SnapshotAnchor::new(1, "cache://terminal", "hash"))
+                .unwrap();
+        }
+        let reader = EventStoreReader::new(backend);
+        let mut cache = Cache::default();
+        let result = restore_cache_snapshot_and_replay_tail(&mut cache, &reader, |cache, _| {
+            cache.add_order(order.clone(), None, None, false).unwrap();
+            Ok(())
+        });
+
+        if missing_fills {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Unresolved persisted terminal evidence")
+            );
         } else {
             result.unwrap();
         }

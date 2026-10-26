@@ -1749,6 +1749,27 @@ fn dispatch_order_messages(
                         ParsedOrderEvent::StatusOnly(report) if report.filled_qty.is_positive() => {
                             ParsedOrderEvent::Skipped
                         }
+                        ParsedOrderEvent::Canceled(_) | ParsedOrderEvent::Expired(_) => {
+                            // A terminal stream status cannot release the order before its
+                            // cumulative executions have been committed by native recovery.
+                            match parse_order_status_report(msg, instrument, account_id, ts_init) {
+                                Ok(_) => ParsedOrderEvent::Skipped,
+                                Err(e) => {
+                                    log::error!(
+                                        "Cannot admit terminal status for {client_order_id}: {e}"
+                                    );
+                                    dispatch_unparsed_order_fill(
+                                        msg,
+                                        Some(client_order_id),
+                                        instrument,
+                                        emitter,
+                                        state,
+                                        ts_init,
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
                         event => event,
                     };
                     let fill_evidence = match &event {
@@ -2243,7 +2264,10 @@ fn dispatch_parsed_order_event(
             emitter.send_order_status_report(*report);
         }
         ParsedOrderEvent::Skipped => {
-            is_terminal = venue_status == OKXOrderStatus::Filled;
+            is_terminal = matches!(
+                venue_status,
+                OKXOrderStatus::Filled | OKXOrderStatus::Canceled | OKXOrderStatus::MmpCanceled
+            );
         }
     }
 
@@ -2603,7 +2627,13 @@ fn dispatch_unparsed_order_fill(
         account_id: emitter.account_id(),
         instrument_id: instrument.id(),
         venue_order_id: VenueOrderId::new(msg.ord_id),
-        client_order_id: client_order_id.or_else(|| parse_client_order_id(msg.cl_ord_id.as_str())),
+        client_order_id: client_order_id
+            .or_else(|| {
+                msg.algo_cl_ord_id
+                    .as_deref()
+                    .and_then(parse_client_order_id)
+            })
+            .or_else(|| parse_client_order_id(msg.cl_ord_id.as_str())),
         trade_id: parse_order_trade_id(&msg.trade_id),
         trade_id_placeholder: is_order_trade_id_placeholder(&msg.trade_id, msg.category),
         order_side: msg.side.into(),
@@ -2636,7 +2666,10 @@ fn dispatch_order_fill_obligation(
     }
 
     match parse_order_status_report(msg, instrument, emitter.account_id(), ts_init) {
-        Ok(mut report) if report.filled_qty.is_positive() => {
+        Ok(mut report)
+            if report.filled_qty.is_positive()
+                || (client_order_id.is_some() && report.order_status.is_closed()) =>
+        {
             report.client_order_id = client_order_id.or(report.client_order_id);
             // Publish cumulative evidence first so the native manager can check the
             // committed cache before admitting the accompanying individual execution.
@@ -3302,6 +3335,82 @@ mod tests {
                 assert_eq!(&fills[0], fill.as_ref());
             }
             other => panic!("Expected native execution before evidence: {other:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case::zero("0", false)]
+    #[case::partial("0.4", false)]
+    #[case::malformed("invalid", true)]
+    #[case::unrepresentable("0.000000001", true)]
+    #[case::missing("", true)]
+    fn terminal_stream_waits_for_cumulative_executions(
+        #[case] cumulative: &str,
+        #[case] incomplete: bool,
+        #[values(false, true)] expired: bool,
+    ) {
+        let mut msg = load_regular_order_messages("ws_orders.json").remove(0);
+        msg.inst_id = Ustr::from("BTC-USDT-SWAP");
+        msg.inst_type = OKXInstrumentType::Swap;
+        msg.ord_type = OKXOrderType::Limit;
+        msg.side = OKXSide::Buy;
+        msg.state = OKXOrderStatus::Canceled;
+        msg.sz = "1".to_string();
+        msg.acc_fill_sz = Some(cumulative.to_string());
+        msg.fill_sz = "0".to_string();
+        msg.trade_id.clear();
+        msg.fill_time = 0;
+        msg.fill_px = "0".to_string();
+        msg.avg_px = "100".to_string();
+        msg.px = "100".to_string();
+        msg.fee = Some("0".to_string());
+        msg.fee_ccy = Ustr::from("USDT");
+        msg.cancel_source = Some(if expired { "5" } else { "1" }.to_string());
+        let client_order_id = ClientOrderId::from(msg.cl_ord_id.as_str());
+        let state = WsDispatchState::default();
+        state.order_identities.insert(
+            client_order_id,
+            OrderIdentity {
+                client_order_id,
+                strategy_id: StrategyId::from("STRATEGY-001"),
+                instrument_id: InstrumentId::from("BTC-USDT-SWAP.OKX"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+            },
+        );
+        let (emitter, mut receiver) = test_execution_emitter();
+        dispatch_test_message(
+            OKXWsMessage::Orders(vec![msg]),
+            &emitter,
+            &state,
+            &test_algo_instruments(),
+        );
+        let events = drain_execution_events(&mut receiver);
+
+        assert!(!events.iter().any(|e| matches!(e, ExecutionEvent::Order(_))));
+
+        if incomplete {
+            assert!(events.iter().any(|e| matches!(
+                e,
+                ExecutionEvent::Report(CommonExecutionReport::IncompleteFill(_))
+            )));
+            assert!(!state.contains_terminal(&client_order_id));
+        } else {
+            let ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills)) =
+                &events[0]
+            else {
+                panic!("Expected guarded terminal projection: {events:?}");
+            };
+            assert_eq!(report.filled_qty, Quantity::from(cumulative));
+            assert_eq!(
+                report.order_status,
+                if expired {
+                    OrderStatus::Expired
+                } else {
+                    OrderStatus::Canceled
+                }
+            );
+            assert!(fills.is_empty());
         }
     }
 
@@ -4874,10 +4983,11 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0],
-            ExecutionEvent::Order(OrderEventAny::Canceled(canceled))
-                if canceled.client_order_id == client_order_id
-                    && canceled.venue_order_id
-                        == Some(VenueOrderId::new(child_venue_order_id.as_str()))
+            ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(canceled, fills))
+                if canceled.client_order_id == Some(client_order_id)
+                    && canceled.venue_order_id == VenueOrderId::new(child_venue_order_id.as_str())
+                    && canceled.order_status == OrderStatus::Canceled
+                    && canceled.filled_qty.is_zero() && fills.is_empty()
         ));
         assert!(state.contains_terminal(&client_order_id));
 

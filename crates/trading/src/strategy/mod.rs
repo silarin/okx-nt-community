@@ -1822,6 +1822,45 @@ pub trait Strategy: DataActor {
                 log::error!("Error canceling orders for {instrument_id}: {e}");
             }
 
+            // Cancellation is asynchronous, so wait for terminal evidence before closing
+            let has_unresolved_orders = {
+                let core = StrategyNative::strategy_core(self);
+                let cache = core.cache_ref();
+                cache.has_pending_order_executions(strategy_id, Some(instrument_id))
+                    || cache.has_orders_open(
+                        None,
+                        Some(&instrument_id),
+                        Some(&strategy_id),
+                        None,
+                        None,
+                    )
+                    || cache.has_orders_inflight(
+                        None,
+                        Some(&instrument_id),
+                        Some(&strategy_id),
+                        None,
+                        None,
+                    )
+                    || cache.has_orders_emulated(
+                        None,
+                        Some(&instrument_id),
+                        Some(&strategy_id),
+                        None,
+                        None,
+                    )
+                    || cache.has_orders_active_local(
+                        None,
+                        Some(&instrument_id),
+                        Some(&strategy_id),
+                        None,
+                        None,
+                    )
+            };
+
+            if has_unresolved_orders {
+                continue;
+            }
+
             if let Err(e) = self.close_all_positions(
                 instrument_id,
                 None,
@@ -1934,7 +1973,12 @@ pub trait Strategy: DataActor {
         let has_local_orders =
             cache.has_orders_active_local(None, None, Some(&strategy_id), None, None);
 
-        if has_open_orders || has_inflight_orders || has_emulated_orders || has_local_orders {
+        if has_open_orders
+            || has_inflight_orders
+            || has_emulated_orders
+            || has_local_orders
+            || cache.has_pending_order_executions(strategy_id, None)
+        {
             return;
         }
 
@@ -2589,6 +2633,7 @@ mod tests {
     use nautilus_core::{DurationNanos, UnixNanos};
     use nautilus_execution::{engine::ExecutionEngine, order_emulator::emulator::OrderEmulator};
     use nautilus_model::{
+        accounts::CashAccount,
         data::QuoteTick,
         enums::{
             ContingencyType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
@@ -7096,6 +7141,391 @@ mod tests {
             .unwrap();
         strategy.check_market_exit(event);
         assert!(!strategy.is_exiting());
+    }
+
+    #[rstest]
+    #[case::filled("filled", "1.000000")]
+    #[case::partial_then_canceled("partial", "0.400000")]
+    #[case::canceled("canceled", "0.000000")]
+    #[case::cancel_rejected_then_filled("rejected", "1.000000")]
+    fn test_market_exit_waits_for_pending_close(
+        #[case] outcome: &str,
+        #[case] filled_qty: &str,
+        #[values(false, true)] accepted: bool,
+    ) {
+        let mut strategy = create_test_strategy();
+        strategy.core.config.manage_stop = true;
+        strategy.core.config.market_exit_reduce_only = false;
+        let clock = register_gtd_strategy(&mut strategy);
+        start_strategy(&mut strategy);
+        let cache = strategy.core.cache_rc();
+        let instrument = InstrumentAny::CurrencyPair(currency_pair_btcusdt());
+        let strategy_id = strategy.core.strategy_id().unwrap();
+        let account_id = AccountId::from("SIM-001");
+        cache
+            .borrow_mut()
+            .add_account(CashAccount::default().into())
+            .unwrap();
+        let position_id = PositionId::from("BTCUSDT.BINANCE-TEST-001");
+        let position = Position::new(
+            &instrument,
+            OrderFilledSpec::builder()
+                .strategy_id(strategy_id)
+                .instrument_id(instrument.id())
+                .client_order_id(ClientOrderId::from("O-ENTRY"))
+                .account_id(account_id)
+                .position_id(position_id)
+                .order_side(OrderSide::Buy)
+                .last_qty(Quantity::from("1.000000"))
+                .last_px(Price::from("50000.00"))
+                .currency(instrument.quote_currency())
+                .commission(Money::zero(instrument.quote_currency()))
+                .build(),
+        );
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_position(&position, OmsType::Netting)
+            .unwrap();
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(TraderId::from("TRADER-001"))
+            .strategy_id(strategy_id)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-ORDINARY-CLOSE"))
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("1.000000"))
+            .price(Price::from("50000.00"))
+            .time_in_force(TimeInForce::Ioc)
+            .build();
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), Some(position_id), None, false)
+            .unwrap();
+        let mut engine = ExecutionEngine::new(clock, cache.clone(), None);
+        engine.register_oms_type(strategy_id, OmsType::Netting);
+        engine.process(&TestOrderEventStubs::submitted(&order, account_id));
+        if accepted {
+            engine.process(&TestOrderEventStubs::accepted(
+                &order,
+                account_id,
+                VenueOrderId::from("V-CLOSE"),
+            ));
+        }
+        let (risk_handler, risk_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(None);
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            risk_handler,
+        );
+        let (exec_handler, exec_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(None);
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_queue_execute(),
+            exec_handler,
+        );
+
+        assert!(!Strategy::stop(&mut strategy));
+        assert!(exec_messages.get_messages().iter().any(|c| matches!(c, TradingCommand::CancelOrder(c) if c.client_order_id == order.client_order_id())));
+        assert!(
+            risk_messages.get_messages().is_empty(),
+            "managed exit must not overlap the ordinary close"
+        );
+        let timer_name = strategy.core.market_exit_timer_name;
+        let mut tick = 0_u64;
+        let mut next_event = || {
+            tick += 1;
+            TimeEvent::new(timer_name, UUID4::new(), tick.into(), tick.into())
+        };
+        route_time_event(&mut strategy, &next_event());
+        assert!(strategy.is_exiting());
+        assert!(risk_messages.get_messages().is_empty());
+
+        if outcome == "rejected" {
+            engine.process(&OrderEventAny::CancelRejected(
+                OrderCancelRejectedSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(strategy_id)
+                    .instrument_id(instrument.id())
+                    .client_order_id(order.client_order_id())
+                    .account_id(account_id)
+                    .reason(Ustr::from("Cancellation unresolved"))
+                    .build(),
+            ));
+            route_time_event(&mut strategy, &next_event());
+            assert!(risk_messages.get_messages().is_empty());
+            assert!(strategy.is_exiting());
+        }
+
+        if !accepted {
+            engine.process(&TestOrderEventStubs::accepted(
+                &order,
+                account_id,
+                VenueOrderId::from("V-CLOSE"),
+            ));
+        }
+
+        if outcome != "canceled" {
+            engine.process(&TestOrderEventStubs::filled(
+                &order,
+                &instrument,
+                Some(TradeId::from("T-CLOSE")),
+                Some(position_id),
+                Some(Price::from("50000.00")),
+                Some(Quantity::from(filled_qty)),
+                None,
+                Some(Money::zero(instrument.quote_currency())),
+                Some(2.into()),
+                Some(account_id),
+            ));
+        }
+
+        if outcome == "partial" {
+            route_time_event(&mut strategy, &next_event());
+            assert!(
+                risk_messages.get_messages().is_empty(),
+                "partial fill does not resolve the outstanding remainder"
+            );
+        }
+
+        if matches!(outcome, "canceled" | "partial") {
+            engine.process(&TestOrderEventStubs::canceled(
+                &order,
+                account_id,
+                Some(VenueOrderId::from("V-CLOSE")),
+            ));
+        }
+        route_time_event(&mut strategy, &next_event());
+
+        let commands = risk_messages.get_messages();
+        if matches!(outcome, "filled" | "rejected") {
+            assert!(commands.is_empty());
+            assert!(cache.borrow().position(&position_id).unwrap().is_closed());
+            assert!(!strategy.is_exiting());
+            assert_eq!(strategy.state(), ComponentState::Stopped);
+        } else {
+            assert_eq!(commands.len(), 1);
+            let TradingCommand::SubmitOrder(command) = &commands[0] else {
+                panic!("expected managed close");
+            };
+            assert_eq!(command.position_id, Some(position_id));
+            assert_eq!(command.order_init.order_side, OrderSide::Sell);
+            assert_eq!(
+                command.order_init.quantity,
+                Quantity::from(if outcome == "partial" {
+                    "0.600000"
+                } else {
+                    "1.000000"
+                })
+            );
+            assert!(strategy.is_exiting());
+            route_time_event(&mut strategy, &next_event());
+            assert_eq!(
+                risk_messages.get_messages().len(),
+                1,
+                "pending managed close must not be duplicated"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::initialized(OrderStatus::Initialized, false, false, false)]
+    #[case::emulated(OrderStatus::Emulated, false, false, false)]
+    #[case::released(OrderStatus::Released, false, false, false)]
+    #[case::submitted(OrderStatus::Submitted, false, false, false)]
+    #[case::sibling_strategy(OrderStatus::Accepted, true, false, true)]
+    #[case::other_instrument(OrderStatus::Submitted, false, true, true)]
+    #[case::terminal(OrderStatus::Canceled, false, false, true)]
+    fn test_market_exit_initial_close_respects_order_scope(
+        #[case] status: OrderStatus,
+        #[case] sibling: bool,
+        #[case] other_instrument: bool,
+        #[case] closes_immediately: bool,
+        #[values(false, true)] execution_pending: bool,
+    ) {
+        let mut strategy = create_test_strategy();
+        register_gtd_strategy(&mut strategy);
+        start_strategy(&mut strategy);
+        let cache = strategy.core.cache_rc();
+        let instrument = InstrumentAny::CurrencyPair(currency_pair_btcusdt());
+        let strategy_id = strategy.core.strategy_id().unwrap();
+        let position_id = PositionId::from("P-EXIT-SCOPE");
+        let position = Position::new(
+            &instrument,
+            OrderFilledSpec::builder()
+                .strategy_id(strategy_id)
+                .instrument_id(instrument.id())
+                .position_id(position_id)
+                .last_qty(Quantity::from("1.000000"))
+                .last_px(Price::from("50000.00"))
+                .currency(instrument.quote_currency())
+                .commission(Money::zero(instrument.quote_currency()))
+                .build(),
+        );
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_position(&position, OmsType::Netting)
+            .unwrap();
+        let order = OrderTestBuilder::new(OrderType::StopMarket)
+            .trader_id(TraderId::from("TRADER-001"))
+            .strategy_id(if sibling {
+                StrategyId::from("SIBLING-001")
+            } else {
+                strategy_id
+            })
+            .instrument_id(if other_instrument {
+                InstrumentId::from("ETHUSDT.BINANCE")
+            } else {
+                instrument.id()
+            })
+            .client_order_id(ClientOrderId::from("O-EXIT-SCOPE"))
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("1.000000"))
+            .trigger_price(Price::from("49000.00"))
+            .build();
+        add_order_to_cache(&strategy, &order);
+        let account_id = AccountId::from("ACC-001");
+
+        match status {
+            OrderStatus::Emulated | OrderStatus::Released => {
+                cache
+                    .borrow_mut()
+                    .update_order(&OrderEventAny::Emulated(
+                        OrderEmulatedSpec::builder()
+                            .trader_id(order.trader_id())
+                            .strategy_id(order.strategy_id())
+                            .instrument_id(order.instrument_id())
+                            .client_order_id(order.client_order_id())
+                            .build(),
+                    ))
+                    .unwrap();
+
+                if status == OrderStatus::Released {
+                    cache
+                        .borrow_mut()
+                        .update_order(&OrderEventAny::Released(OrderReleased::new(
+                            order.trader_id(),
+                            order.strategy_id(),
+                            order.instrument_id(),
+                            order.client_order_id(),
+                            Price::from("49000.00"),
+                            UUID4::new(),
+                            0.into(),
+                            0.into(),
+                        )))
+                        .unwrap();
+                }
+            }
+            OrderStatus::Submitted | OrderStatus::Accepted | OrderStatus::Canceled => {
+                cache
+                    .borrow_mut()
+                    .update_order(&TestOrderEventStubs::submitted(&order, account_id))
+                    .unwrap();
+
+                if status != OrderStatus::Submitted {
+                    cache
+                        .borrow_mut()
+                        .update_order(&TestOrderEventStubs::accepted(
+                            &order,
+                            account_id,
+                            VenueOrderId::from("V-EXIT-SCOPE"),
+                        ))
+                        .unwrap();
+                }
+
+                if status == OrderStatus::Canceled {
+                    cache
+                        .borrow_mut()
+                        .update_order(&TestOrderEventStubs::canceled(
+                            &order,
+                            account_id,
+                            Some(VenueOrderId::from("V-EXIT-SCOPE")),
+                        ))
+                        .unwrap();
+                }
+            }
+            OrderStatus::Initialized => {}
+            _ => unreachable!(),
+        }
+        let (risk_handler, risk_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(None);
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_queue_execute(),
+            risk_handler,
+        );
+        let (exec_handler, exec_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(None);
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_queue_execute(),
+            exec_handler,
+        );
+        let (emulator_handler, _emulator_messages): (
+            _,
+            TypedIntoMessageSavingHandler<TradingCommand>,
+        ) = get_typed_into_message_saving_handler(None);
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::order_emulator_execute(),
+            emulator_handler,
+        );
+
+        if execution_pending {
+            cache.borrow_mut().set_order_execution_pending(
+                order.client_order_id(),
+                order.instrument_id(),
+                Some(order.strategy_id()),
+                true,
+            );
+        }
+        strategy.market_exit().unwrap();
+
+        let commands = risk_messages.get_messages();
+        let held = execution_pending && !sibling && !other_instrument;
+        assert_eq!(commands.len(), usize::from(closes_immediately && !held));
+        if held && closes_immediately {
+            let timer_name = strategy.core.market_exit_timer_name;
+            route_time_event(
+                &mut strategy,
+                &TimeEvent::new(timer_name, UUID4::new(), 1.into(), 1.into()),
+            );
+            assert!(risk_messages.get_messages().is_empty());
+            assert!(strategy.is_exiting());
+            cache.borrow_mut().set_order_execution_pending(
+                order.client_order_id(),
+                order.instrument_id(),
+                Some(order.strategy_id()),
+                false,
+            );
+            route_time_event(
+                &mut strategy,
+                &TimeEvent::new(timer_name, UUID4::new(), 2.into(), 2.into()),
+            );
+            assert_eq!(risk_messages.get_messages().len(), 1);
+        }
+
+        if let Some(TradingCommand::SubmitOrder(command)) = commands.first() {
+            assert_eq!(command.instrument_id, instrument.id());
+            assert_eq!(command.strategy_id, strategy_id);
+            assert_eq!(command.position_id, Some(position_id));
+            assert_eq!(command.order_init.quantity, Quantity::from("1.000000"));
+        }
+
+        if sibling {
+            assert!(exec_messages.get_messages().is_empty());
+            assert_eq!(
+                cache
+                    .borrow()
+                    .order(&order.client_order_id())
+                    .unwrap()
+                    .status(),
+                OrderStatus::Accepted
+            );
+        }
     }
 
     #[rstest]
