@@ -60,11 +60,11 @@ use crate::{
         },
         models::OKXInstrument,
         parse::{
-            determine_order_type_with_alt, is_market_price, okx_channel_to_bar_spec,
-            okx_status_to_market_action, parse_cumulative_fill_quantity, parse_fee,
-            parse_fee_currency, parse_funding_rate_msg, parse_instrument_any, parse_instrument_id,
-            parse_message_vec, parse_millisecond_timestamp, parse_order_trade_id,
-            parse_parent_client_order_id, parse_price, parse_quantity,
+            determine_order_type_with_alt, is_expiration_cancel, is_market_price,
+            okx_channel_to_bar_spec, okx_status_to_market_action, parse_cumulative_fill_quantity,
+            parse_fee, parse_fee_currency, parse_funding_rate_msg, parse_instrument_any,
+            parse_instrument_id, parse_message_vec, parse_millisecond_timestamp,
+            parse_order_trade_id, parse_parent_client_order_id, parse_price, parse_quantity,
             parse_spread_order_status_report as parse_common_spread_order_status_report,
             venue_position_id,
         },
@@ -474,32 +474,16 @@ pub fn parse_spread_order_event(
     }
 }
 
-/// Case-insensitive substring check.
-#[inline]
-fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
-}
-
 /// Determines if a Canceled order is actually an Expired order based on cancel reason.
 ///
 /// OKX's numeric `cancelSource` enumeration is not fully documented, so
 /// unmapped codes log once via [`log_unknown_cancel_source`] to surface
 /// candidates for the mapping.
 fn is_order_expired_by_reason(msg: &OKXOrderMsg) -> bool {
-    if let Some(ref reason) = msg.cancel_source_reason
-        && (contains_ignore_ascii_case(reason, "expir")
-            || contains_ignore_ascii_case(reason, "gtd")
-            || contains_ignore_ascii_case(reason, "timeout"))
-    {
-        return true;
-    }
-
-    if let Some(ref source) = msg.cancel_source
-        && (source == "5" || source == "time_expired" || source == "gtd_expired")
-    {
+    if is_expiration_cancel(
+        msg.cancel_source.as_deref().unwrap_or_default(),
+        msg.cancel_source_reason.as_deref().unwrap_or_default(),
+    ) {
         return true;
     }
 
@@ -1877,10 +1861,17 @@ pub fn parse_order_status_report(
             .try_into()
             .map_err(|e| anyhow::anyhow!("Unsupported OKX order type: {e}"))?,
     };
-    let order_status: OrderStatus = msg
-        .state
-        .try_into()
-        .map_err(|e| anyhow::anyhow!("Unsupported OKX order status: {e}"))?;
+    let order_status = if matches!(
+        msg.state,
+        OKXOrderStatus::Canceled | OKXOrderStatus::MmpCanceled
+    ) && is_order_expired_by_reason(msg)
+    {
+        OrderStatus::Expired
+    } else {
+        msg.state
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("Unsupported OKX order status: {e}"))?
+    };
 
     let time_in_force = match okx_order_type {
         OKXOrderType::Fok | OKXOrderType::OpFok => TimeInForce::Fok,

@@ -14174,3 +14174,23 @@ fn test_cache_api_infallible_borrow_conflict_panics_with_context() {
     let _guard = cell.borrow_mut();
     let _ = api.order(&ClientOrderId::from("BORROW-ORDER"));
 }
+
+#[rstest]
+fn test_pending_order_execution_scope_and_reset() {
+    let mut cache = Cache::default();
+    let instrument = InstrumentId::from("ETHUSDT.BINANCE");
+    let other_instrument = InstrumentId::from("BTCUSDT.BINANCE");
+    let owner = StrategyId::from("OWNER-001");
+    let other = StrategyId::from("OTHER-001");
+    let id = ClientOrderId::from("O-HELD");
+    cache.set_order_execution_pending(id, instrument, Some(owner), true);
+    assert!(cache.has_pending_order_executions(owner, Some(instrument)));
+    assert!(cache.has_pending_order_executions(owner, None));
+    assert!(!cache.has_pending_order_executions(other, Some(instrument)));
+    assert!(!cache.has_pending_order_executions(owner, Some(other_instrument)));
+    cache.set_order_execution_pending(id, instrument, None, true);
+    assert!(cache.has_pending_order_executions(owner, Some(instrument)));
+    assert!(!cache.has_pending_order_executions(owner, None));
+    cache.reset();
+    assert!(!cache.has_pending_order_executions(owner, Some(instrument)));
+}

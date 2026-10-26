@@ -21,6 +21,7 @@ pub mod modify;
 pub mod query;
 pub mod report;
 pub mod submit;
+pub mod terminal;
 
 use std::fmt::Display;
 
@@ -50,6 +51,7 @@ pub use self::{
         GeneratePositionStatusReports, GeneratePositionStatusReportsBuilder,
     },
     submit::{SubmitOrder, SubmitOrderList},
+    terminal::OrderTerminalEvidence,
 };
 
 /// Parameter indicating that a conditional order should close the whole position at trigger time.

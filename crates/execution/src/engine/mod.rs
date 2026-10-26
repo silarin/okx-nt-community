@@ -1131,12 +1131,12 @@ impl ExecutionEngine {
                 self.reconcile_order_with_fills(order_report, fills);
             }
             ExecutionReport::OrderQueryWithFills(order_report, fills) => {
-                self.handle_order_with_fills(order_report, fills, false);
+                self.handle_order_with_fills(order_report, fills, false, false);
             }
             ExecutionReport::OrderFillEvidence(report, _) => {
                 // Companion trades constrain recovery but never apply fills through this
                 // route. Native status projection requires already committed quantity.
-                self.handle_order_with_fills(report, &[], false);
+                self.handle_order_with_fills(report, &[], false, false);
             }
             ExecutionReport::OrderFillConflict(report) => {
                 msgbus::publish_any(
@@ -1176,7 +1176,7 @@ impl ExecutionEngine {
             report.instrument_id,
             report.client_order_id,
         ) {
-            self.handle_order_with_fills(report, &[], false);
+            self.handle_order_with_fills(report, &[], false, false);
             return;
         }
 
@@ -1799,7 +1799,17 @@ impl ExecutionEngine {
     /// Adapters use this to emit ADL / liquidation / settlement events without
     /// losing real fill metadata.
     pub fn reconcile_order_with_fills(&mut self, report: &OrderStatusReport, fills: &[FillReport]) {
-        self.handle_order_with_fills(report, fills, true);
+        self.handle_order_with_fills(report, fills, true, false);
+    }
+
+    /// Applies authoritative query executions while retaining terminal admission in the host.
+    /// The original snapshot still validates identity, history and accounting boundaries.
+    pub fn reconcile_order_query_executions(
+        &mut self,
+        report: &OrderStatusReport,
+        fills: &[FillReport],
+    ) {
+        self.handle_order_with_fills(report, fills, false, true);
     }
 
     fn handle_order_with_fills(
@@ -1807,6 +1817,7 @@ impl ExecutionEngine {
         report: &OrderStatusReport,
         fills: &[FillReport],
         is_snapshot: bool,
+        defer_terminal: bool,
     ) {
         let is_snapshot = is_snapshot
             && !self.requires_order_query_fills(
@@ -1835,6 +1846,10 @@ impl ExecutionEngine {
             });
         let instrument = cache.instrument(&report.instrument_id).cloned();
         drop(cache);
+
+        if defer_terminal && fills.is_empty() && order.is_some() {
+            return;
+        }
 
         if !is_snapshot
             && fills.is_empty()
@@ -2012,6 +2027,10 @@ impl ExecutionEngine {
             {
                 order = refreshed;
             }
+        }
+
+        if defer_terminal {
+            return;
         }
 
         let ts_now = self.clock.borrow().timestamp_ns();

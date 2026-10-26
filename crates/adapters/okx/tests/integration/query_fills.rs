@@ -48,7 +48,7 @@ use nautilus_common::{
 };
 use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_event_store::{
-    EventStoreConfig, EventStoreLifecycle, RedbBackend, RetentionMode,
+    EventStore, EventStoreConfig, EventStoreLifecycle, RedbBackend, RetentionMode, ScanDirection,
     restore_cache_from_sealed_run,
 };
 use nautilus_live::{
@@ -62,7 +62,7 @@ use nautilus_model::{
     accounts::{AccountAny, CashAccount},
     data::QuoteTick,
     enums::{AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
-    events::{OrderEventAny, OrderFilled},
+    events::{OrderEventAny, OrderFilled, order::spec::OrderFilledSpec},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId,
         TraderId, Venue as NativeVenue, VenueOrderId,
@@ -171,12 +171,15 @@ struct Venue {
     submissions: tokio::sync::Mutex<Vec<Value>>,
     omit_submission_ack: std::sync::atomic::AtomicBool,
     queries: tokio::sync::Mutex<Vec<HashMap<String, String>>>,
+    instruments: tokio::sync::Mutex<Value>,
     balance: tokio::sync::Mutex<Value>,
     report: tokio::sync::Mutex<Value>,
+    order_details: tokio::sync::Mutex<HashMap<String, Value>>,
     fills: tokio::sync::Mutex<Value>,
     historical_fills: tokio::sync::Mutex<Value>,
     next_fill_page: tokio::sync::Mutex<Option<Value>>,
     scoped_fills: tokio::sync::Mutex<Option<Value>>,
+    order_fills: tokio::sync::Mutex<HashMap<String, Value>>,
     stalled_request: tokio::sync::Mutex<Option<String>>,
     order_response_gate: tokio::sync::Notify,
     fill_queries: tokio::sync::Mutex<Vec<HashMap<String, String>>>,
@@ -259,14 +262,22 @@ async fn serve_socket(mut socket: WebSocket, state: Arc<Venue>) {
                 json!({"id":request["id"],"op":"cancel-order","code":"0","msg":"","data":[{"clOrdId":CID,"ordId":VID,"sCode":"0","sMsg":""}]})
             }
             "order" => {
-                state.submissions.lock().await.push(request.clone());
+                let mut submissions = state.submissions.lock().await;
+                submissions.push(request.clone());
+                let venue_id = if request["args"][0]["clOrdId"] == CID {
+                    VID.to_string()
+                } else {
+                    (VID.parse::<u64>().unwrap() + submissions.len() as u64).to_string()
+                };
+                drop(submissions);
+
                 if state
                     .omit_submission_ack
                     .load(std::sync::atomic::Ordering::Relaxed)
                 {
                     continue;
                 }
-                json!({"id":request["id"],"op":"order","code":"0","msg":"","data":[{"clOrdId":CID,"ordId":VID,"tag":"","sCode":"0","sMsg":""}]})
+                json!({"id":request["id"],"op":"order","code":"0","msg":"","data":[{"clOrdId":request["args"][0]["clOrdId"],"ordId":venue_id,"tag":"","sCode":"0","sMsg":""}]})
             }
             _ => panic!("unexpected fixture command: {request}"),
         };
@@ -289,12 +300,15 @@ async fn start_venue() -> (SocketAddr, Arc<Venue>, tokio::task::JoinHandle<()>) 
         submissions: Default::default(),
         omit_submission_ack: Default::default(),
         queries: Default::default(),
+        instruments: tokio::sync::Mutex::new(instruments()),
         balance: tokio::sync::Mutex::new(balance()),
         report: tokio::sync::Mutex::new(json!({"code":"0","msg":"","data":[]})),
+        order_details: Default::default(),
         fills: tokio::sync::Mutex::new(json!({"code":"0","msg":"","data":[]})),
         historical_fills: tokio::sync::Mutex::new(json!({"code":"0","msg":"","data":[]})),
         next_fill_page: Default::default(),
         scoped_fills: Default::default(),
+        order_fills: Default::default(),
         stalled_request: Default::default(),
         order_response_gate: Default::default(),
         fill_queries: Default::default(),
@@ -305,11 +319,11 @@ async fn start_venue() -> (SocketAddr, Arc<Venue>, tokio::task::JoinHandle<()>) 
         .route("/ws/business", get(websocket))
         .route(
             "/api/v5/public/instruments",
-            get(|| async { Json(instruments()) }),
+            get(|State(s): State<Arc<Venue>>| async move { Json(s.instruments.lock().await.clone()) }),
         )
         .route(
             "/api/v5/account/instruments",
-            get(|| async { Json(instruments()) }),
+            get(|State(s): State<Arc<Venue>>| async move { Json(s.instruments.lock().await.clone()) }),
         )
         .route(
             "/api/v5/account/balance",
@@ -319,7 +333,15 @@ async fn start_venue() -> (SocketAddr, Arc<Venue>, tokio::task::JoinHandle<()>) 
             "/api/v5/trade/order",
             get(
                 |State(s): State<Arc<Venue>>, Query(q): Query<HashMap<String, String>>| async move {
-                    let response = s.report.lock().await.clone();
+                    let response = if let Some(id) = q.get("ordId") {
+                        s.order_details.lock().await.get(id).cloned()
+                    } else {
+                        None
+                    };
+                    let response = match response {
+                        Some(response) => response,
+                        None => s.report.lock().await.clone(),
+                    };
                     let stalled = s.stalled_request.lock().await.as_deref() == Some("order_status");
                     s.queries.lock().await.push(q);
                     if stalled {
@@ -344,8 +366,12 @@ async fn start_venue() -> (SocketAddr, Arc<Venue>, tokio::task::JoinHandle<()>) 
                 {
                     std::future::pending::<()>().await;
                 }
-                let mut response = if q.contains_key("ordId") {
-                    s.scoped_fills.lock().await.clone()
+                let mut response = if let Some(order_id) = q.get("ordId") {
+                    s.order_fills.lock().await.get(order_id).cloned().or(s
+                        .scoped_fills
+                        .lock()
+                        .await
+                        .clone())
                 } else {
                     None
                 }
@@ -534,6 +560,7 @@ fn build_node_with_store(
         side: OrderSide::Buy,
         core: StrategyCore::new(StrategyConfig {
             strategy_id: Some(StrategyId::from(STRATEGY)),
+            use_hyphens_in_client_order_ids: false,
             ..Default::default()
         }),
         events,
@@ -1814,6 +1841,249 @@ async fn test_persisted_restart_preserves_exact_fees_and_fill_authority(
 }
 
 #[rstest]
+#[case::canceled(false)]
+#[case::expired(true)]
+#[tokio::test]
+async fn test_managed_exit_waits_for_canceled_fill_recovery(
+    #[case] expired: bool,
+    #[values(false, true)] recover: bool,
+    #[values(false, true)] missing_status: bool,
+) {
+    let (addr, venue, server) = start_venue().await;
+    {
+        let mut balance = venue.balance.lock().await;
+        let mut base = balance["data"][0]["details"][0].clone();
+        base["ccy"] = json!("BTC");
+
+        for field in ["availBal", "availEq", "cashBal", "eq"] {
+            base[field] = json!("0.00100000");
+        }
+        base["frozenBal"] = json!("0");
+        balance["data"][0]["details"]
+            .as_array_mut()
+            .unwrap()
+            .push(base);
+    }
+    let mut node = build_node(addr, Rc::new(RefCell::new(Vec::new())), QuerySource::Direct);
+    node.kernel()
+        .exec_engine
+        .borrow_mut()
+        .register_oms_type(StrategyId::from(STRATEGY), OmsType::Netting);
+    let now = node.kernel().clock().borrow().timestamp_ns();
+    node.kernel()
+        .cache
+        .borrow_mut()
+        .add_quote(QuoteTick::new(
+            InstrumentId::from(INSTRUMENT),
+            Price::from("50000.0"),
+            Price::from("50000.0"),
+            Quantity::from("1.00000000"),
+            Quantity::from("1.00000000"),
+            now,
+            now,
+        ))
+        .unwrap();
+    let cache = node.kernel().cache.clone();
+    let handle = node.handle();
+    {
+        let mut strategy =
+            try_get_actor_unchecked::<ProbeStrategy>(&StrategyId::from(STRATEGY).inner()).unwrap();
+        strategy.side = OrderSide::Sell;
+        strategy.core.config.manage_stop = true;
+        strategy.core.config.market_exit_reduce_only = false;
+
+        if missing_status {
+            strategy.core.config.market_exit_max_attempts = 400;
+        }
+    }
+    let driver = Box::pin(async {
+        wait_until(|| cache.borrow().order_exists(&ClientOrderId::from(CID))).await;
+        wait_until(|| cached(&cache).ts_submitted().is_some()).await;
+        let timestamp = cached(&cache).ts_submitted().unwrap().as_u64() / 1_000_000;
+        let mut accepted = wire_order("live", "0", "0", "", "0", "0", timestamp);
+        accepted["data"][0]["side"] = json!("sell");
+        venue.updates.send(accepted).unwrap();
+        wait_until(|| cached(&cache).status() == OrderStatus::Accepted).await;
+        let instrument = cache
+            .borrow()
+            .instrument(&InstrumentId::from(INSTRUMENT))
+            .unwrap()
+            .clone();
+        let position_id = PositionId::from("BTC-USD.OKX-QUERY-001");
+        let position = Position::new(
+            &instrument,
+            OrderFilledSpec::builder()
+                .trader_id(TraderId::from("TESTER-001"))
+                .strategy_id(StrategyId::from(STRATEGY))
+                .instrument_id(instrument.id())
+                .client_order_id(ClientOrderId::from("OPENING"))
+                .account_id(AccountId::from("OKX-001"))
+                .position_id(position_id)
+                .order_side(OrderSide::Buy)
+                .last_qty(Quantity::from("0.00100000"))
+                .last_px(Price::from("50000.0"))
+                .currency(instrument.quote_currency())
+                .commission(Money::zero(instrument.quote_currency()))
+                .ts_event(UnixNanos::from((timestamp - 1) * 1_000_000))
+                .build(),
+        );
+        cache
+            .borrow_mut()
+            .add_position(&position, OmsType::Netting)
+            .unwrap();
+        let mut canceled = wire_order(
+            "canceled",
+            "0.00040000",
+            "0",
+            "",
+            "-0.02",
+            "0",
+            timestamp + 20,
+        );
+        canceled["data"][0]["side"] = json!("sell");
+        canceled["data"][0]["cTime"] = json!(timestamp.to_string());
+        canceled["data"][0]["fillPx"] = json!("0");
+        canceled["data"][0]["rebate"] = json!("0");
+
+        if expired {
+            canceled["data"][0]["cancelSource"] = json!("5");
+        }
+
+        if !missing_status {
+            *venue.report.lock().await = json!({"code":"0", "msg":"", "data":canceled["data"]});
+            venue.updates.send(canceled.clone()).unwrap();
+            sentinel(&venue, &cache, timestamp + 40).await;
+        }
+        assert!(!cached(&cache).is_closed());
+        assert!(cached(&cache).filled_qty().is_zero());
+        {
+            let mut strategy =
+                try_get_actor_unchecked::<ProbeStrategy>(&StrategyId::from(STRATEGY).inner())
+                    .unwrap();
+            assert!(!Strategy::stop(&mut *strategy));
+            assert!(strategy.is_exiting());
+        }
+        // Let the real native managed-exit timer run while history is unavailable.
+        tokio::time::sleep(if missing_status {
+            Duration::from_secs(33)
+        } else {
+            Duration::from_millis(350)
+        })
+        .await;
+
+        if missing_status {
+            // Four queries precede the fifth check, which exhausts the native budget.
+            assert_eq!(venue.queries.lock().await.len(), 4);
+        }
+        assert_eq!(venue.submissions.lock().await.len(), 1);
+        assert!(!cached(&cache).is_closed());
+        assert_eq!(
+            cache.borrow().position(&position_id).unwrap().quantity,
+            Quantity::from("0.00100000")
+        );
+
+        if recover {
+            if missing_status {
+                *venue.report.lock().await = json!({"code":"0", "msg":"", "data":canceled["data"]});
+                venue.updates.send(canceled).unwrap();
+            }
+
+            *venue.fills.lock().await = json!({"code":"0", "msg":"", "data":[{
+                "instType":"SPOT", "instId":"BTC-USD", "ordId":VID, "clOrdId":CID,
+                "tradeId":"90001", "billId":"80001", "fillSz":"0.00040000", "fillPx":"50000.0",
+                "side":"sell", "posSide":"net", "execType":"T", "fee":"-0.02", "feeCcy":"USD",
+                "ts":(timestamp+10).to_string(), "fillTime":(timestamp+5).to_string()
+            }]});
+            query(&cache);
+            wait_until(|| cached(&cache).is_closed()).await;
+            assert_eq!(
+                cached(&cache).status(),
+                if expired {
+                    OrderStatus::Expired
+                } else {
+                    OrderStatus::Canceled
+                }
+            );
+            assert_eq!(cached(&cache).filled_qty(), Quantity::from("0.00040000"));
+            tokio::time::timeout(DEADLINE, async {
+                while venue.submissions.lock().await.len() < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let submissions = venue.submissions.lock().await.clone();
+            assert_eq!(submissions.len(), 2);
+            let close = &submissions[1]["args"][0];
+            assert_eq!(close["side"], "sell");
+            assert_eq!(close["ordType"], "market");
+            assert_eq!(
+                close["sz"].as_str().unwrap().parse::<Quantity>().unwrap(),
+                Quantity::from("0.00060000")
+            );
+            let close_id = ClientOrderId::from(close["clOrdId"].as_str().unwrap());
+            wait_until(|| {
+                cache
+                    .borrow()
+                    .order(&close_id)
+                    .is_some_and(|o| o.ts_submitted().is_some())
+            })
+            .await;
+            let close_order = cache.borrow().order(&close_id).unwrap().clone();
+            let mut filled = wire_order(
+                "filled",
+                "0.00060000",
+                "0.00060000",
+                "90002",
+                "-0.03",
+                "-0.03",
+                close_order.ts_submitted().unwrap().as_u64() / 1_000_000 + 1,
+            );
+            filled["data"][0]["side"] = json!("sell");
+            filled["data"][0]["ordType"] = json!("market");
+            filled["data"][0]["sz"] = json!("0.00060000");
+            filled["data"][0]["clOrdId"] = json!(close_id.as_str());
+            filled["data"][0]["ordId"] = json!((VID.parse::<u64>().unwrap() + 2).to_string());
+            filled["data"][0]["px"] = json!("0");
+            venue.updates.send(filled).unwrap();
+            wait_until(|| cache.borrow().position(&position_id).unwrap().is_closed()).await;
+            wait_until(|| {
+                let strategy =
+                    try_get_actor_unchecked::<ProbeStrategy>(&StrategyId::from(STRATEGY).inner())
+                        .unwrap();
+                !strategy.is_exiting()
+            })
+            .await;
+            assert_eq!(venue.submissions.lock().await.len(), 2);
+            assert_eq!(
+                cache.borrow().positions(None, None, None, None, None).len(),
+                1
+            );
+        }
+        handle.stop();
+    });
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(70), async {
+        tokio::join!(node.run(), driver)
+    })
+    .await
+    .unwrap();
+
+    if recover {
+        result.unwrap();
+    } else {
+        assert!(result.unwrap_err().to_string().contains(if missing_status {
+            "Command recovery incomplete"
+        } else {
+            "Order fill recovery incomplete"
+        }));
+        assert!(!cached(&cache).is_closed());
+        assert_eq!(venue.submissions.lock().await.len(), 1);
+    }
+    node.dispose();
+    server.abort();
+}
+
+#[rstest]
 #[case::full("filled", "0.00100000", "0.00060000")]
 #[case::partial("partially_filled", "0.00080000", "0.00040000")]
 #[case::short_final("filled", "0.00080000", "0.00040000")]
@@ -1902,7 +2172,7 @@ async fn test_latest_stream_fill_retains_missed_execution_across_restart(
         } else {
             assert!(cached(&cache).filled_qty().is_zero());
             assert!(cached(&cache).trade_ids().is_empty());
-            assert_ne!(cached(&cache).status(), OrderStatus::Filled);
+            assert!(!cached(&cache).is_closed());
         }
         let before = snapshot(&cache);
         venue.updates.send(latest).unwrap();
@@ -1998,6 +2268,13 @@ async fn test_stream_progress_preserves_query_history_across_restart(
     });
     let topic = MessagingSwitchboard::reconciliation_raw_order_status_report_topic();
     msgbus::subscribe_any(topic.into(), handler.clone(), None);
+    let observed_fills = Rc::new(RefCell::new(Vec::new()));
+    let captured_fills = observed_fills.clone();
+    let fill_handler = ShareableMessageHandler::from_typed(move |fill: &FillReport| {
+        captured_fills.borrow_mut().push(fill.clone());
+    });
+    let fill_topic = MessagingSwitchboard::reconciliation_fill_evidence_topic();
+    msgbus::subscribe_any(fill_topic.into(), fill_handler.clone(), None);
     let instance = node.kernel().instance_id.to_string();
     let cache = node.kernel().cache.clone();
     let handle = node.handle();
@@ -2057,6 +2334,22 @@ async fn test_stream_progress_preserves_query_history_across_restart(
             let before_query = observed.borrow().len();
             query(&cache);
             wait_until(|| observed.borrow().len() > before_query).await;
+            // The detail report precedes the HTTP fill request. Keep this response
+            // installed until native ingress has retained the contradictory fill.
+            wait_until(|| {
+                observed_fills.borrow().iter().any(|fill| {
+                    fill.trade_id == TradeId::from(if field == "tradeId" { value } else { "90001" })
+                        && fill.last_px
+                            == Price::from(if field == "fillPx" { value } else { "50000.0" })
+                        && fill.commission
+                            == Money::from(if field == "fee" {
+                                "0.03 USD"
+                            } else {
+                                "0.02 USD"
+                            })
+                })
+            })
+            .await;
             sentinel(&venue, &cache, timestamp + 10).await;
             assert_eq!(
                 snapshot(&cache)["positions"][0]["commissions"],
@@ -2130,6 +2423,7 @@ async fn test_stream_progress_preserves_query_history_across_restart(
     .await
     .unwrap();
     msgbus::unsubscribe_any(topic.into(), &handler);
+    msgbus::unsubscribe_any(fill_topic.into(), &fill_handler);
 
     if expected_hold {
         assert!(
@@ -3815,8 +4109,9 @@ async fn test_unrepresentable_stream_execution_remains_pending_after_restart(
 #[rstest]
 #[tokio::test]
 async fn test_external_algo_status_requires_authoritative_child_executions(
-    #[values("held", "stream", "query")] recovery: &str,
+    #[values("held", "stream", "query", "malformed")] recovery: &str,
     #[values(false, true)] larger_earlier_history: bool,
+    #[values("", "ChildClient1")] child_client_order_id: &str,
 ) {
     use nautilus_common::messages::execution::{QueryOrder, TradingCommand};
 
@@ -3923,21 +4218,29 @@ async fn test_external_algo_status_requires_authoritative_child_executions(
             "-0.05",
             timestamp,
         );
-        child["data"][0]["clOrdId"] = json!("");
+        child["data"][0]["clOrdId"] = json!(child_client_order_id);
         child["data"][0]["algoClOrdId"] = json!(EXTERNAL_CID);
         child["data"][0]["ordId"] = json!(CHILD_VID);
 
         if recovery != "held" {
             *venue.report.lock().await = json!({"code":"0","msg":"","data":child["data"]});
             *venue.fills.lock().await = json!({"code":"0","msg":"","data":[{
-                "instType":"SPOT", "instId":"BTC-USD", "ordId":CHILD_VID, "clOrdId":"",
+                "instType":"SPOT", "instId":"BTC-USD", "ordId":CHILD_VID, "clOrdId":child_client_order_id,
                 "tradeId":"90001", "billId":"80001", "fillSz":"0.00100000", "fillPx":"50000.0",
                 "side":"buy", "posSide":"net", "execType":"T", "fee":"-0.05", "feeCcy":"USD",
                 "ts":(timestamp+5).to_string(), "fillTime":(timestamp+1).to_string()
             }]});
         }
 
-        if recovery == "query" {
+        if recovery == "malformed" {
+            let mut malformed = child.clone();
+            malformed["data"][0]["fillFee"] = json!("invalid");
+            venue.updates.send(malformed).unwrap();
+            sentinel(&venue, &cache, timestamp + 10).await;
+            assert!(external().unwrap().filled_qty().is_zero());
+        }
+
+        if matches!(recovery, "query" | "malformed" | "fills") {
             let order = external().unwrap();
             AsyncRunner::handle_exec_command(TradingCommand::QueryOrder(QueryOrder::new(
                 order.trader_id(),
@@ -3957,7 +4260,18 @@ async fn test_external_algo_status_requires_authoritative_child_executions(
 
         if recovery != "held" {
             wait_until(|| external().unwrap().status() == OrderStatus::Filled).await;
-            wait_until(|| *observed.borrow() >= if recovery == "query" { 4 } else { 5 }).await;
+            // A provisional query report precedes its asynchronous fill-history bundle.
+            // Snapshot only after that bundle has committed the native price update.
+            if !larger_earlier_history {
+                wait_until(|| external().unwrap().price() == Some(Price::from("50000.0"))).await;
+                wait_until(|| {
+                    !cache.borrow().has_pending_order_executions(
+                        external().unwrap().strategy_id(),
+                        Some(external().unwrap().instrument_id()),
+                    )
+                })
+                .await;
+            }
             assert_eq!(
                 external().unwrap().trade_ids(),
                 vec![&TradeId::from("90001")]
@@ -4052,6 +4366,7 @@ async fn test_external_algo_status_requires_authoritative_child_executions(
 async fn test_partial_rest_observations_survive_later_history_and_restart(
     #[case] first_result: &str,
     #[case] recover: bool,
+    #[values(false, true)] algo_child: bool,
 ) {
     let store = tempfile::TempDir::new().unwrap();
     let (addr, venue, server) = start_venue().await;
@@ -4096,7 +4411,7 @@ async fn test_partial_rest_observations_survive_later_history_and_restart(
             .send(wire_order("live", "0", "0", "", "0", "0", timestamp))
             .unwrap();
         wait_until(|| cached(&cache).status() == OrderStatus::Accepted).await;
-        let full = wire_order(
+        let mut full = wire_order(
             "filled",
             "0.00100000",
             "0.00060000",
@@ -4105,15 +4420,20 @@ async fn test_partial_rest_observations_survive_later_history_and_restart(
             "-0.03",
             timestamp + 20,
         );
+
+        if algo_child {
+            full["data"][0]["clOrdId"] = json!("ChildClient1");
+            full["data"][0]["algoClOrdId"] = json!(CID);
+        }
         *venue.report.lock().await = json!({"code":"0", "msg":"", "data":full["data"]});
         let first = json!({
-            "instType":"SPOT", "instId":"BTC-USD", "ordId":VID, "clOrdId":CID,
+            "instType":"SPOT", "instId":"BTC-USD", "ordId":VID, "clOrdId":if algo_child { "ChildClient1" } else { CID },
             "tradeId":"90001", "billId":"80001", "fillSz":"0.00040000", "fillPx":"50000.0",
             "side":"buy", "posSide":"net", "execType":"T", "fee":"-0.02", "feeCcy":"USD",
             "ts":(timestamp+5).to_string(), "fillTime":(timestamp+1).to_string()
         });
         let second = json!({
-            "instType":"SPOT", "instId":"BTC-USD", "ordId":VID, "clOrdId":CID,
+            "instType":"SPOT", "instId":"BTC-USD", "ordId":VID, "clOrdId":if algo_child { "ChildClient1" } else { CID },
             "tradeId":"90002", "billId":"80002", "fillSz": if recover { "0.00060000" } else { "0.00100000" }, "fillPx":"50000.0",
             "side":"buy", "posSide":"net", "execType":"T", "fee": if recover { "-0.03" } else { "-0.05" }, "feeCcy":"USD",
             "ts":(timestamp+25).to_string(), "fillTime":(timestamp+21).to_string()
@@ -5035,6 +5355,29 @@ async fn test_startup_timeout_retains_observed_fill_evidence_in_sealed_run(
     drop(node);
     let runs = RedbBackend::list_runs(store.path(), &instance).unwrap();
     assert_eq!(runs.len(), 1);
+    if page_observation {
+        let backend = RedbBackend::open_sealed(store.path(), &instance, &runs[0].run_id).unwrap();
+        let entries = backend
+            .scan_range(1, backend.high_watermark().unwrap(), ScanDirection::Forward)
+            .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.payload_type.as_str() == "FillReport")
+                .count(),
+            100,
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.payload_type.as_str() == "IncompleteFill")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.payload_type.as_str() == "OrderQueryWithFills")
+        );
+    }
     let restarted = build_node(addr, Rc::new(RefCell::new(Vec::new())), QuerySource::Direct);
     let error = restore_cache_from_sealed_run(
         &mut restarted.kernel().cache.borrow_mut(),
@@ -5044,13 +5387,13 @@ async fn test_startup_timeout_retains_observed_fill_evidence_in_sealed_run(
     )
     .unwrap_err();
     assert!(
-        error.to_string().contains(if page_observation {
-            "Unresolved persisted standalone fill recovery"
-        } else if stalled_request == "later_algo_type" {
-            "Unresolved persisted order fill recovery"
-        } else {
-            "Unresolved persisted incomplete fill recovery"
-        }),
+        error
+            .to_string()
+            .contains(if stalled_request == "later_algo_type" {
+                "Unresolved persisted order fill recovery"
+            } else {
+                "Unresolved persisted incomplete fill recovery"
+            }),
         "{error:#}"
     );
     server.abort();
@@ -5061,10 +5404,11 @@ async fn test_startup_timeout_retains_observed_fill_evidence_in_sealed_run(
 #[case::fee_conflict("fee")]
 #[case::price_conflict("fillPx")]
 #[case::missing_trade("tradeId")]
+#[case::client_conflict("clOrdId")]
 #[tokio::test]
 async fn test_tracked_stream_companion_constrains_later_query(
     #[case] conflict: &str,
-    #[values(false, true)] algo_child: bool,
+    #[values(None, Some(""), Some("ChildClient1"))] algo_child: Option<&str>,
     #[values(false, true)] stream_first: bool,
 ) {
     let store = tempfile::TempDir::new().unwrap();
@@ -5086,7 +5430,10 @@ async fn test_tracked_stream_companion_constrains_later_query(
     let observed = Rc::new(RefCell::new(0));
     let count = observed.clone();
     let handler = ShareableMessageHandler::from_typed(move |report: &ExecutionReport| {
-        if matches!(report, ExecutionReport::OrderQueryWithFills(..)) {
+        if matches!(
+            report,
+            ExecutionReport::OrderQueryWithFills(..) | ExecutionReport::OrderFillConflict(..)
+        ) {
             *count.borrow_mut() += 1;
         }
     });
@@ -5124,9 +5471,9 @@ async fn test_tracked_stream_companion_constrains_later_query(
             final_frame.clone()
         };
 
-        if algo_child {
+        if let Some(child_client_id) = algo_child {
             for value in [&mut frame, &mut final_frame] {
-                value["data"][0]["clOrdId"] = json!("");
+                value["data"][0]["clOrdId"] = json!(child_client_id);
                 value["data"][0]["algoClOrdId"] = json!(CID);
             }
         }
@@ -5144,7 +5491,7 @@ async fn test_tracked_stream_companion_constrains_later_query(
         assert_eq!(cached(&cache).trade_ids().len(), usize::from(stream_first));
         let before = snapshot(&cache);
         *venue.report.lock().await = json!({"code":"0", "msg":"", "data":final_frame["data"]});
-        let mut first = json!({"instType":"SPOT", "instId":"BTC-USD", "ordId":VID, "clOrdId":if algo_child { "" } else { CID },
+        let mut first = json!({"instType":"SPOT", "instId":"BTC-USD", "ordId":VID, "clOrdId":algo_child.unwrap_or(CID),
             "tradeId":"90001", "billId":"80001", "fillSz":"0.00040000", "fillPx":"50000.0",
             "side":"buy", "posSide":"net", "execType":"T", "fee":"-0.02", "feeCcy":"USD",
             "ts":(timestamp+1).to_string(), "fillTime":(timestamp+1).to_string()});
@@ -5170,6 +5517,7 @@ async fn test_tracked_stream_companion_constrains_later_query(
                 "fee" => "-0.04",
                 "fillPx" => "50001.0",
                 "tradeId" => "90003",
+                "clOrdId" => "UnrelatedClient1",
                 _ => unreachable!(),
             });
         }
@@ -5235,12 +5583,411 @@ async fn test_tracked_stream_companion_constrains_later_query(
     } else {
         let error = restored.unwrap_err();
         assert!(
+            error.to_string().contains(if conflict == "clOrdId" {
+                "Unresolved persisted order fill conflict"
+            } else {
+                "Unresolved persisted incomplete fill recovery"
+            }),
+            "{error:#}"
+        );
+    }
+    server.abort();
+}
+
+#[cfg(feature = "high-precision")]
+#[rstest]
+#[tokio::test]
+async fn test_cold_order_only_tied_closing_fills_and_restart(
+    #[values(false, true)] reverse: bool,
+    #[values(
+        "complete",
+        "child",
+        "child-id",
+        "missing-fill",
+        "fee",
+        "cross-order-tie",
+        "retained-close"
+    )]
+    case: &str,
+) {
+    use nautilus_model::{accounts::Account, types::Currency};
+    use rust_decimal::Decimal;
+
+    let store = tempfile::TempDir::new().unwrap();
+    let (addr, venue, server) = start_venue().await;
+    let mut instrument_response = instruments();
+    instrument_response["data"][0]["tickSz"] = json!("0.01");
+    *venue.instruments.lock().await = instrument_response.clone();
+    let mut node = build_node_with_store(
+        addr,
+        Rc::new(RefCell::new(Vec::new())),
+        QuerySource::Direct,
+        Some(EventStoreConfig {
+            base_dir: store.path().to_path_buf(),
+            retention: RetentionMode::Full,
+            ..Default::default()
+        }),
+        None,
+    );
+    let instruments: OKXResponse<OKXInstrument> =
+        serde_json::from_value(instrument_response).unwrap();
+    node.kernel()
+        .cache
+        .borrow_mut()
+        .add_instrument(
+            parse_instrument_any(&instruments.data[0], None, None, Default::default())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    let response: OKXResponse<OKXAccount> = serde_json::from_value(balance()).unwrap();
+    let account = parse_account_state(
+        &response.data[0],
+        AccountId::from("OKX-001"),
+        AccountType::Cash,
+        UnixNanos::default(),
+    )
+    .unwrap();
+    node.kernel()
+        .cache
+        .borrow_mut()
+        .add_account(AccountAny::Cash(CashAccount::new(account, false, false)))
+        .unwrap();
+    let instance = node.kernel().instance_id.to_string();
+    let cache = node.kernel().cache.clone();
+    let wallet = cache
+        .borrow()
+        .account(&AccountId::from("OKX-001"))
+        .unwrap()
+        .balance_total(Some(Currency::USD()))
+        .unwrap();
+    let timestamp = node.kernel().clock.borrow().timestamp_ns().as_u64() / 1_000_000 - 2000;
+    // Two cash cycles, with the final closing order split at one execution timestamp.
+    let mut executions = [
+        (
+            CID,
+            VID,
+            "90001",
+            "buy",
+            "0.002514",
+            "2386.62",
+            "0.01199992536",
+            0,
+        ),
+        (
+            "QueryFills2",
+            "2497956918703120387",
+            "90002",
+            "sell",
+            "0.002514",
+            "2384.70",
+            "0.0119902716",
+            400,
+        ),
+        (
+            "QueryFills3",
+            "2497956918703120388",
+            "90003",
+            "buy",
+            "0.000838",
+            "2387.59",
+            "0.00400160084",
+            793,
+        ),
+        (
+            "QueryFills4",
+            "2497956918703120389",
+            "90004",
+            "sell",
+            "0.000449",
+            "2384.70",
+            "0.0021414606",
+            1191,
+        ),
+        (
+            "QueryFills4",
+            "2497956918703120389",
+            "90005",
+            "sell",
+            "0.000389",
+            "2384.53",
+            "0.00185516434",
+            1191,
+        ),
+    ];
+
+    if case == "cross-order-tie" {
+        executions[2].7 = executions[3].7;
+    }
+
+    if case == "retained-close" {
+        let mut closing = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(TraderId::from("TESTER-001"))
+            .strategy_id(StrategyId::external())
+            .client_order_id(ClientOrderId::from("QueryFills4"))
+            .instrument_id(InstrumentId::from(INSTRUMENT))
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("0.000838"))
+            .build();
+        closing
+            .apply(TestOrderEventStubs::submitted(
+                &closing,
+                AccountId::from("OKX-001"),
+            ))
+            .unwrap();
+        closing
+            .apply(TestOrderEventStubs::accepted(
+                &closing,
+                AccountId::from("OKX-001"),
+                VenueOrderId::from("2497956918703120389"),
+            ))
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_order(closing, None, Some(ClientId::from("OKX")), true)
+            .unwrap();
+    }
+    let mut reports = Vec::new();
+    let mut all_fills = Vec::new();
+
+    for group in [
+        &executions[..1],
+        &executions[1..2],
+        &executions[2..3],
+        &executions[3..],
+    ] {
+        let (cid, vid, trade, side, qty, price, fee, offset) = group.last().unwrap();
+        let total: Decimal = group.iter().map(|f| f.4.parse::<Decimal>().unwrap()).sum();
+        let commission: Decimal = group.iter().map(|f| f.6.parse::<Decimal>().unwrap()).sum();
+        let notional: Decimal = group
+            .iter()
+            .map(|f| f.4.parse::<Decimal>().unwrap() * f.5.parse::<Decimal>().unwrap())
+            .sum();
+        let total = total.to_string();
+        let mut frame = wire_order(
+            "filled",
+            &total,
+            qty,
+            trade,
+            &(-commission).to_string(),
+            &format!("-{fee}"),
+            timestamp + offset - 1,
+        );
+
+        for (key, value) in [
+            ("clOrdId", cid.to_string()),
+            ("ordId", vid.to_string()),
+            ("side", side.to_string()),
+            ("sz", total.clone()),
+            ("px", price.to_string()),
+            ("fillPx", price.to_string()),
+            (
+                "avgPx",
+                (notional / total.parse::<Decimal>().unwrap()).to_string(),
+            ),
+            ("ordType", "ioc".to_string()),
+        ] {
+            frame["data"][0][key] = json!(value);
+        }
+
+        if case.starts_with("child") && *cid == CID {
+            frame["data"][0]["clOrdId"] = json!("ChildClient1");
+            frame["data"][0]["algoClOrdId"] = json!(CID);
+            frame["data"][0]["algoId"] = json!("AlgoParent1");
+        }
+
+        if case == "fee" && *cid == "QueryFills4" {
+            frame["data"][0]["fee"] = json!("-0.004");
+        }
+        venue.order_details.lock().await.insert(
+            vid.to_string(),
+            json!({"code":"0", "msg":"", "data":frame["data"]}),
+        );
+        reports.push(frame["data"][0].clone());
+        let mut fills: Vec<_> = group.iter().map(|(cid, vid, trade, side, qty, px, fee, offset)| {
+            json!({"instType":"SPOT", "instId":"BTC-USD", "ordId":vid, "clOrdId":cid,
+                "tradeId":trade, "billId":trade, "fillSz":qty, "fillPx":px,
+                "side":side, "posSide":"net", "execType":"T", "fee":format!("-{fee}"), "feeCcy":"USD",
+                "ts":(timestamp+offset+10).to_string(), "fillTime":(timestamp+offset).to_string()})
+        }).collect();
+
+        if case.starts_with("child") && *cid == CID {
+            fills[0]["clOrdId"] = json!(if case == "child-id" {
+                "UnrelatedClient1"
+            } else {
+                "ChildClient1"
+            });
+        }
+
+        if case == "missing-fill" && *cid == "QueryFills4" {
+            fills.pop();
+        }
+
+        if reverse {
+            fills.reverse();
+        }
+        all_fills.extend(fills.clone());
+        venue
+            .order_fills
+            .lock()
+            .await
+            .insert(vid.to_string(), json!({"code":"0", "msg":"", "data":fills}));
+    }
+
+    if reverse {
+        reports.reverse();
+        all_fills.reverse();
+    }
+    *venue.report.lock().await = json!({"code":"0", "msg":"", "data":reports});
+    *venue.fills.lock().await = json!({"code":"0", "msg":"", "data":all_fills});
+    venue.bulk.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let result = tokio::time::timeout(DEADLINE, node.start()).await.unwrap();
+    if !matches!(case, "complete" | "child") {
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains(if case == "child-id" {
+                "Order fill recovery incomplete at shutdown"
+            } else {
+                "Startup order fill recovery incomplete"
+            }),
+            "{error:#}"
+        );
+        assert!(venue.submissions.lock().await.is_empty());
+        assert!(
+            cache
+                .borrow()
+                .orders(None, None, None, None, None)
+                .iter()
+                .all(|order| order.filled_qty().is_zero())
+        );
+        assert!(
+            cache
+                .borrow()
+                .positions(None, None, None, None, None)
+                .is_empty()
+        );
+        assert_eq!(
+            cache
+                .borrow()
+                .account(&AccountId::from("OKX-001"))
+                .unwrap()
+                .balance_total(Some(Currency::USD())),
+            Some(wallet)
+        );
+        node.dispose();
+        drop(node);
+        drop(cache);
+        let runs = RedbBackend::list_runs(store.path(), &instance).unwrap();
+        let restarted = build_node(addr, Rc::new(RefCell::new(Vec::new())), QuerySource::Direct);
+        let error = restore_cache_from_sealed_run(
+            &mut restarted.kernel().cache.borrow_mut(),
+            store.path().to_path_buf(),
+            &instance,
+            &runs[0].run_id,
+        )
+        .unwrap_err();
+        assert!(
             error
                 .to_string()
                 .contains("Unresolved persisted incomplete fill recovery"),
             "{error:#}"
         );
+        server.abort();
+        return;
     }
+    result.unwrap();
+    assert!(node.handle().is_running());
+    assert!(venue.submissions.lock().await.is_empty());
+
+    for (cid, _, trade, _, qty, px, fee, offset) in executions {
+        let cache = cache.borrow();
+        let order = cache.order(&ClientOrderId::from(cid)).unwrap();
+        assert_eq!(order.status(), OrderStatus::Filled);
+        let fills: Vec<_> = order
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                OrderEventAny::Filled(fill) if fill.trade_id == TradeId::from(trade) => Some(fill),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].last_qty, Quantity::from(qty));
+        assert_eq!(fills[0].last_px, Price::from(px));
+        assert_eq!(
+            fills[0].commission,
+            Some(Money::from_decimal_exact(fee.parse().unwrap(), Currency::USD()).unwrap())
+        );
+        assert_eq!(fills[0].ts_event.as_u64(), (timestamp + offset) * 1_000_000);
+    }
+    assert!(
+        cache
+            .borrow()
+            .positions(None, None, None, None, None)
+            .is_empty()
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .account(&AccountId::from("OKX-001"))
+            .unwrap()
+            .balance_total(Some(Currency::USD())),
+        Some(wallet)
+    );
+    let before: Vec<_> = cache
+        .borrow()
+        .orders(None, None, None, None, None)
+        .into_iter()
+        .map(|order| order.cloned())
+        .collect();
+    node.stop().await.unwrap();
+    node.dispose();
+    drop(node);
+    drop(cache);
+
+    let runs = RedbBackend::list_runs(store.path(), &instance).unwrap();
+    let mut restarted = build_node(addr, Rc::new(RefCell::new(Vec::new())), QuerySource::Direct);
+    let cache = restarted.kernel().cache.clone();
+    restore_cache_from_sealed_run(
+        &mut cache.borrow_mut(),
+        store.path().to_path_buf(),
+        &instance,
+        &runs[0].run_id,
+    )
+    .unwrap();
+    tokio::time::timeout(DEADLINE, restarted.start())
+        .await
+        .unwrap()
+        .unwrap();
+
+    for order in before {
+        assert_eq!(
+            cache
+                .borrow()
+                .order(&order.client_order_id())
+                .unwrap()
+                .events(),
+            order.events()
+        );
+    }
+    assert!(
+        cache
+            .borrow()
+            .positions(None, None, None, None, None)
+            .is_empty()
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .account(&AccountId::from("OKX-001"))
+            .unwrap()
+            .balance_total(Some(Currency::USD())),
+        Some(wallet)
+    );
+    assert!(venue.submissions.lock().await.is_empty());
+    restarted.stop().await.unwrap();
+    restarted.dispose();
     server.abort();
 }
 
@@ -5649,6 +6396,19 @@ async fn test_status_only_order_update_recovers_actual_history_and_replays(
         }
     });
     msgbus::subscribe_any(topic.into(), handler.clone(), None);
+    let completed_queries = Rc::new(RefCell::new(0));
+    let captured_queries = completed_queries.clone();
+    let query_topic = MessagingSwitchboard::reconciliation_raw_order_query_topic();
+    let query_handler = ShareableMessageHandler::from_any(move |message| {
+        if let Some(ExecutionReport::OrderQueryWithFills(report, fills)) =
+            message.downcast_ref::<ExecutionReport>()
+            && report.client_order_id == Some(ClientOrderId::from(CID))
+            && !fills.is_empty()
+        {
+            *captured_queries.borrow_mut() += 1;
+        }
+    });
+    msgbus::subscribe_any(query_topic.into(), query_handler.clone(), None);
     let driver = async {
         wait_until(|| {
             cache
@@ -5714,8 +6474,22 @@ async fn test_status_only_order_update_recovers_actual_history_and_replays(
         sentinel(&venue, &cache, timestamp + 10).await;
         assert_eq!(snapshot(&cache), before);
         let count = *observed.borrow();
+        let completed_count = *completed_queries.borrow();
         query(&cache);
         wait_until(|| *observed.borrow() > count).await;
+        // Raw detail arrives before its fill history. Await native recovery, or
+        // the retained conflicting bundle, before the next notice or shutdown.
+        if conflicting_last_fill {
+            wait_until(|| *completed_queries.borrow() > completed_count).await;
+        } else {
+            wait_until(|| {
+                !cache.borrow().has_pending_order_executions(
+                    StrategyId::from(STRATEGY),
+                    Some(InstrumentId::from(INSTRUMENT)),
+                )
+            })
+            .await;
+        }
 
         if conflicting_last_fill {
             assert_eq!(snapshot(&cache), before);
@@ -5734,8 +6508,22 @@ async fn test_status_only_order_update_recovers_actual_history_and_replays(
         // A placeholder stream observation requires query authority after its receipt,
         // including a repeated update whose unavailable trade ID cannot prove duplication.
         let count = *observed.borrow();
+        let completed_count = *completed_queries.borrow();
         query(&cache);
         wait_until(|| *observed.borrow() > count).await;
+        // Raw detail arrives before its fill history. Await native recovery, or
+        // the retained conflicting bundle, before the next notice or shutdown.
+        if conflicting_last_fill {
+            wait_until(|| *completed_queries.borrow() > completed_count).await;
+        } else {
+            wait_until(|| {
+                !cache.borrow().has_pending_order_executions(
+                    StrategyId::from(STRATEGY),
+                    Some(InstrumentId::from(INSTRUMENT)),
+                )
+            })
+            .await;
+        }
         assert_eq!(snapshot(&cache), state);
         handle.stop();
         state
@@ -5756,6 +6544,7 @@ async fn test_status_only_order_update_recovers_actual_history_and_replays(
         result.unwrap();
     }
     msgbus::unsubscribe_any(topic.into(), &handler);
+    msgbus::unsubscribe_any(query_topic.into(), &query_handler);
     node.dispose();
     drop(node);
     drop(cache);
@@ -6014,6 +6803,7 @@ async fn test_cash_missing_rebate_requires_actual_fill_history(
         if let ExecutionReport::OrderQueryWithFills(report, fills) = report
             && report.client_order_id == Some(ClientOrderId::from(CID))
             && report.filled_qty.is_positive()
+            && !fills.is_empty()
         {
             assert_eq!(fills.len(), 1);
             *observed_query.borrow_mut() = true;
@@ -6151,5 +6941,278 @@ async fn test_cash_missing_rebate_requires_actual_fill_history(
         restored.unwrap();
         assert_eq!(snapshot(&restarted.kernel().cache), state);
     }
+    server.abort();
+}
+
+#[rstest]
+#[case::canceled(false)]
+#[case::expired(true)]
+#[tokio::test]
+async fn test_terminal_evidence_waits_for_cross_transport_fill_recovery(
+    #[case] expired: bool,
+    #[values(false, true)] contradictory: bool,
+) {
+    let recover = !contradictory;
+    let (addr, venue, server) = start_venue().await;
+    {
+        let mut balance = venue.balance.lock().await;
+        let mut base = balance["data"][0]["details"][0].clone();
+        base["ccy"] = json!("BTC");
+
+        for field in ["availBal", "availEq", "cashBal", "eq"] {
+            base[field] = json!("0.00100000");
+        }
+        base["frozenBal"] = json!("0");
+        balance["data"][0]["details"]
+            .as_array_mut()
+            .unwrap()
+            .push(base);
+    }
+    let mut node = build_node(addr, Rc::new(RefCell::new(Vec::new())), QuerySource::Direct);
+    node.kernel()
+        .exec_engine
+        .borrow_mut()
+        .register_oms_type(StrategyId::from(STRATEGY), OmsType::Netting);
+    let now = node.kernel().clock().borrow().timestamp_ns();
+    node.kernel()
+        .cache
+        .borrow_mut()
+        .add_quote(QuoteTick::new(
+            InstrumentId::from(INSTRUMENT),
+            Price::from("50000.0"),
+            Price::from("50000.0"),
+            Quantity::from("1.00000000"),
+            Quantity::from("1.00000000"),
+            now,
+            now,
+        ))
+        .unwrap();
+    let cache = node.kernel().cache.clone();
+    let handle = node.handle();
+    {
+        let mut strategy =
+            try_get_actor_unchecked::<ProbeStrategy>(&StrategyId::from(STRATEGY).inner()).unwrap();
+        strategy.side = OrderSide::Sell;
+        strategy.core.config.manage_stop = true;
+        strategy.core.config.market_exit_reduce_only = false;
+    }
+    let observed = Rc::new(RefCell::new(false));
+    let captured = observed.clone();
+    let handler = ShareableMessageHandler::from_typed(move |report: &OrderStatusReport| {
+        if report.client_order_id == Some(ClientOrderId::from(CID))
+            && report.filled_qty == Quantity::from("0.00040000")
+        {
+            *captured.borrow_mut() = true;
+        }
+    });
+    msgbus::subscribe_any(
+        MessagingSwitchboard::reconciliation_raw_order_status_report_topic().into(),
+        handler.clone(),
+        None,
+    );
+    let driver = Box::pin(async {
+        wait_until(|| cache.borrow().order_exists(&ClientOrderId::from(CID))).await;
+        wait_until(|| cached(&cache).ts_submitted().is_some()).await;
+        let timestamp = cached(&cache).ts_submitted().unwrap().as_u64() / 1_000_000;
+        let mut accepted = wire_order("live", "0", "0", "", "0", "0", timestamp);
+        accepted["data"][0]["side"] = json!("sell");
+        venue.updates.send(accepted).unwrap();
+        wait_until(|| cached(&cache).status() == OrderStatus::Accepted).await;
+        let instrument = cache
+            .borrow()
+            .instrument(&InstrumentId::from(INSTRUMENT))
+            .unwrap()
+            .clone();
+        let position_id = PositionId::from("BTC-USD.OKX-QUERY-001");
+        let position = Position::new(
+            &instrument,
+            OrderFilledSpec::builder()
+                .trader_id(TraderId::from("TESTER-001"))
+                .strategy_id(StrategyId::from(STRATEGY))
+                .instrument_id(instrument.id())
+                .client_order_id(ClientOrderId::from("OPENING"))
+                .account_id(AccountId::from("OKX-001"))
+                .position_id(position_id)
+                .order_side(OrderSide::Buy)
+                .last_qty(Quantity::from("0.00100000"))
+                .last_px(Price::from("50000.0"))
+                .currency(instrument.quote_currency())
+                .commission(Money::zero(instrument.quote_currency()))
+                .ts_event(UnixNanos::from((timestamp - 1) * 1_000_000))
+                .build(),
+        );
+        cache
+            .borrow_mut()
+            .add_position(&position, OmsType::Netting)
+            .unwrap();
+        let mut canceled = wire_order(
+            "canceled",
+            "0.00040000",
+            "0",
+            "",
+            "-0.02",
+            "0",
+            timestamp + 20,
+        );
+        canceled["data"][0]["side"] = json!("sell");
+        canceled["data"][0]["cTime"] = json!(timestamp.to_string());
+        canceled["data"][0]["fillPx"] = json!("0");
+        canceled["data"][0]["rebate"] = json!("0");
+
+        if expired {
+            canceled["data"][0]["cancelSource"] = json!("5");
+        }
+
+        *venue.report.lock().await = json!({"code":"0", "msg":"", "data":canceled["data"]});
+        query(&cache);
+        wait_until(|| *observed.borrow()).await;
+        assert!(!cached(&cache).is_closed());
+        let mut zero = wire_order(
+            "canceled",
+            "0",
+            "0",
+            "",
+            "0",
+            "0",
+            timestamp + if contradictory { 30 } else { 1 },
+        );
+        zero["data"][0]["side"] = json!("sell");
+        zero["data"][0]["cTime"] = json!(timestamp.to_string());
+        zero["data"][0]["fillPx"] = json!("0");
+
+        if expired {
+            zero["data"][0]["cancelSource"] = json!("5");
+        }
+        venue.updates.send(zero).unwrap();
+        sentinel(&venue, &cache, timestamp + 40).await;
+        assert!(!cached(&cache).is_closed());
+        assert!(cached(&cache).filled_qty().is_zero());
+        {
+            let mut strategy =
+                try_get_actor_unchecked::<ProbeStrategy>(&StrategyId::from(STRATEGY).inner())
+                    .unwrap();
+            assert!(!Strategy::stop(&mut *strategy));
+            assert!(strategy.is_exiting());
+        }
+        // Let the real native managed-exit timer run while history is unavailable.
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(venue.submissions.lock().await.len(), 1);
+        assert!(!cached(&cache).is_closed());
+        assert_eq!(
+            cache.borrow().position(&position_id).unwrap().quantity,
+            Quantity::from("0.00100000")
+        );
+
+        if contradictory {
+            *venue.fills.lock().await = json!({"code":"0", "msg":"", "data":[{
+                "instType":"SPOT", "instId":"BTC-USD", "ordId":VID, "clOrdId":CID,
+                "tradeId":"90001", "billId":"80001", "fillSz":"0.00040000", "fillPx":"50000.0",
+                "side":"sell", "posSide":"net", "execType":"T", "fee":"-0.02", "feeCcy":"USD",
+                "ts":(timestamp+10).to_string(), "fillTime":(timestamp+5).to_string()
+            }]});
+            query(&cache);
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            assert!(!cached(&cache).is_closed());
+            assert_eq!(venue.submissions.lock().await.len(), 1);
+        }
+
+        if recover {
+            *venue.fills.lock().await = json!({"code":"0", "msg":"", "data":[{
+                "instType":"SPOT", "instId":"BTC-USD", "ordId":VID, "clOrdId":CID,
+                "tradeId":"90001", "billId":"80001", "fillSz":"0.00040000", "fillPx":"50000.0",
+                "side":"sell", "posSide":"net", "execType":"T", "fee":"-0.02", "feeCcy":"USD",
+                "ts":(timestamp+10).to_string(), "fillTime":(timestamp+5).to_string()
+            }]});
+            query(&cache);
+            wait_until(|| cached(&cache).is_closed()).await;
+            assert_eq!(
+                cached(&cache).status(),
+                if expired {
+                    OrderStatus::Expired
+                } else {
+                    OrderStatus::Canceled
+                }
+            );
+            assert_eq!(cached(&cache).filled_qty(), Quantity::from("0.00040000"));
+            tokio::time::timeout(DEADLINE, async {
+                while venue.submissions.lock().await.len() < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let submissions = venue.submissions.lock().await.clone();
+            assert_eq!(submissions.len(), 2);
+            let close = &submissions[1]["args"][0];
+            assert_eq!(close["side"], "sell");
+            assert_eq!(close["ordType"], "market");
+            assert_eq!(
+                close["sz"].as_str().unwrap().parse::<Quantity>().unwrap(),
+                Quantity::from("0.00060000")
+            );
+            let close_id = ClientOrderId::from(close["clOrdId"].as_str().unwrap());
+            wait_until(|| {
+                cache
+                    .borrow()
+                    .order(&close_id)
+                    .is_some_and(|o| o.ts_submitted().is_some())
+            })
+            .await;
+            let close_order = cache.borrow().order(&close_id).unwrap().clone();
+            let mut filled = wire_order(
+                "filled",
+                "0.00060000",
+                "0.00060000",
+                "90002",
+                "-0.03",
+                "-0.03",
+                close_order.ts_submitted().unwrap().as_u64() / 1_000_000 + 1,
+            );
+            filled["data"][0]["side"] = json!("sell");
+            filled["data"][0]["ordType"] = json!("market");
+            filled["data"][0]["sz"] = json!("0.00060000");
+            filled["data"][0]["clOrdId"] = json!(close_id.as_str());
+            filled["data"][0]["ordId"] = json!((VID.parse::<u64>().unwrap() + 2).to_string());
+            filled["data"][0]["px"] = json!("0");
+            venue.updates.send(filled).unwrap();
+            wait_until(|| cache.borrow().position(&position_id).unwrap().is_closed()).await;
+            wait_until(|| {
+                let strategy =
+                    try_get_actor_unchecked::<ProbeStrategy>(&StrategyId::from(STRATEGY).inner())
+                        .unwrap();
+                !strategy.is_exiting()
+            })
+            .await;
+            assert_eq!(venue.submissions.lock().await.len(), 2);
+            assert_eq!(
+                cache.borrow().positions(None, None, None, None, None).len(),
+                1
+            );
+        }
+        handle.stop();
+    });
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(70), async {
+        tokio::join!(node.run(), driver)
+    })
+    .await
+    .unwrap();
+
+    if recover {
+        result.unwrap();
+    } else {
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Order fill recovery incomplete")
+        );
+        assert!(!cached(&cache).is_closed());
+        assert_eq!(venue.submissions.lock().await.len(), 1);
+    }
+    msgbus::unsubscribe_any(
+        MessagingSwitchboard::reconciliation_raw_order_status_report_topic().into(),
+        &handler,
+    );
+    node.dispose();
     server.abort();
 }

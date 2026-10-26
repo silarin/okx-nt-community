@@ -960,6 +960,23 @@ pub fn parse_candlestick(
     ))
 }
 
+/// Case-insensitive substring check.
+#[inline]
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// Preserves the existing native cancellation-to-expiry mapping across transports.
+pub(crate) fn is_expiration_cancel(source: &str, reason: &str) -> bool {
+    contains_ignore_ascii_case(reason, "expir")
+        || contains_ignore_ascii_case(reason, "gtd")
+        || contains_ignore_ascii_case(reason, "timeout")
+        || matches!(source, "5" | "time_expired" | "gtd_expired")
+}
+
 /// Parses an OKX order history record into a Nautilus [`OrderStatusReport`].
 ///
 /// # Errors
@@ -1125,10 +1142,19 @@ pub fn parse_order_status_report(
     };
 
     let order_side = OrderSide::from(order.side);
-    let order_status: OrderStatus = order
-        .state
-        .try_into()
-        .map_err(|e| anyhow::anyhow!("Unsupported OKX order status: {e}"))?;
+    let order_status =
+        if matches!(
+            order.state,
+            OKXOrderStatus::Canceled | OKXOrderStatus::MmpCanceled
+        ) && is_expiration_cancel(&order.cancel_source, &order.cancel_source_reason)
+        {
+            OrderStatus::Expired
+        } else {
+            order
+                .state
+                .try_into()
+                .map_err(|e| anyhow::anyhow!("Unsupported OKX order status: {e}"))?
+        };
     let time_in_force = match okx_ord_type {
         OKXOrderType::Fok | OKXOrderType::OpFok => TimeInForce::Fok,
         OKXOrderType::Ioc | OKXOrderType::OptimalLimitIoc => TimeInForce::Ioc,

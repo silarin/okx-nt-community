@@ -90,7 +90,7 @@ use crate::{
     http::{
         client::{
             AlgoOrderReportSweep, FillHistory, OKXHttpClient, OKXPendingAlgoOrderReportsError,
-            ReportInstrumentScope,
+            OrderQueryReport, ReportInstrumentScope,
         },
         error::{ConflictingFillEvidence, IncompleteOrderFill},
         models::{OKXAmendAlgoOrderRequest, OKXCancelAlgoOrderRequest},
@@ -323,14 +323,96 @@ impl OKXExecutionClient {
         &self,
         cmd: GenerateFillReports,
         history: FillHistory,
-        retain_observations: bool,
         max_history_pages: Option<u32>,
+        retain_observations: bool,
+        fill_queries: &mut AHashMap<VenueOrderId, OrderQueryReport>,
     ) -> anyhow::Result<(Vec<FillReport>, bool)> {
         let mut client = self.report_client();
         client.evidence_emitter = retain_observations.then(|| self.emitter.clone());
         client
-            .collect_fill_reports(cmd, history, max_history_pages)
+            .collect_fill_reports(cmd, history, max_history_pages, fill_queries)
             .await
+    }
+
+    async fn recover_order_fill_histories(
+        &self,
+        order_reports: &mut [OrderStatusReport],
+        fill_queries: &mut AHashMap<VenueOrderId, OrderQueryReport>,
+    ) -> (Vec<FillReport>, bool) {
+        let mut fill_reports = Vec::new();
+        let mut fills_complete = true;
+        let history_requests: Vec<_> = order_reports
+            .iter_mut()
+            .filter(|report| {
+                !report.filled_qty.is_zero() && !self.http_client.is_spread(report.instrument_id)
+            })
+            .map(|report| (fill_queries.remove(&report.venue_order_id), report))
+            .collect();
+        let histories = futures_util::stream::iter(history_requests)
+            .map(|(mut query, report)| async move {
+                let observation_emitter = &self.emitter;
+                let history = async {
+                    if query.is_none() {
+                        let detail = self
+                            .http_client
+                            .request_order_status_report_with_type(
+                                report.account_id,
+                                report.instrument_id,
+                                None,
+                                Some(report.venue_order_id),
+                                Some(&|report| {
+                                    observation_emitter.send_execution_report(report.clone());
+                                }),
+                            )
+                            .await?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("Missing startup order product scope")
+                            })?;
+                        self.emitter
+                            .send_execution_report(ExecutionReport::OrderQueryWithFills(
+                                Box::new(detail.report.clone()),
+                                Vec::new(),
+                            ));
+                        *report = detail.report.clone();
+                        query = Some(detail);
+                    }
+                    request_order_query_fills(
+                        &self.http_client,
+                        report,
+                        query.as_ref().expect("order detail resolved"),
+                        &self.emitter,
+                    )
+                    .await
+                }
+                .await;
+                (report.venue_order_id, query, history)
+            })
+            .buffer_unordered(MAX_CONCURRENT_STARTUP_ORDER_HISTORIES);
+        pin_mut!(histories);
+
+        while let Some((venue_order_id, query, history)) = histories.next().await {
+            if let Some(query) = query {
+                fill_queries.insert(venue_order_id, query);
+            }
+
+            match history {
+                Ok(fills) => fill_reports.extend(fills),
+                Err(e) => {
+                    if let Some(incomplete) = e.downcast_ref::<IncompleteOrderFill>() {
+                        self.emitter
+                            .send_execution_report(ExecutionReport::IncompleteFill(Box::new(
+                                incomplete.0.clone(),
+                            )));
+                    }
+
+                    fills_complete = false;
+                    log::warn!(
+                        "Startup order {venue_order_id} requires complete fill history: {e}"
+                    );
+                }
+            }
+        }
+        (fill_reports, fills_complete)
     }
 
     async fn collect_position_status_reports(
@@ -1775,7 +1857,7 @@ impl ExecutionClient for OKXExecutionClient {
         );
         self.spawn_task("query_order", async move {
             let mut reports = Vec::with_capacity(1);
-            let mut fill_types = AHashMap::new();
+            let mut fill_queries = AHashMap::new();
             let mut query_algo = matches!(
                 route,
                 QueryOrderRoute::Algo | QueryOrderRoute::RegularAndAlgo
@@ -1813,9 +1895,9 @@ impl ExecutionClient for OKXExecutionClient {
                         .await;
 
                     match result {
-                        Ok(Some((report, instrument_type))) => {
-                            fill_types.insert(report.venue_order_id, instrument_type);
-                            reports.push(report);
+                        Ok(Some(query)) => {
+                            reports.push(query.report.clone());
+                            fill_queries.insert(query.report.venue_order_id, query);
                         }
                         Ok(None) => {
                             query_algo |= route == QueryOrderRoute::RegularThenAlgo;
@@ -1895,9 +1977,9 @@ impl ExecutionClient for OKXExecutionClient {
                         )
                         .await
                     {
-                        Ok(Some((child_report, instrument_type))) => {
-                            fill_types.insert(child_report.venue_order_id, instrument_type);
-                            merge_order_status_reports(&mut reports, vec![child_report]);
+                        Ok(Some(query)) => {
+                            merge_order_status_reports(&mut reports, vec![query.report.clone()]);
+                            fill_queries.insert(query.report.venue_order_id, query);
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -1934,10 +2016,14 @@ impl ExecutionClient for OKXExecutionClient {
                         expected_order_side.is_none_or(|side| report.order_side == Some(side)),
                         ConflictingFillEvidence("Order query side conflicts with the cached order")
                     );
-                    let instrument_type = *fill_types
+                    let query = fill_queries
                         .get(&report.venue_order_id)
                         .ok_or_else(|| anyhow::anyhow!("Missing regular order product scope"))?;
-                    request_order_query_fills(&http_client, &report, instrument_type, &emitter).await
+                    anyhow::ensure!(
+                        query.report.client_order_id == report.client_order_id,
+                        ConflictingFillEvidence("Order query parent identity conflicts with its child")
+                    );
+                    request_order_query_fills(&http_client, &report, query, &emitter).await
                 }.await;
 
                 match result {
@@ -2069,7 +2155,7 @@ impl ExecutionClient for OKXExecutionClient {
         Some(ExecutionReportTask::new(
             async move {
                 client
-                    .collect_fill_reports(command, FillHistory::Recent, None)
+                    .collect_fill_reports(command, FillHistory::Recent, None, &mut AHashMap::new())
                     .await
             },
             |(reports, _)| Ok(reports),
@@ -2112,7 +2198,7 @@ impl ExecutionClient for OKXExecutionClient {
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
         Ok(self
-            .collect_fill_reports(cmd, FillHistory::Recent, false, None)
+            .collect_fill_reports(cmd, FillHistory::Recent, None, false, &mut AHashMap::new())
             .await?
             .0)
     }
@@ -2162,100 +2248,78 @@ impl ExecutionClient for OKXExecutionClient {
             .build()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let (
-            order_sweep,
-            (mut fill_reports, mut fills_complete),
-            (mut position_reports, positions_complete),
-        ) = tokio::try_join!(
+        let (order_sweep, (mut position_reports, positions_complete)) = tokio::try_join!(
             self.collect_order_status_reports(
                 &order_cmd,
                 true,
-                self.config.max_reconciliation_history_pages,
-            ),
-            self.collect_fill_reports(
-                fill_cmd,
-                fill_history,
-                true,
-                self.config.max_reconciliation_history_pages,
+                self.config.max_reconciliation_history_pages
             ),
             self.collect_position_status_reports(&position_cmd),
         )?;
+        let mut fill_reports = Vec::new();
+        let mut fills_complete = true;
         let OrderReportSweep {
             fallback_parents: _,
             reports: mut order_reports,
             complete: mut orders_complete,
             ambiguous_triggered_child_ids,
             regular_by_venue_order_id,
-            mut fill_types,
+            mut fill_queries,
         } = order_sweep;
         orders_complete &= self
             .recover_triggered_child_order_reports(
                 &mut order_reports,
                 &ambiguous_triggered_child_ids,
                 &regular_by_venue_order_id,
-                &mut fill_types,
+                &mut fill_queries,
             )
             .await;
 
         // Complete every regular order history before the manager globally sorts fills.
-        // Runtime query responses must not project startup trades in HTTP completion order.
-        let observation_emitter = self.emitter.clone();
-
-        for report in &mut order_reports {
-            if report.filled_qty.is_zero() || self.http_client.is_spread(report.instrument_id) {
-                continue;
-            }
-            let history = async {
-                let instrument_type = if let Some(instrument_type) =
-                    fill_types.get(&report.venue_order_id)
-                {
-                    *instrument_type
-                } else {
-                    let (current_report, instrument_type) = self
-                        .http_client
-                        .request_order_status_report_with_type(
-                            report.account_id,
-                            report.instrument_id,
-                            None,
-                            Some(report.venue_order_id),
-                            Some(&|report| {
-                                observation_emitter.send_execution_report(report.clone());
-                            }),
-                        )
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("Missing startup order product scope"))?;
-                    self.emitter
-                        .send_execution_report(ExecutionReport::OrderQueryWithFills(
-                            Box::new(current_report.clone()),
-                            Vec::new(),
-                        ));
-                    *report = current_report;
-                    instrument_type
-                };
-                request_order_query_fills(&self.http_client, report, instrument_type, &self.emitter)
-                    .await
-            }
+        // Independent requests retain observed facts even if startup is canceled.
+        let (recovered_fills, recovered_complete) = self
+            .recover_order_fill_histories(&mut order_reports, &mut fill_queries)
             .await;
-            // Do not mix a bounded account sweep with a full order history.
-            fill_reports.retain(|fill| fill.venue_order_id != report.venue_order_id);
-            match history {
-                Ok(fills) => fill_reports.extend(fills),
-                Err(e) => {
-                    if let Some(incomplete) = e.downcast_ref::<IncompleteOrderFill>() {
-                        self.emitter
-                            .send_execution_report(ExecutionReport::IncompleteFill(Box::new(
-                                incomplete.0.clone(),
-                            )));
-                    }
+        fill_reports.extend(recovered_fills);
+        fills_complete &= recovered_complete;
 
-                    fills_complete = false;
-                    log::warn!(
-                        "Startup order {} requires complete fill history: {e}",
-                        report.venue_order_id
-                    );
-                }
-            }
-        }
+        // Resolve wire child identities before retaining account-wide evidence.
+        // Preserve every observed fact, but use only complete per-order histories
+        // in the mass status for orders that were individually recovered.
+        let (account_fills, account_fills_complete) = self
+            .collect_fill_reports(
+                fill_cmd,
+                fill_history,
+                self.config.max_reconciliation_history_pages,
+                true,
+                &mut fill_queries,
+            )
+            .await?;
+        fills_complete &= account_fills_complete;
+
+        // Account history can discover orders absent from the order sweeps. Their
+        // authenticated detail is evidence, so obtain a complete per-order history
+        // before projecting the cumulative status or accepting the account-wide fills.
+        let mut discovered_reports: Vec<_> = fill_queries
+            .values()
+            .filter(|query| {
+                !order_reports
+                    .iter()
+                    .any(|report| report.venue_order_id == query.report.venue_order_id)
+            })
+            .map(|query| query.report.clone())
+            .collect();
+        let (discovered_fills, discovered_complete) = self
+            .recover_order_fill_histories(&mut discovered_reports, &mut fill_queries)
+            .await;
+        fills_complete &= discovered_complete;
+        fill_reports.extend(discovered_fills);
+        order_reports.extend(discovered_reports);
+        fill_reports.extend(account_fills.into_iter().filter(|fill| {
+            !order_reports.iter().any(|report| {
+                report.venue_order_id == fill.venue_order_id && report.filled_qty.is_positive()
+            })
+        }));
 
         if positions_complete {
             self.add_flat_derivative_position_reports(
@@ -2807,15 +2871,17 @@ impl ExecutionClient for OKXExecutionClient {
 }
 
 const MAX_TRIGGERED_CHILD_RECOVERIES: usize = 100;
+const MAX_CONCURRENT_STARTUP_ORDER_HISTORIES: usize = 4;
 
 async fn request_order_query_fills(
     http_client: &OKXHttpClient,
     report: &OrderStatusReport,
-    instrument_type: OKXInstrumentType,
+    query: &OrderQueryReport,
     emitter: &ExecutionEventEmitter,
 ) -> anyhow::Result<Vec<FillReport>> {
     let mut recent = Vec::new();
-    let observe_fill = |fill: &FillReport| -> anyhow::Result<()> {
+    let observe_fill = |fill: &mut FillReport| -> anyhow::Result<()> {
+        query.normalize_fill(fill)?;
         anyhow::ensure!(
             fill.account_id == report.account_id
                 && fill.instrument_id == report.instrument_id
@@ -2841,7 +2907,7 @@ async fn request_order_query_fills(
         let sweep = http_client
             .request_fill_reports_scoped(
                 report.account_id,
-                Some(instrument_type),
+                Some(query.instrument_type),
                 Some(report.instrument_id),
                 Some(report.venue_order_id),
                 None,
@@ -2851,6 +2917,8 @@ async fn request_order_query_fills(
                 None,
                 None,
                 Some(&observe_fill),
+                None,
+                None,
             )
             .await?;
         let mut fills = sweep.reports;
@@ -2925,7 +2993,7 @@ struct OrderReportSweep {
     complete: bool,
     ambiguous_triggered_child_ids: AHashSet<VenueOrderId>,
     regular_by_venue_order_id: AHashMap<VenueOrderId, OrderStatusReport>,
-    fill_types: AHashMap<VenueOrderId, OKXInstrumentType>,
+    fill_queries: AHashMap<VenueOrderId, OrderQueryReport>,
 }
 
 impl OKXExecutionClient {
@@ -3109,7 +3177,7 @@ impl OKXExecutionClient {
         reports: &mut Vec<OrderStatusReport>,
         ambiguous_triggered_child_ids: &AHashSet<VenueOrderId>,
         regular_by_venue_order_id: &AHashMap<VenueOrderId, OrderStatusReport>,
-        fill_types: &mut AHashMap<VenueOrderId, OKXInstrumentType>,
+        fill_queries: &mut AHashMap<VenueOrderId, OrderQueryReport>,
     ) -> bool {
         let mut fallback_parents = AHashMap::new();
         let mut client = self.report_client();
@@ -3120,7 +3188,7 @@ impl OKXExecutionClient {
                 ambiguous_triggered_child_ids,
                 regular_by_venue_order_id,
                 &mut fallback_parents,
-                fill_types,
+                fill_queries,
             )
             .await;
         retain_external_regular_order_fallbacks(&self.core, reports, &fallback_parents);
@@ -3234,7 +3302,7 @@ impl OKXReportClient {
                         }),
                     )
                     .await
-                    .map(|result| result.map(|(report, _)| report));
+                    .map(|result| result.map(|query| query.report));
 
                 match result {
                     Ok(Some(report)) => reports.push(report),
@@ -3526,7 +3594,7 @@ impl OKXReportClient {
         }
 
         let mut fallback_parents = AHashMap::new();
-        let mut fill_types = AHashMap::new();
+        let mut fill_queries = AHashMap::new();
 
         if cmd.open_only {
             complete &= self
@@ -3535,7 +3603,7 @@ impl OKXReportClient {
                     &ambiguous_triggered_child_ids,
                     &regular_by_venue_order_id,
                     &mut fallback_parents,
-                    &mut fill_types,
+                    &mut fill_queries,
                 )
                 .await;
         }
@@ -3546,7 +3614,7 @@ impl OKXReportClient {
             complete,
             ambiguous_triggered_child_ids,
             regular_by_venue_order_id,
-            fill_types,
+            fill_queries,
         })
     }
 
@@ -3555,6 +3623,7 @@ impl OKXReportClient {
         cmd: GenerateFillReports,
         history: FillHistory,
         max_history_pages: Option<u32>,
+        fill_queries: &mut AHashMap<VenueOrderId, OrderQueryReport>,
     ) -> anyhow::Result<(Vec<FillReport>, bool)> {
         let instrument_types = Self::instrument_types(&self.instrument_types);
         let routing_types = order_routing_instrument_types(&instrument_types);
@@ -3563,7 +3632,13 @@ impl OKXReportClient {
         let end_dt = nanos_to_datetime(cmd.end);
         let mut reports = Vec::new();
         let mut complete = true;
-        let observe_fill = |fill: &FillReport| -> anyhow::Result<()> {
+
+        let observe_order = |report: &ExecutionReport| {
+            // Authenticated detail may add uncertainty even when the caller only asked for fills.
+            self.incomplete_emitter
+                .send_execution_report(report.clone());
+        };
+        let observe_fill = |fill: &mut FillReport| -> anyhow::Result<()> {
             if let Some(emitter) = &self.evidence_emitter {
                 emitter
                     .send_execution_report(ExecutionReport::FillEvidence(Box::new(fill.clone())));
@@ -3586,6 +3661,8 @@ impl OKXReportClient {
                     Some(scope),
                     max_history_pages,
                     Some(&observe_fill),
+                    Some(fill_queries),
+                    Some(&observe_order),
                 )
                 .await?;
             reports.extend(sweep.reports);
@@ -3606,6 +3683,8 @@ impl OKXReportClient {
                         Some(scope),
                         max_history_pages,
                         Some(&observe_fill),
+                        Some(fill_queries),
+                        Some(&observe_order),
                     )
                     .await?;
                 reports.extend(sweep.reports);
@@ -3627,6 +3706,8 @@ impl OKXReportClient {
                         Some(scope),
                         max_history_pages,
                         Some(&observe_fill),
+                        Some(fill_queries),
+                        Some(&observe_order),
                     )
                     .await?;
                 reports.extend(sweep.reports);
@@ -3710,7 +3791,7 @@ impl OKXReportClient {
         ambiguous_triggered_child_ids: &AHashSet<VenueOrderId>,
         regular_by_venue_order_id: &AHashMap<VenueOrderId, OrderStatusReport>,
         fallback_parents: &mut AHashMap<usize, OrderStatusReport>,
-        fill_types: &mut AHashMap<VenueOrderId, OKXInstrumentType>,
+        fill_queries: &mut AHashMap<VenueOrderId, OrderQueryReport>,
     ) -> bool {
         let mut recovered = Vec::with_capacity(reports.len());
         let recovery_candidate_count = reports
@@ -3778,8 +3859,30 @@ impl OKXReportClient {
                 )
                 .await
             {
-                Ok(Some((mut child_report, instrument_type))) => {
-                    fill_types.insert(child_report.venue_order_id, instrument_type);
+                Ok(Some(mut query)) => {
+                    let child_report = &mut query.report;
+                    if query
+                        .algo_client_order_id
+                        .is_some_and(|id| Some(id) != parent_report.client_order_id)
+                        || child_report.account_id != parent_report.account_id
+                        || child_report.instrument_id != parent_report.instrument_id
+                        || child_report.venue_order_id != parent_report.venue_order_id
+                        || child_report.order_side != parent_report.order_side
+                        || child_report.venue_position_id != parent_report.venue_position_id
+                    {
+                        self.incomplete_emitter.send_execution_report(
+                            ExecutionReport::OrderFillConflict(Box::new(parent_report.clone())),
+                        );
+                        self.push_external_regular_order_fallback(
+                            &parent_report,
+                            regular_by_venue_order_id,
+                            &mut recovered,
+                            fallback_parents,
+                        );
+                        complete = false;
+                        continue;
+                    }
+
                     if child_report.order_status == OrderStatus::Accepted {
                         parent_report.quantity = child_report.quantity;
                         parent_report.price = child_report.price.or(parent_report.price);
@@ -3788,9 +3891,10 @@ impl OKXReportClient {
                         recovered.push(parent_report);
                     } else {
                         child_report.client_order_id = parent_report.client_order_id;
-                        self.retain_order_observations(std::slice::from_ref(&child_report));
-                        recovered.push(child_report);
+                        self.retain_order_observations(std::slice::from_ref(child_report));
+                        recovered.push(child_report.clone());
                     }
+                    fill_queries.insert(query.report.venue_order_id, query);
                 }
                 Ok(None) => {
                     log::warn!(
