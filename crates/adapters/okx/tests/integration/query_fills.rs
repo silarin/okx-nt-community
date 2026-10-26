@@ -872,6 +872,129 @@ async fn test_order_query_preserves_authoritative_fills_and_fees() {
 }
 
 #[rstest]
+#[case::canceled_stream(false, true)]
+#[case::expired_stream(true, true)]
+#[case::canceled_query(false, false)]
+#[case::expired_query(true, false)]
+#[tokio::test]
+async fn test_zero_fill_terminal_callbacks_preserve_wire_origin(
+    #[case] expired: bool,
+    #[case] stream: bool,
+) {
+    let (addr, venue, server) = start_venue().await;
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut node = build_node(addr, events.clone(), QuerySource::Direct);
+    let cache = node.kernel().cache.clone();
+    let handle = node.handle();
+    let observed = Rc::new(RefCell::new(0));
+    let captured = observed.clone();
+    let topic = MessagingSwitchboard::reconciliation_raw_order_status_report_topic();
+    let handler = ShareableMessageHandler::from_typed(move |report: &OrderStatusReport| {
+        if report.client_order_id == Some(ClientOrderId::from(CID)) {
+            *captured.borrow_mut() += 1;
+        }
+    });
+    msgbus::subscribe_any(topic.into(), handler.clone(), None);
+    let driver = async {
+        wait_until(|| {
+            cache
+                .borrow()
+                .order(&ClientOrderId::from(CID))
+                .is_some_and(|order| {
+                    matches!(
+                        order.status(),
+                        OrderStatus::Submitted | OrderStatus::Accepted
+                    )
+                })
+        })
+        .await;
+        let submitted_ms = cached(&cache).ts_submitted().unwrap().as_u64() / 1_000_000;
+        venue
+            .updates
+            .send(wire_order("live", "0", "0", "", "0", "0", submitted_ms))
+            .unwrap();
+        wait_until(|| cached(&cache).status() == OrderStatus::Accepted).await;
+
+        let mut frame = wire_order("canceled", "0", "0", "", "0", "0", submitted_ms);
+        frame["data"][0]["avgPx"] = json!("");
+        frame["data"][0]["fillPx"] = json!("");
+        frame["data"][0]["cancelSource"] = json!(if expired { "5" } else { "" });
+        *venue.report.lock().await = json!({"code":"0","msg":"","data":frame["data"]});
+        let expected = if expired {
+            OrderStatus::Expired
+        } else {
+            OrderStatus::Canceled
+        };
+        let terminal_callbacks = || {
+            events
+                .borrow()
+                .iter()
+                .filter_map(|event| match event {
+                    OrderEventAny::Canceled(event) => {
+                        Some((OrderStatus::Canceled, event.reconciliation))
+                    }
+                    OrderEventAny::Expired(event) => {
+                        Some((OrderStatus::Expired, event.reconciliation))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        if stream {
+            venue.updates.send(frame.clone()).unwrap();
+        } else {
+            query(&cache);
+        }
+        wait_until(|| cached(&cache).status() == expected && !terminal_callbacks().is_empty())
+            .await;
+        assert_eq!(terminal_callbacks(), vec![(expected, !stream)]);
+        let before_duplicate = cached(&cache).events().len();
+        let callbacks_before_duplicate = events.borrow().len();
+
+        if stream {
+            venue.updates.send(frame).unwrap();
+            sentinel(&venue, &cache, submitted_ms + 100).await;
+        } else {
+            let reports_before = *observed.borrow();
+            query(&cache);
+            wait_until(|| *observed.borrow() > reports_before).await;
+        }
+        let reports_before = *observed.borrow();
+        query(&cache);
+        wait_until(|| *observed.borrow() > reports_before).await;
+        sentinel(&venue, &cache, submitted_ms + 200).await;
+
+        assert_eq!(cached(&cache).status(), expected);
+        assert_eq!(cached(&cache).events().len(), before_duplicate);
+        assert_eq!(events.borrow().len(), callbacks_before_duplicate);
+        assert_eq!(terminal_callbacks(), vec![(expected, !stream)]);
+        assert!(cached(&cache).filled_qty().is_zero());
+        assert!(cached(&cache).trade_ids().is_empty());
+        assert!(
+            cache
+                .borrow()
+                .positions(None, None, None, None, None)
+                .is_empty()
+        );
+        assert!(
+            !events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, OrderEventAny::Filled(_)))
+        );
+        handle.stop();
+    };
+    let (result, ()) = tokio::time::timeout(DEADLINE, async { tokio::join!(node.run(), driver) })
+        .await
+        .unwrap();
+    result.unwrap();
+    msgbus::unsubscribe_any(topic.into(), &handler);
+    assert_eq!(venue.submissions.lock().await.len(), 1);
+    server.abort();
+}
+
+#[rstest]
 #[case("live", OrderStatus::Accepted)]
 #[case("canceled", OrderStatus::Canceled)]
 #[tokio::test]

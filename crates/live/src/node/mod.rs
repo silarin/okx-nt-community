@@ -2548,11 +2548,18 @@ impl LiveNode {
                     report.instrument_id,
                     report.client_order_id,
                 );
-                Some(if cumulative {
-                    OrderTerminalEvidence::Report(report.clone())
-                } else {
-                    OrderTerminalEvidence::Status(report.clone())
-                })
+                Some(
+                    if matches!(
+                        event,
+                        ExecutionEvent::Report(ExecutionReport::OrderFillEvidence(..))
+                    ) {
+                        OrderTerminalEvidence::StreamReport(report.clone())
+                    } else if cumulative {
+                        OrderTerminalEvidence::Report(report.clone())
+                    } else {
+                        OrderTerminalEvidence::Status(report.clone())
+                    },
+                )
             }
             _ => None,
         }
@@ -2694,6 +2701,9 @@ impl LiveNode {
                 }
                 OrderTerminalEvidence::Report(report) => {
                     ExecutionEvent::Report(ExecutionReport::OrderQueryWithFills(report, Vec::new()))
+                }
+                OrderTerminalEvidence::StreamReport(report) => {
+                    ExecutionEvent::Report(ExecutionReport::OrderFillEvidence(report, Vec::new()))
                 }
                 OrderTerminalEvidence::Status(report) => {
                     ExecutionEvent::Report(ExecutionReport::Order(report))
@@ -14558,6 +14568,111 @@ mod tests {
             .borrow_mut()
             .purge_closed_orders(1_000_000_000.into(), 0);
         assert!(node.exec_manager.unresolved_query_fill_ids().is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_terminal_report_preserves_origin_after_admission(
+        #[values(false, true)] stream: bool,
+        #[values(false, true)] missing_fills: bool,
+        #[values(false, true)] external: bool,
+        #[values(OrderStatus::Canceled, OrderStatus::Expired)] status: OrderStatus,
+    ) {
+        let (mut node, order, instrument) =
+            venue_evidence_node(SubmissionRecoveryPolicy::RetainUnresolved);
+        let id = if external {
+            node.register_external_order_claims(order.strategy_id(), &[instrument.id()])
+                .unwrap();
+            ClientOrderId::from("O-EXTERNAL-ORIGIN")
+        } else {
+            order.client_order_id()
+        };
+        let account = AccountId::from("TEST-001");
+        let venue = VenueOrderId::from("V-TERMINAL-ORIGIN");
+
+        if !external {
+            node.process_exec_event(ExecutionEvent::Order(TestOrderEventStubs::accepted(
+                &order, account, venue,
+            )));
+        }
+        let report = OrderStatusReport::new(
+            account,
+            instrument.id(),
+            Some(id),
+            venue,
+            Some(order.order_side()),
+            order.order_type(),
+            order.time_in_force(),
+            status,
+            order.quantity(),
+            Quantity::from(if missing_fills { "0.400" } else { "0.000" }),
+            1.into(),
+            20.into(),
+            30.into(),
+            None,
+        )
+        .with_price(order.price().unwrap())
+        .with_avg_px(dec!(100));
+        let observed = if stream {
+            ExecutionReport::OrderFillEvidence(Box::new(report.clone()), Vec::new())
+        } else {
+            ExecutionReport::OrderQueryWithFills(Box::new(report.clone()), Vec::new())
+        };
+        node.process_exec_event(ExecutionEvent::Report(observed.clone()));
+        if missing_fills {
+            assert!(!node.kernel.cache.borrow().order(&id).unwrap().is_closed());
+            assert!(
+                node.kernel
+                    .cache
+                    .borrow()
+                    .has_pending_order_executions(order.strategy_id(), Some(instrument.id()),)
+            );
+            let fill = FillReport::new(
+                account,
+                instrument.id(),
+                venue,
+                TradeId::from("T-TERMINAL-ORIGIN"),
+                order.order_side(),
+                Quantity::from("0.400"),
+                order.price().unwrap(),
+                Money::from("0 USDT"),
+                LiquiditySide::Taker,
+                Some(id),
+                None,
+                10.into(),
+                30.into(),
+                None,
+            );
+            node.process_exec_event(ExecutionEvent::Report(
+                ExecutionReport::OrderQueryWithFills(Box::new(report.clone()), vec![fill]),
+            ));
+        }
+        // Duplicate stream observations and later queries cannot repeat the callback
+        node.process_exec_event(ExecutionEvent::Report(observed));
+        node.process_exec_event(ExecutionEvent::Report(
+            ExecutionReport::OrderQueryWithFills(Box::new(report), Vec::new()),
+        ));
+        let cached = node.kernel.cache.borrow().order_owned(&id).unwrap();
+        assert_eq!(cached.status(), status);
+        let origins: Vec<_> = cached
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                OrderEventAny::Canceled(event) => Some(event.reconciliation),
+                OrderEventAny::Expired(event) => Some(event.reconciliation),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cached.ts_submitted().is_some(), !external);
+        assert_eq!(origins, vec![!stream || external]);
+        assert!(node.exec_manager.unresolved_query_fill_ids().is_empty());
+        assert!(
+            !node
+                .kernel
+                .cache
+                .borrow()
+                .has_pending_order_executions(order.strategy_id(), Some(instrument.id()),)
+        );
     }
 
     #[rstest]

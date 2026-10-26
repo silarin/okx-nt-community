@@ -36,6 +36,9 @@ pub enum OrderTerminalEvidence {
     Report(Box<OrderStatusReport>),
     /// A status delta whose quantities do not establish cumulative execution evidence.
     Status(Box<OrderStatusReport>),
+    /// A cumulative execution snapshot observed on the live venue stream.
+    /// Retains stream provenance while sharing every cumulative admission constraint.
+    StreamReport(Box<OrderStatusReport>),
 }
 
 impl OrderTerminalEvidence {
@@ -44,6 +47,7 @@ impl OrderTerminalEvidence {
     pub fn same_observation(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Report(left), Self::Report(right))
+            | (Self::StreamReport(left), Self::StreamReport(right))
             | (Self::Status(left), Self::Status(right)) => {
                 let mut right = right.clone();
                 right.report_id = left.report_id;
@@ -86,7 +90,7 @@ impl OrderTerminalEvidence {
             Self::Rejected(event) => Some(OrderEventAny::Rejected(event.clone())),
             Self::Denied(event) => Some(OrderEventAny::Denied(event.clone())),
             Self::Expired(event) => Some(OrderEventAny::Expired(*event)),
-            Self::Report(_) | Self::Status(_) => None,
+            Self::Report(_) | Self::StreamReport(_) | Self::Status(_) => None,
         }
     }
 
@@ -98,7 +102,9 @@ impl OrderTerminalEvidence {
             Self::Expired(event) => Some(event.client_order_id),
             Self::Rejected(event) => Some(event.client_order_id),
             Self::Denied(event) => Some(event.client_order_id),
-            Self::Report(report) | Self::Status(report) => report.client_order_id,
+            Self::Report(report) | Self::StreamReport(report) | Self::Status(report) => {
+                report.client_order_id
+            }
         }
     }
 
@@ -110,7 +116,9 @@ impl OrderTerminalEvidence {
             Self::Expired(event) => event.venue_order_id,
             Self::Rejected(_) => None,
             Self::Denied(_) => None,
-            Self::Report(report) | Self::Status(report) => Some(report.venue_order_id),
+            Self::Report(report) | Self::StreamReport(report) | Self::Status(report) => {
+                Some(report.venue_order_id)
+            }
         }
     }
 
@@ -128,7 +136,7 @@ impl OrderTerminalEvidence {
                 event.instrument_id,
                 event.venue_order_id?,
             )),
-            Self::Report(report) | Self::Status(report) => Some((
+            Self::Report(report) | Self::StreamReport(report) | Self::Status(report) => Some((
                 report.account_id,
                 report.instrument_id,
                 report.venue_order_id,
@@ -145,7 +153,9 @@ impl OrderTerminalEvidence {
             Self::Expired(event) => event.ts_event,
             Self::Rejected(event) => event.ts_event,
             Self::Denied(event) => event.ts_event,
-            Self::Report(report) | Self::Status(report) => report.ts_last,
+            Self::Report(report) | Self::StreamReport(report) | Self::Status(report) => {
+                report.ts_last
+            }
         }
     }
 
@@ -163,7 +173,7 @@ impl OrderTerminalEvidence {
         }
 
         match self {
-            Self::Report(report) | Self::Status(report) => {
+            Self::Report(report) | Self::StreamReport(report) | Self::Status(report) => {
                 report.order_status.is_closed()
                     && report.instrument_id == order.instrument_id()
                     && order
@@ -193,7 +203,7 @@ impl OrderTerminalEvidence {
         &self,
         fills: impl IntoIterator<Item = &'a FillReport>,
     ) -> bool {
-        let Self::Report(report) = self else {
+        let (Self::Report(report) | Self::StreamReport(report)) = self else {
             return false;
         };
         self.executions_exceed(
@@ -223,7 +233,7 @@ impl OrderTerminalEvidence {
         &self,
         fills: impl IntoIterator<Item = (TradeId, Quantity, UnixNanos)>,
     ) -> bool {
-        let Self::Report(report) = self else {
+        let (Self::Report(report) | Self::StreamReport(report)) = self else {
             return false;
         };
         let mut seen = std::collections::HashSet::new();
@@ -243,7 +253,7 @@ impl OrderTerminalEvidence {
     /// Checks cumulative execution chronology against another authentic snapshot.
     #[must_use]
     pub fn conflicts_with_report(&self, other: &OrderStatusReport) -> bool {
-        let Self::Report(report) = self else {
+        let (Self::Report(report) | Self::StreamReport(report)) = self else {
             return false;
         };
         report.account_id == other.account_id
@@ -325,6 +335,22 @@ mod tests {
     }
 
     #[rstest]
+    fn terminal_stream_origin_roundtrips_without_becoming_query_evidence() {
+        let report = report();
+        let original = OrderTerminalEvidence::StreamReport(Box::new(report.clone()));
+        let encoded = serde_json::to_string(&original).unwrap();
+        let restored: OrderTerminalEvidence = serde_json::from_str(&encoded).unwrap();
+        assert!(original.same_observation(&restored));
+        assert!(
+            !original.same_observation(&OrderTerminalEvidence::Report(Box::new(report.clone())))
+        );
+        let mut contradictory = report;
+        contradictory.ts_last = 10.into();
+        contradictory.filled_qty = Quantity::from("0.500");
+        assert!(restored.conflicts_with_report(&contradictory));
+    }
+
+    #[rstest]
     fn terminal_observation_dedup_preserves_venue_facts() {
         let original = report();
         let evidence = OrderTerminalEvidence::Report(Box::new(original.clone()));
@@ -350,6 +376,7 @@ mod tests {
     fn terminal_snapshot_checks_exact_execution_boundary(
         #[case] time: u64,
         #[case] conflict: bool,
+        #[values(false, true)] stream: bool,
     ) {
         let report = report();
         let fill = FillReport::new(
@@ -368,7 +395,11 @@ mod tests {
             30.into(),
             None,
         );
-        let evidence = OrderTerminalEvidence::Report(Box::new(report));
+        let evidence = if stream {
+            OrderTerminalEvidence::StreamReport(Box::new(report))
+        } else {
+            OrderTerminalEvidence::Report(Box::new(report))
+        };
         assert_eq!(evidence.conflicts_with_fills([&fill]), conflict);
         let mut other = fill;
         other.venue_order_id = VenueOrderId::from("V-OTHER");

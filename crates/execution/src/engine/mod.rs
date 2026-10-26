@@ -106,6 +106,13 @@ use crate::{
     },
 };
 
+#[derive(Clone, Copy, Debug)]
+enum OrderReportOrigin {
+    Snapshot,
+    Query,
+    Stream,
+}
+
 const TIMER_SNAPSHOT_POSITIONS: &str = "ExecEngine_SNAPSHOT_POSITIONS";
 const TIMER_PURGE_CLOSED_ORDERS: &str = "ExecEngine_PURGE_CLOSED_ORDERS";
 const TIMER_PURGE_CLOSED_POSITIONS: &str = "ExecEngine_PURGE_CLOSED_POSITIONS";
@@ -1131,12 +1138,12 @@ impl ExecutionEngine {
                 self.reconcile_order_with_fills(order_report, fills);
             }
             ExecutionReport::OrderQueryWithFills(order_report, fills) => {
-                self.handle_order_with_fills(order_report, fills, false, false);
+                self.handle_order_with_fills(order_report, fills, OrderReportOrigin::Query, false);
             }
             ExecutionReport::OrderFillEvidence(report, _) => {
                 // Companion trades constrain recovery but never apply fills through this
                 // route. Native status projection requires already committed quantity.
-                self.handle_order_with_fills(report, &[], false, false);
+                self.handle_order_with_fills(report, &[], OrderReportOrigin::Stream, false);
             }
             ExecutionReport::OrderFillConflict(report) => {
                 msgbus::publish_any(
@@ -1176,7 +1183,7 @@ impl ExecutionEngine {
             report.instrument_id,
             report.client_order_id,
         ) {
-            self.handle_order_with_fills(report, &[], false, false);
+            self.handle_order_with_fills(report, &[], OrderReportOrigin::Query, false);
             return;
         }
 
@@ -1799,7 +1806,7 @@ impl ExecutionEngine {
     /// Adapters use this to emit ADL / liquidation / settlement events without
     /// losing real fill metadata.
     pub fn reconcile_order_with_fills(&mut self, report: &OrderStatusReport, fills: &[FillReport]) {
-        self.handle_order_with_fills(report, fills, true, false);
+        self.handle_order_with_fills(report, fills, OrderReportOrigin::Snapshot, false);
     }
 
     /// Applies authoritative query executions while retaining terminal admission in the host.
@@ -1809,17 +1816,17 @@ impl ExecutionEngine {
         report: &OrderStatusReport,
         fills: &[FillReport],
     ) {
-        self.handle_order_with_fills(report, fills, false, true);
+        self.handle_order_with_fills(report, fills, OrderReportOrigin::Query, true);
     }
 
     fn handle_order_with_fills(
         &mut self,
         report: &OrderStatusReport,
         fills: &[FillReport],
-        is_snapshot: bool,
+        origin: OrderReportOrigin,
         defer_terminal: bool,
     ) {
-        let is_snapshot = is_snapshot
+        let is_snapshot = matches!(origin, OrderReportOrigin::Snapshot)
             && !self.requires_order_query_fills(
                 report.account_id,
                 report.instrument_id,
@@ -1878,8 +1885,19 @@ impl ExecutionEngine {
                     self.clock.borrow().timestamp_ns(),
                 );
 
-                for event in &events {
-                    self.handle_event(event);
+                for mut event in events {
+                    // Only terminal callbacks inherit stream provenance after native
+                    // quantity and identity admission for natively submitted orders.
+                    // Reconstructed external orders and inferred acceptance stay reconciliation.
+                    if matches!(origin, OrderReportOrigin::Stream) && order.ts_submitted().is_some()
+                    {
+                        match &mut event {
+                            OrderEventAny::Canceled(event) => event.reconciliation = false,
+                            OrderEventAny::Expired(event) => event.reconciliation = false,
+                            _ => {}
+                        }
+                    }
+                    self.handle_event(&event);
                 }
             }
             return;
