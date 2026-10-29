@@ -1176,6 +1176,37 @@ impl Trader {
         stop_component(&component_id)
     }
 
+    /// Checks that registered strategies have completed shutdown without faulting.
+    ///
+    /// Call at the shutdown grace boundary, before disconnecting clients. Never-started
+    /// and disposed strategies are accepted; a pending managed exit is incomplete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any strategy is active, stopping, or faulted.
+    pub fn check_strategy_stops(&self) -> anyhow::Result<()> {
+        let mut incomplete = Vec::new();
+
+        for strategy_id in &self.strategy_ids {
+            let state = component_state(&strategy_id.inner())?;
+            if !matches!(
+                state,
+                ComponentState::PreInitialized
+                    | ComponentState::Ready
+                    | ComponentState::Stopped
+                    | ComponentState::Disposed
+            ) {
+                incomplete.push(format!("{strategy_id}: {state}"));
+            }
+        }
+        anyhow::ensure!(
+            incomplete.is_empty(),
+            "Strategy shutdown incomplete: {}",
+            incomplete.join(", ")
+        );
+        Ok(())
+    }
+
     /// Resets all registered components.
     ///
     /// # Errors
@@ -2111,6 +2142,8 @@ mod tests {
         time_events: usize,
         strategy_time_events: usize,
         post_market_exits: usize,
+        exit_ready: bool,
+        panic_readiness: bool,
         post_market_exits_on_callback: Option<usize>,
         gtd_timer_active_on_callback: Option<bool>,
     }
@@ -2122,6 +2155,8 @@ mod tests {
                 time_events: 0,
                 strategy_time_events: 0,
                 post_market_exits: 0,
+                exit_ready: true,
+                panic_readiness: false,
                 post_market_exits_on_callback: None,
                 gtd_timer_active_on_callback: None,
             }
@@ -2146,6 +2181,11 @@ mod tests {
     }
 
     nautilus_strategy!(TimerRoutingStrategy, {
+        fn market_exit_ready(&self) -> bool {
+            assert!(!self.panic_readiness, "readiness panic");
+            self.exit_ready
+        }
+
         fn on_time_event(&mut self, _event: &TimeEvent) -> anyhow::Result<()> {
             self.strategy_time_events += 1;
             Ok(())
@@ -3319,6 +3359,69 @@ mod tests {
         assert_eq!(strategy.post_market_exits_on_callback, Some(1));
         assert!(!strategy.is_exiting());
         assert_eq!(strategy.state(), ComponentState::Stopped);
+    }
+
+    #[rstest]
+    #[case::eventually_ready(true, false)]
+    #[case::timed_out(false, false)]
+    #[case::panicked(false, true)]
+    fn native_readiness_retains_timer_and_bounds_shutdown(
+        #[case] becomes_ready: bool,
+        #[case] panic_readiness: bool,
+    ) {
+        let (_msgbus, cache, portfolio, _data_engine, _risk_engine, _exec_engine, clock_factory) =
+            create_trader_components();
+        let mut trader = Trader::new(
+            TraderId::test_default(),
+            UUID4::new(),
+            Environment::Backtest,
+            clock_factory,
+            cache,
+            portfolio,
+        );
+        let strategy_id = StrategyId::from("TimerRouting-001");
+        let mut strategy = TimerRoutingStrategy::new(StrategyConfig {
+            strategy_id: Some(strategy_id),
+            manage_stop: true,
+            market_exit_interval_ms: 1,
+            market_exit_max_attempts: 3,
+            ..Default::default()
+        });
+        strategy.exit_ready = false;
+        strategy.panic_readiness = panic_readiness;
+        trader.add_strategy(strategy).unwrap();
+        trader.start_components().unwrap();
+        trader.stop_components().unwrap();
+        assert!(trader.check_strategy_stops().is_err());
+        let clock = trader.get_component_clocks().into_iter().next().unwrap();
+        assert_eq!(
+            dispatch_component_time_events(&clock, UnixNanos::from(1_000_000)),
+            1
+        );
+        {
+            let mut strategy = get_actor_unchecked::<TimerRoutingStrategy>(&strategy_id.inner());
+            assert!(strategy.is_exiting());
+            assert_eq!(strategy.post_market_exits, 0);
+            strategy.exit_ready = becomes_ready;
+        }
+        dispatch_component_time_events(&clock, UnixNanos::from(3_000_000));
+        let strategy = get_actor_unchecked::<TimerRoutingStrategy>(&strategy_id.inner());
+        assert!(!strategy.is_exiting());
+        assert_eq!(strategy.post_market_exits, usize::from(becomes_ready));
+        assert_eq!(
+            strategy.state(),
+            if becomes_ready {
+                ComponentState::Stopped
+            } else {
+                ComponentState::Faulted
+            }
+        );
+        drop(strategy);
+        assert_eq!(trader.check_strategy_stops().is_ok(), becomes_ready);
+        assert_eq!(
+            dispatch_component_time_events(&clock, UnixNanos::from(10_000_000)),
+            0
+        );
     }
 
     #[rstest]

@@ -592,17 +592,18 @@ pub fn dispatch_ws_message(
                 dispatch_algo_order_message(msg, emitter, state, account_id, instruments, ts_init);
             }
         }
-        OKXWsMessage::Account(data) => {
+        OKXWsMessage::Account { data, update } => {
             let ts_init = clock.get_time_ns();
 
             match serde_json::from_value::<Vec<OKXAccount>>(data) {
                 Ok(accounts) => {
                     for account in &accounts {
-                        match crate::common::parse::parse_account_state(
+                        match crate::common::parse::parse_account_state_with_source(
                             account,
                             account_id,
                             account_type,
                             ts_init,
+                            update.clone(),
                         ) {
                             Ok(account_state) => emitter.send_account_state(account_state),
                             Err(e) => log::error!("Failed to parse account state: {e}"),
@@ -4103,7 +4104,10 @@ mod tests {
         let (emitter, mut receiver) = test_execution_emitter();
 
         dispatch_ws_message(
-            OKXWsMessage::Account(payload["data"].clone()),
+            OKXWsMessage::Account {
+                data: payload["data"].clone(),
+                update: crate::common::account::OKXAccountUpdate::Unknown,
+            },
             &emitter,
             &WsDispatchState::default(),
             AccountId::from("OKX-001"),

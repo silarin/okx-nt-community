@@ -228,7 +228,7 @@ fn load_order_messages(fixture: &str) -> (OKXWebSocketArg, Vec<OKXOrderMsg>) {
         .join(fixture);
     let content = std::fs::read_to_string(path).unwrap();
     let frame: OKXWsFrame = serde_json::from_str(&content).unwrap();
-    let OKXWsFrame::Data { arg, data } = frame else {
+    let OKXWsFrame::Data { arg, data, .. } = frame else {
         panic!("Expected private order data frame");
     };
     let order_msgs = serde_json::from_value(data).unwrap();
@@ -1845,7 +1845,7 @@ fn test_dispatch_positions_channel_emits_position_report() {
     )
     .unwrap();
     let frame: OKXWsFrame = serde_json::from_str(&content).unwrap();
-    let OKXWsFrame::Data { arg, data } = frame else {
+    let OKXWsFrame::Data { arg, data, .. } = frame else {
         panic!("Expected data frame");
     };
     assert_eq!(arg.channel, OKXWsChannel::Positions);
@@ -1901,7 +1901,7 @@ fn test_dispatch_liquidation_warning_logs_only() {
     )
     .unwrap();
     let frame: OKXWsFrame = serde_json::from_str(&content).unwrap();
-    let OKXWsFrame::Data { arg, data } = frame else {
+    let OKXWsFrame::Data { arg, data, .. } = frame else {
         panic!("Expected data frame");
     };
     assert_eq!(arg.channel, OKXWsChannel::LiquidationWarning);
@@ -1968,7 +1968,7 @@ fn test_dispatch_tracked_post_only_cancel_from_fixture(
         .join(fixture);
     let content = std::fs::read_to_string(path).unwrap();
     let frame: OKXWsFrame = serde_json::from_str(&content).unwrap();
-    let OKXWsFrame::Data { arg, data } = frame else {
+    let OKXWsFrame::Data { arg, data, .. } = frame else {
         panic!("Expected private order data frame");
     };
     assert_eq!(arg.channel, OKXWsChannel::Orders);
@@ -2125,7 +2125,7 @@ fn test_dispatch_rpi_canceled_first_emits_rejection_without_acceptance() {
         .join("ws_orders_rpi_canceled_first.json");
     let content = std::fs::read_to_string(path).unwrap();
     let frame: OKXWsFrame = serde_json::from_str(&content).unwrap();
-    let OKXWsFrame::Data { arg, data } = frame else {
+    let OKXWsFrame::Data { arg, data, .. } = frame else {
         panic!("Expected private RPI order data frame");
     };
     let order_msgs: Vec<OKXOrderMsg> = serde_json::from_value(data).unwrap();

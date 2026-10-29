@@ -61,6 +61,7 @@ use super::{
 };
 use crate::{
     common::{
+        account::OKXAccountUpdate,
         consts::{OKX_FIELD_SMSG, OKX_SUCCESS_CODE, should_retry_error_code},
         enums::{OKXOrderStatus, OKXOrderType},
         parse::prefer_rpi_response_fields,
@@ -433,7 +434,11 @@ impl OKXWsFeedHandler {
                                 id, op, code, msg, data,
                             });
                         }
-                        OKXWsFrame::Data { arg, data } => {
+                        OKXWsFrame::Data { arg, data, account_update } => {
+                            if arg.channel == OKXWsChannel::Account {
+                                return Some(OKXWsMessage::Account { data, update: account_update });
+                            }
+
                             if let Some(output) = self.route_data_message(arg, data) {
                                 return Some(output);
                             }
@@ -506,7 +511,10 @@ impl OKXWsFeedHandler {
         } = arg;
 
         match channel {
-            OKXWsChannel::Account => Some(OKXWsMessage::Account(data)),
+            OKXWsChannel::Account => Some(OKXWsMessage::Account {
+                data,
+                update: OKXAccountUpdate::Unknown,
+            }),
             OKXWsChannel::Positions => Some(OKXWsMessage::Positions(data)),
             OKXWsChannel::Orders => {
                 parse_array_items(data, "orders", false).map(OKXWsMessage::Orders)

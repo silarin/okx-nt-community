@@ -942,7 +942,8 @@ impl NautilusKernel {
     ///
     /// # Errors
     ///
-    /// Returns an error if actor or strategy state cannot be saved.
+    /// Returns an error if strategy shutdown is incomplete, component state cannot be saved,
+    /// or streaming data cannot be flushed. Cleanup and flushing are attempted before returning.
     #[allow(unknown_lints)]
     #[expect(
         clippy::unused_async,
@@ -954,6 +955,7 @@ impl NautilusKernel {
 
         // Execution and data clients are stopped by their engines via `stop_engines` below
 
+        let stop_result = self.trader.borrow().check_strategy_stops();
         let save_result = self.save_trader_state();
         self.portfolio.borrow_mut().finalize_equity_curve();
         self.stop_engines();
@@ -967,8 +969,10 @@ impl NautilusKernel {
         }
         self.ts_shutdown = Some(ts_shutdown);
         log::info!("Stopped");
+        let flush_result = self.flush_streaming_writer();
         save_result?;
-        self.flush_streaming_writer()
+        stop_result?;
+        flush_result
     }
 
     /// Saves actor and strategy state at most once for the current trader run.
@@ -2024,6 +2028,30 @@ mod lifecycle_tests {
                 "database.close",
             ]
         );
+    }
+
+    #[rstest]
+    fn finalize_stop_rejects_pending_managed_exit() {
+        use nautilus_trading::strategy::StrategyNative;
+
+        let strategy_id = StrategyId::from("PENDING-EXIT-001");
+        let (database, control) = TestCacheDatabaseControl::create();
+        let mut kernel = NautilusKernelBuilder::default()
+            .with_cache_database(Box::new(database))
+            .build()
+            .unwrap();
+        let mut strategy = StateStrategy::new(strategy_id, control, state("strategy", b"save"));
+        StrategyNative::strategy_core_mut(&mut strategy)
+            .config
+            .manage_stop = true;
+        kernel.trader.borrow_mut().add_strategy(strategy).unwrap();
+        kernel.start();
+        kernel.start_trader().unwrap();
+        kernel.stop_trader();
+        let error = finalize(&mut kernel).unwrap_err();
+        assert!(error.to_string().contains("Strategy shutdown incomplete"));
+        assert!(error.to_string().contains("PENDING-EXIT-001"));
+        kernel.dispose();
     }
 
     #[rstest]

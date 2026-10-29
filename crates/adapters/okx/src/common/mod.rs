@@ -24,10 +24,12 @@
 //! - URL management for different endpoints.
 //! - Shared data models.
 
+pub mod account;
 pub mod consts;
 pub mod credential;
 pub mod enums;
 pub mod failure;
+pub mod fees;
 pub mod models;
 pub mod parse;
 pub mod urls;

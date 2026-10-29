@@ -134,7 +134,7 @@ use crate::{
         models::OKXInstrument,
         parse::{
             extract_inst_family, is_okx_spread_symbol, is_order_status_report_more_advanced,
-            okx_instrument_type, okx_instrument_type_from_symbol, parse_account_state,
+            okx_instrument_type, okx_instrument_type_from_symbol, parse_account_state_with_source,
             parse_base_quote_from_symbol, parse_candlestick, parse_fill_report, parse_funding_rate,
             parse_incomplete_order_fill, parse_index_price_update, parse_instrument_any,
             parse_mark_price_update, parse_millisecond_timestamp, parse_order_fill_observation,
@@ -2171,13 +2171,15 @@ impl OKXRawHttpClient {
         &self,
         params: GetAlgoOrdersParams,
     ) -> Result<Vec<OKXOrderAlgo>, OKXHttpError> {
-        self.send_request(
-            Method::GET,
-            "/api/v5/trade/orders-algo-pending",
-            Some(&params),
-            None,
-            true,
-        )
+        super::algo_visibility::pace_algo_visibility_request(|| {
+            self.send_request(
+                Method::GET,
+                "/api/v5/trade/orders-algo-pending",
+                Some(&params),
+                None,
+                true,
+            )
+        })
         .await
     }
 
@@ -2190,13 +2192,15 @@ impl OKXRawHttpClient {
         &self,
         params: GetAlgoOrdersParams,
     ) -> Result<Vec<OKXOrderAlgo>, OKXHttpError> {
-        self.send_request(
-            Method::GET,
-            "/api/v5/trade/orders-algo-history",
-            Some(&params),
-            None,
-            true,
-        )
+        super::algo_visibility::pace_algo_visibility_request(|| {
+            self.send_request(
+                Method::GET,
+                "/api/v5/trade/orders-algo-history",
+                Some(&params),
+                None,
+                true,
+            )
+        })
         .await
     }
 
@@ -2690,7 +2694,13 @@ impl OKXHttpClient {
         let raw = resp
             .first()
             .ok_or_else(|| anyhow::anyhow!("No account state returned from OKX"))?;
-        let account_state = parse_account_state(raw, account_id, account_type, ts_init)?;
+        let account_state = parse_account_state_with_source(
+            raw,
+            account_id,
+            account_type,
+            ts_init,
+            crate::common::account::OKXAccountUpdate::Rest,
+        )?;
 
         Ok(account_state)
     }
@@ -3866,8 +3876,39 @@ impl OKXHttpClient {
         &self,
         bar_type: BarType,
         start: Option<Timestamp>,
+        end: Option<Timestamp>,
+        limit: Option<u32>,
+    ) -> anyhow::Result<Vec<Bar>> {
+        self.request_bars_inner(bar_type, start, end, limit, false)
+            .await
+    }
+
+    /// Requests only candles explicitly confirmed complete by OKX.
+    ///
+    /// Bounds, ordering and pagination follow [`Self::request_bars`]. The limit counts
+    /// completed candles; unconfirmed rows still advance the pagination cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request or parsing fails, or the confirmation flag is unknown.
+    pub async fn request_completed_bars(
+        &self,
+        bar_type: BarType,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
+        limit: Option<u32>,
+    ) -> anyhow::Result<Vec<Bar>> {
+        self.request_bars_inner(bar_type, start, end, limit, true)
+            .await
+    }
+
+    async fn request_bars_inner(
+        &self,
+        bar_type: BarType,
+        start: Option<Timestamp>,
         mut end: Option<Timestamp>,
         limit: Option<u32>,
+        completed_only: bool,
     ) -> anyhow::Result<Vec<Bar>> {
         const HISTORY_SPLIT_DAYS: i64 = 100;
         const MAX_PAGES_SOFT: usize = 500;
@@ -4039,8 +4080,7 @@ impl OKXHttpClient {
             match mode {
                 Mode::Latest => {
                     if have_latest_first_page && let Some(b) = before_ms {
-                        p.before_ms(b);
-                        req_used_before = true;
+                        p.after_ms(b);
                     }
                 }
                 Mode::Backward => {
@@ -4089,7 +4129,7 @@ impl OKXHttpClient {
                     p2.inst_id(symbol.as_str())
                         .bar(&bar_param)
                         .limit(page_cap as u32);
-                    p2.before_ms(b);
+                    p2.after_ms(b);
                     let params2 = p2.build().map_err(anyhow::Error::new)?;
                     let raw2 = self
                         .inner
@@ -4132,6 +4172,12 @@ impl OKXHttpClient {
 
             pages += 1;
 
+            if completed_only {
+                for candle in &raw {
+                    candle.is_confirmed()?;
+                }
+            }
+
             // Parse, oldest → newest
             let mut page: Vec<Bar> = Vec::with_capacity(raw.len());
             for r in &raw {
@@ -4150,6 +4196,9 @@ impl OKXHttpClient {
             let mut filtered: Vec<Bar> = page
                 .clone()
                 .into_iter()
+                .zip(raw.iter().rev())
+                .filter(|(_, candle)| !completed_only || candle.8 == "1")
+                .map(|(bar, _)| bar)
                 .filter(|b| {
                     let ts = b.ts_event.as_i64();
                     let ok_after = start_ns.is_none_or(|sns| ts >= sns);
@@ -4220,6 +4269,10 @@ impl OKXHttpClient {
                 match mode {
                     Mode::Range => after_ms = page_oldest_ms,
                     Mode::Backward => before_ms = page_oldest_ms,
+                    Mode::Latest if completed_only => {
+                        before_ms = page_oldest_ms.map(|ms| ms.saturating_sub(1));
+                        have_latest_first_page = true;
+                    }
                     Mode::Latest => {
                         if let Some(b) = before_ms {
                             let jump = (page_cap as i64).saturating_mul(slot_ms.max(1));
@@ -4308,6 +4361,10 @@ impl OKXHttpClient {
             if !raw.is_empty() {
                 let mut page: Vec<Bar> = Vec::with_capacity(raw.len());
                 for r in &raw {
+                    if completed_only && !r.is_confirmed()? {
+                        continue;
+                    }
+
                     page.push(parse_historical_candlestick(
                         r,
                         bar_type,

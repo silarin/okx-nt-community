@@ -6241,7 +6241,7 @@ mod tests {
         let frame: OKXWsFrame = serde_json::from_str(&json_data).unwrap();
 
         match frame {
-            OKXWsFrame::Data { arg, data } => {
+            OKXWsFrame::Data { arg, data, .. } => {
                 let orders: Vec<OKXSpreadOrder> = serde_json::from_value(data).unwrap();
 
                 assert_eq!(arg.channel, OKXWsChannel::SprdOrders);

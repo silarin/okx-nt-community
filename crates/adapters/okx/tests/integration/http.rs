@@ -9543,3 +9543,167 @@ async fn test_http_request_instruments_caches_usdc_inst_id_code_and_trade_quote_
         )]
     );
 }
+
+#[rstest]
+#[case::latest(None, None)]
+#[case::backward(None, Some("2024-02-01T00:03:00Z"))]
+#[case::forward(Some("2024-01-31T23:59:59Z"), None)]
+#[case::range(Some("2024-01-31T23:59:59Z"), Some("2024-02-01T00:03:00Z"))]
+#[tokio::test]
+async fn completed_bars_exclude_unconfirmed_rows_and_refill_limit(
+    #[case] start: Option<&str>,
+    #[case] end: Option<&str>,
+) {
+    let open: Timestamp = "2024-02-01T00:00:00Z".parse().unwrap();
+    let template = load_test_data("http_get_candlesticks.json")["data"][0].clone();
+    let candles = (0..3)
+        .map(|index| {
+            let mut candle = template.clone();
+            candle[0] = json!((open.as_millisecond() + index * 60_000).to_string());
+            candle[8] = json!(if index == 2 { "0" } else { "1" });
+            candle
+        })
+        .collect();
+    let addr = start_candlestick_server(candles).await;
+    let client = OKXHttpClient::new(
+        Some(format!("http://{addr}")),
+        5,
+        0,
+        1000,
+        10000,
+        OKXEnvironment::Demo,
+        None,
+    )
+    .unwrap();
+    client.cache_instruments(&load_instruments_any());
+    let bar_type = BarType::from("BTC-USD.OKX-1-MINUTE-LAST-EXTERNAL");
+    let start = start.map(|s| s.parse().unwrap());
+    let end = end.map(|s| s.parse().unwrap());
+    let bars = client
+        .request_completed_bars(bar_type, start, end, Some(2))
+        .await
+        .unwrap();
+    assert_eq!(bars.len(), 2);
+    assert_eq!(bars[0].ts_event, UnixNanos::from(open));
+    assert_eq!(
+        bars[1].ts_event,
+        UnixNanos::from(open + SignedDuration::from_secs(60))
+    );
+    let legacy = client
+        .request_bars(bar_type, start, end, Some(3))
+        .await
+        .unwrap();
+    assert_eq!(legacy.len(), 3);
+}
+
+#[rstest]
+#[case::missing("")]
+#[case::unknown("2")]
+#[tokio::test]
+async fn completed_bars_reject_unknown_confirmation(#[case] confirm: &str) {
+    let mut candle = load_test_data("http_get_candlesticks.json")["data"][0].clone();
+    candle[8] = json!(confirm);
+    let addr = start_candlestick_server(vec![candle]).await;
+    let client = OKXHttpClient::new(
+        Some(format!("http://{addr}")),
+        5,
+        0,
+        1000,
+        10000,
+        OKXEnvironment::Demo,
+        None,
+    )
+    .unwrap();
+    client.cache_instruments(&load_instruments_any());
+    let result = client
+        .request_completed_bars(
+            BarType::from("BTC-USD.OKX-1-MINUTE-LAST-EXTERNAL"),
+            None,
+            None,
+            Some(1),
+        )
+        .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("confirmation flag")
+    );
+}
+
+#[tokio::test]
+async fn completed_bars_fallback_keeps_older_cursor_on_history_endpoint() {
+    let now_ms = Timestamp::now().as_millisecond();
+    let open_ms = now_ms / 60_000 * 60_000 - 180_000;
+    let template = load_test_data("http_get_candlesticks.json")["data"][0].clone();
+    let candles: Vec<_> = (0..3)
+        .map(|index| {
+            let mut candle = template.clone();
+            candle[0] = json!((open_ms + index * 60_000).to_string());
+            candle[8] = json!(if index == 2 { "0" } else { "1" });
+            candle
+        })
+        .collect();
+    let recent = vec![candles[2].clone(), candles[1].clone()];
+    let older = candles[0].clone();
+    let history_calls = Arc::new(AtomicUsize::new(0));
+    let counter = history_calls.clone();
+    let router = Router::new()
+        .route(
+            "/api/v5/market/candles",
+            get(move |Query(params): Query<HashMap<String, String>>| {
+                let recent = recent.clone();
+                async move {
+                    Json(okx_response(&if params.contains_key("after") {
+                        vec![]
+                    } else {
+                        recent
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/api/v5/market/history-candles",
+            get(move |Query(params): Query<HashMap<String, String>>| {
+                let older = older.clone();
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    assert!(!params.contains_key("before"));
+                    assert_eq!(
+                        params.get("after").unwrap().parse::<i64>().unwrap(),
+                        open_ms + 60_000 - 1
+                    );
+                    Json(okx_response(&[older]))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let client = OKXHttpClient::new(
+        Some(format!("http://{addr}")),
+        5,
+        0,
+        1000,
+        10000,
+        OKXEnvironment::Demo,
+        None,
+    )
+    .unwrap();
+    client.cache_instruments(&load_instruments_any());
+    let bars = client
+        .request_completed_bars(
+            BarType::from("BTC-USD.OKX-1-MINUTE-LAST-EXTERNAL"),
+            None,
+            None,
+            Some(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bars.len(), 2);
+    assert_eq!(bars[0].ts_event.as_u64(), open_ms as u64 * 1_000_000);
+    assert_eq!(history_calls.load(Ordering::SeqCst), 1);
+}

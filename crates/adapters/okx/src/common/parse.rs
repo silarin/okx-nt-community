@@ -3055,7 +3055,27 @@ pub fn parse_account_state(
     account_type: AccountType,
     ts_init: UnixNanos,
 ) -> anyhow::Result<AccountState> {
+    parse_account_state_with_source(
+        okx_account,
+        account_id,
+        account_type,
+        ts_init,
+        super::account::OKXAccountUpdate::Unknown,
+    )
+}
+
+pub(crate) fn parse_account_state_with_source(
+    okx_account: &OKXAccount,
+    account_id: AccountId,
+    account_type: AccountType,
+    ts_init: UnixNanos,
+    update: super::account::OKXAccountUpdate,
+) -> anyhow::Result<AccountState> {
     let mut balances = Vec::new();
+    let mut info = super::account::OKXAccountStateInfo {
+        update,
+        ..Default::default()
+    };
 
     for b in &okx_account.details {
         // Skip balances with empty or whitespace-only currency codes
@@ -3078,7 +3098,18 @@ pub fn parse_account_state(
         };
 
         match AccountBalance::from_total_and_free(total, free, currency) {
-            Ok(balance) => balances.push(balance),
+            Ok(balance) => {
+                let ns = b.u_time.checked_mul(1_000_000).ok_or_else(|| {
+                    anyhow::anyhow!("OKX currency update time overflows nanoseconds")
+                })?;
+                anyhow::ensure!(
+                    info.balance_timestamps
+                        .insert(ccy_str.to_string(), UnixNanos::from(ns))
+                        .is_none(),
+                    "OKX account reports duplicate currency balances"
+                );
+                balances.push(balance);
+            }
             Err(e) => {
                 log::warn!("Skipping balance detail for {ccy_str} with invalid total/free: {e}");
             }
@@ -3152,7 +3183,8 @@ pub fn parse_account_state(
         ts_event,
         ts_init,
         None,
-    ))
+    )
+    .with_info(Some(info.into_params())))
 }
 
 /// Converts an optional `UnixNanos` to an optional `Timestamp`.
