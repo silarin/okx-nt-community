@@ -3021,6 +3021,7 @@ impl LiveNode {
         }
         // Capture recovery at the grace-period boundary, before disconnection can queue more
         // evidence. A later drain must not turn incomplete recovery into a successful shutdown.
+        let strategy_stop_result = self.kernel.trader.borrow().check_strategy_stops();
         let mut unresolved_commands = self.exec_manager.unresolved_command_ids();
         let mut unresolved_submissions = self.exec_manager.unresolved_submission_ids();
         let mut unresolved_query_fills = self.exec_manager.unresolved_query_fill_ids();
@@ -3030,6 +3031,9 @@ impl LiveNode {
         let deadline = dst::time::Instant::now() + timeout;
 
         let mut errors = Vec::new();
+        if let Err(e) = strategy_stop_result {
+            errors.push(e.to_string());
+        }
         let (report_result, disconnect_result) = futures_util::join!(
             dst::time::timeout(
                 timeout,

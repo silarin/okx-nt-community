@@ -38,6 +38,7 @@ use zeroize::Zeroize;
 use super::enums::{OKXWsChannel, OKXWsOperation};
 use crate::{
     common::{
+        account::OKXAccountUpdate,
         enums::{
             OKXAlgoOrderStatus, OKXAlgoOrderType, OKXBookAction, OKXCandleConfirm, OKXExecType,
             OKXInstrumentType, OKXMarginMode, OKXOrderCategory, OKXOrderStatus, OKXOrderType,
@@ -141,7 +142,10 @@ pub enum OKXWsMessage {
     /// Algo order push channel updates.
     AlgoOrders(Vec<OKXAlgoOrderMsg>),
     /// Account channel update (raw JSON).
-    Account(serde_json::Value),
+    Account {
+        data: serde_json::Value,
+        update: OKXAccountUpdate,
+    },
     /// Positions channel update (raw JSON).
     Positions(serde_json::Value),
     /// Liquidation risk warnings for account positions.
@@ -292,6 +296,7 @@ pub enum OKXWsFrame {
     Data {
         arg: OKXWebSocketArg,
         data: serde_json::Value,
+        account_update: OKXAccountUpdate,
     },
     Error {
         arg: Option<OKXWebSocketArg>,
@@ -325,6 +330,9 @@ enum OKXWsFrameKey {
     Id,
     Channel,
     ConnCount,
+    EventType,
+    CurPage,
+    LastPage,
     #[serde(other)]
     Other,
 }
@@ -349,6 +357,9 @@ struct OKXWsFrameFields {
     id: Option<Box<RawValue>>,
     channel: Option<Box<RawValue>>,
     conn_count: Option<Box<RawValue>>,
+    event_type: Option<Box<RawValue>>,
+    cur_page: Option<Box<RawValue>>,
+    last_page: Option<Box<RawValue>>,
 }
 
 enum OKXWsFrameData {
@@ -402,6 +413,9 @@ impl<'de> Visitor<'de> for OKXWsFrameVisitor {
                 OKXWsFrameKey::Id => &mut fields.id,
                 OKXWsFrameKey::Channel => &mut fields.channel,
                 OKXWsFrameKey::ConnCount => &mut fields.conn_count,
+                OKXWsFrameKey::EventType => &mut fields.event_type,
+                OKXWsFrameKey::CurPage => &mut fields.cur_page,
+                OKXWsFrameKey::LastPage => &mut fields.last_page,
                 OKXWsFrameKey::Other => {
                     map.next_value::<IgnoredAny>()?;
                     continue;
@@ -606,7 +620,38 @@ fn parse_data<E: serde::de::Error>(mut fields: OKXWsFrameFields) -> Result<OKXWs
         .ok_or_else(|| E::missing_field("data"))?
         .into_value()?;
 
-    Ok(OKXWsFrame::Data { arg, data })
+    let account_update = if arg.channel == OKXWsChannel::Account {
+        match fields
+            .event_type
+            .as_deref()
+            .map(|raw| parse_raw::<String, E>(raw, "eventType"))
+            .transpose()?
+            .as_deref()
+        {
+            Some("snapshot") => OKXAccountUpdate::WebSocketSnapshot {
+                page: fields
+                    .cur_page
+                    .as_deref()
+                    .map(|raw| parse_raw(raw, "curPage"))
+                    .transpose()?,
+                last_page: fields
+                    .last_page
+                    .as_deref()
+                    .map(|raw| parse_raw(raw, "lastPage"))
+                    .transpose()?,
+            },
+            Some("event_update") => OKXAccountUpdate::WebSocketUpdate,
+            _ => OKXAccountUpdate::Unknown,
+        }
+    } else {
+        OKXAccountUpdate::Unknown
+    };
+
+    Ok(OKXWsFrame::Data {
+        arg,
+        data,
+        account_update,
+    })
 }
 
 fn parse_error<E: serde::de::Error>(mut fields: OKXWsFrameFields) -> Result<OKXWsFrame, E> {
@@ -2321,6 +2366,35 @@ mod tests {
     }
 
     #[rstest]
+    #[case::snapshot(Some("snapshot"), true)]
+    #[case::update(Some("event_update"), false)]
+    #[case::legacy(None, false)]
+    fn account_envelope_preserves_update_kind_and_snapshot_page(
+        #[case] event_type: Option<&str>,
+        #[case] snapshot: bool,
+    ) {
+        let mut payload = serde_json::json!({"arg":{"channel":"account"}, "curPage":2, "lastPage":false, "data":[]});
+        if let Some(event_type) = event_type {
+            payload["eventType"] = serde_json::json!(event_type);
+        }
+        let frame: OKXWsFrame = serde_json::from_value(payload).unwrap();
+        let OKXWsFrame::Data { account_update, .. } = frame else {
+            panic!("expected account data");
+        };
+        let expected = if snapshot {
+            OKXAccountUpdate::WebSocketSnapshot {
+                page: Some(2),
+                last_page: Some(false),
+            }
+        } else if event_type.is_some() {
+            OKXAccountUpdate::WebSocketUpdate
+        } else {
+            OKXAccountUpdate::Unknown
+        };
+        assert_eq!(account_update, expected);
+    }
+
+    #[rstest]
     fn test_data_event_parsing() {
         let data_json = r#"{
             "arg": {
@@ -2340,7 +2414,7 @@ mod tests {
         let parsed: OKXWsFrame = serde_json::from_str(data_json).unwrap();
 
         match parsed {
-            OKXWsFrame::Data { arg, data } => {
+            OKXWsFrame::Data { arg, data, .. } => {
                 assert_eq!(arg.channel, OKXWsChannel::Trades);
                 assert_eq!(arg.inst_id, Some(Ustr::from("BTC-USDT")));
                 assert!(data.is_array());

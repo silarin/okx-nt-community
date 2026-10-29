@@ -635,3 +635,89 @@ async fn test_rpi_request_book_snapshot_routes_to_rpi_endpoint() {
     );
     assert_eq!(queries[0].get("sz").map(String::as_str), Some("2"));
 }
+
+#[rstest]
+#[case::completed(true, 1)]
+#[case::legacy(false, 2)]
+#[tokio::test]
+async fn request_bars_routes_completed_only_to_native_http(
+    #[case] completed_only: bool,
+    #[case] last_index: u64,
+) {
+    use nautilus_common::messages::data::RequestBars;
+    use nautilus_model::data::BarType;
+    let mut payload = load_test_data("http_get_candlesticks.json");
+    let template = payload["data"][0].clone();
+    let open_ms = 1_760_000_040_000u64;
+    let candles: Vec<_> = (0..3)
+        .rev()
+        .map(|index| {
+            let mut candle = template.clone();
+            candle[0] = json!((open_ms + index * 60_000).to_string());
+            candle[8] = json!(if index == 2 { "0" } else { "1" });
+            candle
+        })
+        .collect();
+    payload["data"] = json!(candles);
+    let route = get(move || {
+        let payload = payload.clone();
+        async move { Json(payload) }
+    });
+    let router = create_router(TestServerState::default())
+        .route("/api/v5/market/candles", route.clone())
+        .route("/api/v5/market/history-candles", route);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let (client, mut rx) = create_test_data_client(addr, false);
+    let instruments = request_instruments();
+    let request_id = instruments.request_id;
+    client.request_instruments(instruments).unwrap();
+    collect_data_events_until_response(&mut rx, request_id, Duration::from_secs(5)).await;
+    let params = Params::new(
+        [("completed_only".into(), json!(completed_only))]
+            .into_iter()
+            .collect(),
+    );
+    let request = RequestBars::new(
+        BarType::from("BTC-USD.OKX-1-MINUTE-LAST-EXTERNAL"),
+        None,
+        None,
+        NonZeroUsize::new(2),
+        Some(*OKX_CLIENT_ID),
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(params),
+    );
+    let request_id = request.request_id;
+    client.request_bars(request.clone()).unwrap();
+    let events =
+        collect_data_events_until_response(&mut rx, request_id, Duration::from_secs(5)).await;
+    let response = events
+        .iter()
+        .find_map(|event| match event {
+            DataEvent::Response(DataResponse::Bars(response)) => Some(response),
+            _ => None,
+        })
+        .expect("bar response");
+    assert_eq!(response.data.len(), 2);
+    assert_eq!(
+        response.data.last().unwrap().ts_event.as_u64(),
+        (open_ms + last_index * 60_000) * 1_000_000
+    );
+    let mut invalid = request;
+    invalid.params = Some(Params::new(
+        [("completed_only".into(), json!("true"))]
+            .into_iter()
+            .collect(),
+    ));
+    assert!(
+        client
+            .request_bars(invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("completed_only must be a boolean")
+    );
+}

@@ -51,7 +51,7 @@ pub struct OKXTrade {
 }
 
 /// Represents a candlestick from the GET /api/v5/market/history-candles endpoint.
-/// The tuple contains [timestamp(ms), open, high, low, close, volume, turnover, `base_volume`, count].
+/// The tuple contains [timestamp(ms), open, high, low, close, volume, turnover, `base_volume`, confirm].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OKXCandlestick(
     /// Timestamp in milliseconds.
@@ -70,9 +70,24 @@ pub struct OKXCandlestick(
     pub String,
     /// Base volume.
     pub String,
-    /// Record count.
+    /// Completion flag: `0` for unconfirmed, `1` for complete.
     pub String,
 );
+
+impl OKXCandlestick {
+    /// Returns whether OKX explicitly confirmed the candle complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the confirmation flag is unknown.
+    pub(crate) fn is_confirmed(&self) -> anyhow::Result<bool> {
+        match self.8.as_str() {
+            "0" => Ok(false),
+            "1" => Ok(true),
+            _ => anyhow::bail!("Invalid OKX candle confirmation flag"),
+        }
+    }
+}
 
 use crate::common::{
     enums::{

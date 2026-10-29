@@ -1088,7 +1088,7 @@ impl OKXDataClient {
             | OKXWsMessage::SpreadOrders(_)
             | OKXWsMessage::AlgoOrders(_)
             | OKXWsMessage::OrderResponse { .. }
-            | OKXWsMessage::Account(_)
+            | OKXWsMessage::Account { .. }
             | OKXWsMessage::Positions(_)
             | OKXWsMessage::LiquidationWarnings(_)
             | OKXWsMessage::SendFailed { .. } => {
@@ -3017,16 +3017,29 @@ impl DataClient for OKXDataClient {
         let request_id = request.request_id;
         let client_id = request.client_id.unwrap_or(self.client_id);
         let params = request.params;
+        let completed_only = params
+            .as_ref()
+            .and_then(|p| p.get("completed_only"))
+            .map(|value| {
+                value
+                    .as_bool()
+                    .ok_or_else(|| anyhow::anyhow!("completed_only must be a boolean"))
+            })
+            .transpose()?
+            .unwrap_or(false);
         let clock = self.clock;
         let start_nanos = datetime_to_unix_nanos(start);
         let end_nanos = datetime_to_unix_nanos(end);
 
         self.spawn_task(async move {
-            match http
-                .request_bars(bar_type, start, end, limit)
-                .await
-                .context("failed to request bars from OKX")
-            {
+            let result = if completed_only {
+                http.request_completed_bars(bar_type, start, end, limit)
+                    .await
+            } else {
+                http.request_bars(bar_type, start, end, limit).await
+            };
+
+            match result.context("failed to request bars from OKX") {
                 Ok(bars) => {
                     let response = DataResponse::Bars(BarsResponse::new(
                         request_id,

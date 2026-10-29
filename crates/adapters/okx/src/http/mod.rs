@@ -23,6 +23,7 @@
 //! - Position queries and management.
 //! - Request signing and rate limiting.
 
+pub mod algo_visibility;
 pub mod client;
 pub mod error;
 pub mod models;
