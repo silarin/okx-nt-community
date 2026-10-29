@@ -34,7 +34,8 @@ pub enum CommissionBasis {
     /// Signed commissions including both charges and rebates.
     Net,
     /// Charges for an all-taker prefix, net for an all-maker prefix.
-    /// Mixed or unknown liquidity remains unresolved.
+    /// Mixed maker/taker liquidity resolves only when charges and net agree;
+    /// unknown liquidity remains unresolved.
     UniformLiquidity,
 }
 
