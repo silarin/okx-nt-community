@@ -385,12 +385,13 @@ impl OKXExecutionClient {
                     .await
                 }
                 .await;
-                (report.venue_order_id, query, history)
+                (report, query, history)
             })
             .buffer_unordered(MAX_CONCURRENT_STARTUP_ORDER_HISTORIES);
         pin_mut!(histories);
 
-        while let Some((venue_order_id, query, history)) = histories.next().await {
+        while let Some((report, query, history)) = histories.next().await {
+            let venue_order_id = report.venue_order_id;
             if let Some(query) = query {
                 fill_queries.insert(venue_order_id, query);
             }
@@ -398,6 +399,13 @@ impl OKXExecutionClient {
             match history {
                 Ok(fills) => fill_reports.extend(fills),
                 Err(e) => {
+                    if e.is::<ConflictingFillEvidence>() {
+                        self.emitter
+                            .send_execution_report(ExecutionReport::OrderFillConflict(Box::new(
+                                report.clone(),
+                            )));
+                    }
+
                     if let Some(incomplete) = e.downcast_ref::<IncompleteOrderFill>() {
                         self.emitter
                             .send_execution_report(ExecutionReport::IncompleteFill(Box::new(

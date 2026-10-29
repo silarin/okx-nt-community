@@ -6034,9 +6034,11 @@ async fn test_cold_order_only_tied_closing_fills_and_restart(
         )
         .unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("Unresolved persisted incomplete fill recovery"),
+            error.to_string().contains(if case == "child-id" {
+                "Unresolved persisted order fill conflict"
+            } else {
+                "Unresolved persisted incomplete fill recovery"
+            }),
             "{error:#}"
         );
         server.abort();
@@ -6277,6 +6279,226 @@ async fn test_startup_bulk_observations_precede_scoped_history(
                 .to_string()
                 .contains("Unresolved persisted incomplete fill recovery"),
             "{error:#}"
+        );
+    }
+    server.abort();
+}
+
+#[rstest]
+#[case::matching("", "")]
+#[case::inexact_fee("fee", "-0.05000000000000001")]
+#[case::off_grid_quantity("fillSz", "0.001000001")]
+#[case::off_grid_price("fillPx", "50000.01")]
+#[case::wrong_side("side", "sell")]
+#[case::invalid_quantity("fillSz", "invalid")]
+#[case::zero_quantity("fillSz", "0")]
+#[case::negative_quantity("fillSz", "-0.00100000")]
+#[case::empty_quantity("fillSz", "")]
+#[tokio::test]
+async fn test_startup_fill_conflict_survives_completed_cache_snapshot(
+    #[values(false, true)] start_only: bool,
+    #[values(false, true)] account_wide: bool,
+    #[values(false, true)] discovered: bool,
+    #[values("", CID)] client_order_id: &str,
+    #[case] field: &str,
+    #[case] value: &str,
+) {
+    let conflict = !field.is_empty();
+    let store = tempfile::TempDir::new().unwrap();
+    let (addr, venue, server) = start_venue().await;
+    let mut node = build_node_with_store(
+        addr,
+        Rc::new(RefCell::new(Vec::new())),
+        QuerySource::Direct,
+        Some(EventStoreConfig {
+            base_dir: store.path().to_path_buf(),
+            retention: RetentionMode::Full,
+            ..Default::default()
+        }),
+        Some(Rc::new(RefCell::new(None))),
+    );
+    let instance = node.kernel().instance_id.to_string();
+    let account_id = AccountId::from("OKX-001");
+    let timestamp = node.kernel().clock.borrow().timestamp_ns().as_u64() / 1_000_000 - 100;
+    let response: OKXResponse<OKXAccount> = serde_json::from_value(balance()).unwrap();
+    let account = parse_account_state(
+        &response.data[0],
+        account_id,
+        AccountType::Cash,
+        UnixNanos::default(),
+    )
+    .unwrap();
+    node.kernel()
+        .cache
+        .borrow_mut()
+        .add_account(AccountAny::Cash(CashAccount::new(account, false, false)))
+        .unwrap();
+    let instrument = node
+        .kernel()
+        .cache
+        .borrow()
+        .instrument(&InstrumentId::from(INSTRUMENT))
+        .unwrap()
+        .clone();
+
+    // Model a completed order restored from a prior native cache snapshot
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(TraderId::from("TESTER-001"))
+        .strategy_id(StrategyId::from(STRATEGY))
+        .client_order_id(ClientOrderId::from(CID))
+        .instrument_id(InstrumentId::from(INSTRUMENT))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("0.00100000"))
+        .price(Price::from("50000.0"))
+        .build();
+    order
+        .apply(TestOrderEventStubs::submitted(&order, account_id))
+        .unwrap();
+    order
+        .apply(TestOrderEventStubs::accepted(
+            &order,
+            account_id,
+            VenueOrderId::from(VID),
+        ))
+        .unwrap();
+    let fill = OrderFilled::new(
+        order.trader_id(),
+        order.strategy_id(),
+        order.instrument_id(),
+        order.client_order_id(),
+        VenueOrderId::from(VID),
+        account_id,
+        TradeId::from("90001"),
+        OrderSide::Buy,
+        OrderType::Limit,
+        order.quantity(),
+        Price::from("50000.0"),
+        instrument.quote_currency(),
+        LiquiditySide::Taker,
+        UUID4::new(),
+        UnixNanos::from((timestamp + 1) * 1_000_000),
+        UnixNanos::from((timestamp + 1) * 1_000_000),
+        false,
+        None,
+        Some(Money::from_str_exact("0.05 USD").unwrap()),
+        None,
+    );
+    order.apply(OrderEventAny::Filled(fill)).unwrap();
+    node.kernel()
+        .cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(ClientId::from("OKX")), true)
+        .unwrap();
+    let frame = wire_order(
+        "filled",
+        "0.00100000",
+        "0.00100000",
+        "90001",
+        "-0.05",
+        "-0.05",
+        timestamp,
+    );
+    *venue.report.lock().await = json!({"code":"0", "msg":"", "data":frame["data"]});
+    if discovered {
+        venue.order_details.lock().await.insert(
+            VID.to_string(),
+            json!({"code":"0", "msg":"", "data":frame["data"]}),
+        );
+        *venue.report.lock().await = json!({"code":"0", "msg":"", "data":[]});
+    }
+    let good = json!({"instType":"SPOT", "instId":"BTC-USD", "ordId":VID, "clOrdId":client_order_id,
+        "tradeId":"90001", "billId":"80001", "fillSz":"0.00100000", "fillPx":"50000.0",
+        "side":"buy", "posSide":"net", "execType":"T", "fee":"-0.05", "feeCcy":"USD",
+        "ts":(timestamp+1).to_string(), "fillTime":(timestamp+1).to_string()});
+    let mut scoped = good.clone();
+    if conflict {
+        scoped[field] = json!(value);
+    }
+    let (bulk, scoped) = if account_wide {
+        (scoped, good)
+    } else {
+        (good, scoped)
+    };
+    let mut account_rows = vec![bulk];
+    for quantity in ["", "0", "-0.001"] {
+        let mut non_execution = account_rows[0].clone();
+        non_execution["tradeId"] = json!("");
+        non_execution["fillSz"] = json!(quantity);
+        account_rows.push(non_execution);
+    }
+    *venue.fills.lock().await = json!({"code":"0", "msg":"", "data":account_rows});
+    *venue.scoped_fills.lock().await = Some(json!({"code":"0", "msg":"", "data":[scoped]}));
+    venue.bulk.store(true, std::sync::atomic::Ordering::Relaxed);
+    let handle = node.handle();
+    let result = tokio::time::timeout(Duration::from_secs(70), async {
+        if start_only {
+            node.start().await?;
+            node.stop().await
+        } else if conflict {
+            node.run().await
+        } else {
+            let driver = async {
+                wait_until(|| handle.is_running()).await;
+                handle.stop();
+            };
+            let (result, ()) = tokio::join!(node.run(), driver);
+            result
+        }
+    })
+    .await
+    .unwrap();
+
+    if conflict {
+        let error = result.unwrap_err();
+
+        if !account_wide {
+            assert!(
+                error
+                    .to_string()
+                    .contains("Startup order fill recovery incomplete"),
+                "{error:#}"
+            );
+        }
+    } else {
+        result.unwrap();
+    }
+    assert!(venue.submissions.lock().await.is_empty());
+    node.dispose();
+    drop(node);
+    let runs = RedbBackend::list_runs(store.path(), &instance).unwrap();
+    assert_eq!(runs.len(), 1);
+    let backend = RedbBackend::open_sealed(store.path(), &instance, &runs[0].run_id).unwrap();
+    let entries = backend
+        .scan_range(1, backend.high_watermark().unwrap(), ScanDirection::Forward)
+        .unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.payload_type.as_str() == "OrderFillConflict")
+            .count(),
+        usize::from(conflict),
+    );
+
+    let mut restored = Cache::default();
+    restored.add_instrument(instrument).unwrap();
+    restored
+        .add_order(order, None, Some(ClientId::from("OKX")), true)
+        .unwrap();
+    let reader = nautilus_event_store::EventStoreReader::new(backend);
+    let replay = nautilus_event_store::replay_cache_snapshot_tail(&mut restored, &reader);
+    if conflict {
+        let error = replay.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Unresolved persisted order fill conflict"),
+            "{error:#}"
+        );
+    } else {
+        replay.unwrap();
+        assert_eq!(
+            restored.order(&ClientOrderId::from(CID)).unwrap().status(),
+            OrderStatus::Filled,
         );
     }
     server.abort();

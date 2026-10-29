@@ -669,11 +669,9 @@ impl OrderQueryReport {
                 && fill.last_px.is_positive(),
             ConflictingFillEvidence("Order query fill identity is mismatched or duplicated")
         );
-        // Only the same authenticated order detail can relate a supplied child
-        // client ID to the algo client ID used by native orders and stream fills.
-        if fill.client_order_id.is_some() {
-            fill.client_order_id = report.client_order_id;
-        }
+        // The same authenticated order detail supplies canonical identity even
+        // when the fill omits its optional wire client ID.
+        fill.client_order_id = report.client_order_id;
         Ok(())
     }
 }
@@ -5471,80 +5469,75 @@ impl OKXHttpClient {
             });
 
             for detail in &page[..take] {
-                if let Some(venue_order_id) = venue_order_id {
-                    anyhow::ensure!(
-                        detail.ord_id.as_str() == venue_order_id.as_str()
-                            && detail.inst_type == instrument_type
-                            && instrument_id.is_some_and(|id| id.symbol.inner() == detail.inst_id),
-                        ConflictingFillEvidence(
-                            "Order fill response does not match the requested scope"
-                        )
-                    );
-                    anyhow::ensure!(
-                        fill_quantity_is_positive(&detail.fill_sz)
-                            .context(ConflictingFillEvidence("Invalid order fill quantity"))?,
-                        ConflictingFillEvidence("Order fill response has a non-positive quantity")
-                    );
-                }
-                // Skip fills with zero or negative quantity (cancelled orders, etc)
-                if detail.fill_sz.is_empty() {
-                    continue;
-                }
-
-                if !fill_quantity_is_positive(&detail.fill_sz).with_context(|| {
-                    format!(
-                        "failed to parse fill quantity for instrument {}",
-                        detail.inst_id
-                    )
-                })? {
-                    continue;
-                }
-
-                if report_ts_outside_window(detail.ts, start_ns, end_ns) {
-                    continue;
-                }
-
-                let inst = match self.resolve_report_instrument(
-                    detail.inst_id,
-                    detail.inst_type,
-                    false,
-                    false,
-                    scope,
-                )? {
-                    InstrumentResolution::Found(inst) => inst,
-                    InstrumentResolution::Skip => continue,
-                    InstrumentResolution::Incomplete => {
-                        complete = false;
-                        continue;
+                let result = async {
+                    if let Some(venue_order_id) = venue_order_id {
+                        anyhow::ensure!(
+                            detail.ord_id.as_str() == venue_order_id.as_str()
+                                && detail.inst_type == instrument_type
+                                && instrument_id
+                                    .is_some_and(|id| id.symbol.inner() == detail.inst_id),
+                            ConflictingFillEvidence(
+                                "Order fill response does not match the requested scope"
+                            )
+                        );
+                        anyhow::ensure!(
+                            fill_quantity_is_positive(&detail.fill_sz)
+                                .context(ConflictingFillEvidence("Invalid order fill quantity"))?,
+                            ConflictingFillEvidence(
+                                "Order fill response has a non-positive quantity"
+                            )
+                        );
                     }
-                };
-
-                let mut report = parse_fill_report(
-                    detail,
-                    account_id,
-                    inst.id(),
-                    inst.price_precision(),
-                    inst.size_precision(),
-                    ts_init,
-                )
-                .map_err(|e| {
-                    if venue_order_id.is_some() {
-                        e.context(ConflictingFillEvidence("Invalid authoritative order fill"))
-                    } else {
-                        e
+                    // Non-execution account rows may omit quantity. A row with
+                    // a trade ID is execution evidence and must not be discarded.
+                    let execution_evidence = order_queries.is_some() && !detail.trade_id.is_empty();
+                    if detail.fill_sz.is_empty() && !execution_evidence {
+                        return Ok(None);
                     }
-                })?;
 
-                if let Some(queries) = order_queries.as_deref_mut() {
-                    if report.client_order_id.is_some()
-                        && !queries.contains_key(&report.venue_order_id)
+                    let positive_quantity = fill_quantity_is_positive(&detail.fill_sz)
+                        .context(ConflictingFillEvidence("Invalid fill quantity"))
+                        .with_context(|| {
+                            format!(
+                                "failed to parse fill quantity for instrument {}",
+                                detail.inst_id
+                            )
+                        });
+
+                    if positive_quantity.as_ref().is_ok_and(|positive| !positive)
+                        && !execution_evidence
+                    {
+                        return Ok(None);
+                    }
+
+                    if report_ts_outside_window(detail.ts, start_ns, end_ns) {
+                        return Ok(None);
+                    }
+
+                    let inst = match self.resolve_report_instrument(
+                        detail.inst_id,
+                        detail.inst_type,
+                        false,
+                        false,
+                        scope,
+                    )? {
+                        InstrumentResolution::Found(inst) => inst,
+                        InstrumentResolution::Skip => return Ok(None),
+                        InstrumentResolution::Incomplete => {
+                            complete = false;
+                            return Ok(None);
+                        }
+                    };
+
+                    if let Some(queries) = order_queries.as_deref_mut()
+                        && !queries.contains_key(&VenueOrderId::from(detail.ord_id.as_str()))
                     {
                         let query = self
                             .request_order_status_report_with_type(
                                 account_id,
-                                report.instrument_id,
+                                inst.id(),
                                 None,
-                                Some(report.venue_order_id),
+                                Some(VenueOrderId::from(detail.ord_id.as_str())),
                                 observe_order,
                             )
                             .await
@@ -5561,7 +5554,7 @@ impl OKXHttpClient {
                             .ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "Fill identity requires authenticated order detail for {}",
-                                    report.venue_order_id,
+                                    VenueOrderId::from(detail.ord_id.as_str()),
                                 )
                             })?;
 
@@ -5571,10 +5564,27 @@ impl OKXHttpClient {
                                 Vec::new(),
                             ));
                         }
-                        queries.insert(report.venue_order_id, query);
+                        queries.insert(VenueOrderId::from(detail.ord_id.as_str()), query);
                     }
 
-                    if let Some(query) = queries.get(&report.venue_order_id) {
+                    anyhow::ensure!(
+                        positive_quantity?,
+                        ConflictingFillEvidence("Execution fill has a non-positive quantity")
+                    );
+                    let mut report = parse_fill_report(
+                        detail,
+                        account_id,
+                        inst.id(),
+                        inst.price_precision(),
+                        inst.size_precision(),
+                        ts_init,
+                    )
+                    .context(ConflictingFillEvidence("Invalid authoritative fill"))?;
+
+                    if let Some(query) = order_queries
+                        .as_deref()
+                        .and_then(|queries| queries.get(&report.venue_order_id))
+                    {
                         anyhow::ensure!(
                             query.instrument_type == detail.inst_type,
                             ConflictingFillEvidence(
@@ -5583,12 +5593,33 @@ impl OKXHttpClient {
                         );
                         query.normalize_fill(&mut report)?;
                     }
-                }
 
-                if let Some(observe) = observe_fill {
-                    observe(&mut report)?;
+                    if let Some(observe) = observe_fill {
+                        observe(&mut report)?;
+                    }
+                    Ok::<_, anyhow::Error>(Some(report))
                 }
-                reports.push(report);
+                .await;
+
+                match result {
+                    Ok(Some(report)) => reports.push(report),
+                    Ok(None) => {}
+                    Err(e) => {
+                        // Account-wide parsing can fail before a FillReport exists.
+                        // Retain that conflict against its authenticated order detail.
+                        if e.is::<ConflictingFillEvidence>()
+                            && let Some(observe) = observe_order
+                            && let Some(query) = order_queries.as_deref().and_then(|queries| {
+                                queries.get(&VenueOrderId::from(detail.ord_id.as_str()))
+                            })
+                        {
+                            observe(&ExecutionReport::OrderFillConflict(Box::new(
+                                query.report.clone(),
+                            )));
+                        }
+                        return Err(e);
+                    }
+                }
             }
             seen += page.len();
             cursor = page.last().map(|fill| fill.bill_id.to_string());
