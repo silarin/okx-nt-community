@@ -1,0 +1,147 @@
+# Vendored from the published hypersync-client crate; retains its MPL-2.0 license.
+# The transport uses Cap'n Proto 0.24 with regenerated schema bindings.
+
+[package]
+publish = false
+edition = "2021"
+name = "hypersync-client"
+version = "1.4.1"
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "client library for hypersync"
+homepage = "https://github.com/enviodev/hypersync-client-rust"
+readme = "README.md"
+license = "MPL-2.0"
+repository = "https://github.com/enviodev/hypersync-client-rust"
+
+[lib]
+name = "hypersync_client"
+path = "src/lib.rs"
+
+[[test]]
+name = "api_test"
+path = "tests/api_test.rs"
+
+[dependencies.alloy-dyn-abi]
+version = "1.1"
+
+[dependencies.alloy-json-abi]
+version = "1.1"
+
+[dependencies.alloy-primitives]
+version = "1.1"
+
+[dependencies.anyhow]
+version = "1"
+
+[dependencies.arrayvec]
+version = "0.7"
+features = ["serde"]
+
+[dependencies.arrow]
+version = "57"
+features = ["ipc_compression"]
+
+[dependencies.bincode]
+version = "1"
+
+[dependencies.capnp]
+version = "0.24.1"
+
+[dependencies.faster-hex]
+version = "0.9"
+
+[dependencies.fastrange-rs]
+version = "0.1"
+
+[dependencies.futures]
+version = "0.3"
+
+[dependencies.hypersync-format]
+version = "0.7.0"
+
+[dependencies.hypersync-net-types]
+version = "0.12.3"
+path = "../hypersync-net-types"
+
+[dependencies.hypersync-schema]
+version = "0.4.0"
+
+[dependencies.log]
+version = "0.4"
+
+[dependencies.nohash-hasher]
+version = "0.2.0"
+
+[dependencies.num_cpus]
+version = "1"
+
+[dependencies.parquet]
+version = "57"
+features = ["arrow", "async"]
+
+[dependencies.rand]
+version = "0.8"
+
+[dependencies.rayon]
+version = "1"
+
+[dependencies.reqwest]
+version = "0.12"
+features = ["json", "rustls-tls-native-roots", "stream", "http2"]
+default-features = false
+
+[dependencies.reqwest-eventsource]
+version = "0.6"
+
+[dependencies.ruint]
+version = "1"
+
+[dependencies.schemars]
+version = "1.2.0"
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
+
+[dependencies.serde_json]
+version = "1"
+
+[dependencies.thiserror]
+version = "2.0.17"
+
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread", "fs", "test-util", "rt", "macros", "sync"]
+default-features = false
+
+[dependencies.url]
+version = "2"
+features = ["serde"]
+
+[dependencies.uuid]
+version = "1"
+features = ["v4"]
+
+[dependencies.xxhash-rust]
+version = "0.8"
+features = ["xxh3"]
+
+[dev-dependencies.dotenvy]
+version = "0.15.7"
+
+[dev-dependencies.env_logger]
+version = "0.11"
+
+[dev-dependencies.hex-literal]
+version = "0.4"
+
+[dev-dependencies.http]
+version = "1"
+
+[dev-dependencies.maplit]
+version = "1"

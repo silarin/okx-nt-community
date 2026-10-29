@@ -1,0 +1,2123 @@
+#![deny(missing_docs)]
+// README.md is a symlink (ln -s ../README.md README.md) to the root workspace
+// README. This is needed so that both `cargo doc` and `cargo package` work:
+// - `cargo doc`: include_str! resolves the symlink to the root README.
+// - `cargo package`: cargo copies the symlink target into the tarball, so
+//   include_str! finds README.md at the package root during verification.
+#![doc = include_str!("../README.md")]
+use std::time::Instant;
+use std::{sync::Arc, time::Duration};
+
+use anyhow::{anyhow, Context, Result};
+use futures::StreamExt;
+use hypersync_net_types::{hypersync_net_types_capnp, ArchiveHeight, ChainId, Query};
+use reqwest::{Method, StatusCode};
+use reqwest_eventsource::retry::ExponentialBackoff;
+use reqwest_eventsource::{Event, EventSource};
+
+pub mod arrow_reader;
+mod column_mapping;
+mod config;
+mod decode;
+mod decode_call;
+mod from_arrow;
+pub mod metrics;
+mod parquet_out;
+mod parse_response;
+pub mod preset_query;
+mod rate_limit;
+mod rayon_async;
+pub mod simple_types;
+mod stream;
+mod types;
+mod util;
+
+pub use hypersync_format as format;
+pub use hypersync_net_types as net_types;
+pub use hypersync_schema as schema;
+
+use parse_response::parse_query_response;
+use tokio::sync::mpsc;
+use types::ResponseData;
+use url::Url;
+
+pub use column_mapping::{ColumnMapping, DataType};
+pub use config::HexOutput;
+pub use config::{ClientConfig, SerializationFormat, StreamConfig};
+pub use decode::Decoder;
+pub use decode_call::CallDecoder;
+pub use metrics::{
+    RequestKind, RequestStats, StreamMetrics, StreamObserver, StreamSummary, NUM_SIZE_BUCKETS,
+    SIZE_BUCKET_LABELS,
+};
+pub use rate_limit::RateLimitInfo;
+pub use types::{
+    ArrowResponse, ArrowResponseData, EventResponse, QueryResponse, RateLimitResponse,
+};
+
+use crate::parse_response::read_query_response;
+use crate::simple_types::InternalEventJoinStrategy;
+
+#[derive(Debug)]
+struct HttpClientWrapper {
+    /// Mutable state that needs to be refreshed periodically
+    inner: std::sync::Mutex<HttpClientWrapperInner>,
+    /// HyperSync server api token.
+    api_token: String,
+    /// Standard timeout for http requests.
+    timeout: Duration,
+    /// Pools are never idle since polling often happens on the client
+    /// so connections never timeout and dns lookups never happen again
+    /// this is problematic if the underlying ip address changes during
+    /// failovers on hypersync. Since reqwest doesn't implement this we
+    /// simply recreate the client every time
+    max_connection_age: Duration,
+    /// For refreshing the client
+    user_agent: String,
+}
+
+#[derive(Debug)]
+struct HttpClientWrapperInner {
+    /// Initialized reqwest instance for client url.
+    client: reqwest::Client,
+    /// Timestamp when the client was created
+    created_at: Instant,
+}
+
+impl HttpClientWrapper {
+    fn new(user_agent: String, api_token: String, timeout: Duration) -> Self {
+        let client = reqwest::Client::builder()
+            .no_gzip()
+            .user_agent(&user_agent)
+            .build()
+            .unwrap();
+
+        Self {
+            inner: std::sync::Mutex::new(HttpClientWrapperInner {
+                client,
+                created_at: Instant::now(),
+            }),
+            api_token,
+            timeout,
+            max_connection_age: Duration::from_secs(60),
+            user_agent,
+        }
+    }
+
+    fn get_client(&self) -> reqwest::Client {
+        let mut inner = self.inner.lock().expect("HttpClientWrapper mutex poisoned");
+
+        // Check if client needs refresh due to age
+        if inner.created_at.elapsed() > self.max_connection_age {
+            // Recreate client to force new DNS lookup for failover scenarios
+            inner.client = reqwest::Client::builder()
+                .no_gzip()
+                .user_agent(&self.user_agent)
+                .build()
+                .unwrap();
+            inner.created_at = Instant::now();
+        }
+
+        // Clone is cheap for reqwest::Client (it's Arc-wrapped internally)
+        inner.client.clone()
+    }
+
+    fn request(&self, method: Method, url: Url) -> reqwest::RequestBuilder {
+        let client = self.get_client();
+        client
+            .request(method, url)
+            .timeout(self.timeout)
+            .bearer_auth(&self.api_token)
+    }
+
+    fn request_no_timeout(&self, method: Method, url: Url) -> reqwest::RequestBuilder {
+        let client = self.get_client();
+        client.request(method, url).bearer_auth(&self.api_token)
+    }
+}
+
+/// Internal client state to handle http requests and retries.
+#[derive(Debug)]
+struct ClientInner {
+    http_client: HttpClientWrapper,
+    /// HyperSync server URL.
+    url: Url,
+    /// Number of retries to attempt before returning error.
+    max_num_retries: usize,
+    /// Milliseconds that would be used for retry backoff increasing.
+    retry_backoff_ms: u64,
+    /// Initial wait time for request backoff.
+    retry_base_ms: u64,
+    /// Ceiling time for request backoff.
+    retry_ceiling_ms: u64,
+    /// Query serialization format to use for HTTP requests.
+    serialization_format: SerializationFormat,
+    /// Most recently observed rate limit info from the server, paired with the
+    /// instant it was captured so elapsed time can be subtracted from `reset_secs`.
+    rate_limit_state: std::sync::Mutex<Option<(RateLimitInfo, Instant)>>,
+    /// Whether to proactively sleep when the rate limit is exhausted.
+    proactive_rate_limit_sleep: bool,
+}
+
+/// Client to handle http requests and retries.
+#[derive(Clone, Debug)]
+pub struct Client {
+    inner: Arc<ClientInner>,
+}
+
+impl Client {
+    /// Creates a new client with the given configuration.
+    ///
+    /// Configuration must include the `url` and `api_token` fields.
+    /// # Example
+    /// ```
+    /// use hypersync_client::{Client, ClientConfig};
+    ///
+    /// let config = ClientConfig {
+    ///     url: "https://eth.hypersync.xyz".to_string(),
+    ///     api_token: std::env::var("ENVIO_API_TOKEN")?,
+    ///     ..Default::default()
+    /// };
+    /// let client = Client::new(config)?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    /// This method fails if the config is invalid.
+    pub fn new(cfg: ClientConfig) -> Result<Self> {
+        // hscr stands for hypersync client rust
+        cfg.validate().context("invalid ClientConfig")?;
+        let user_agent = format!("hscr/{}", env!("CARGO_PKG_VERSION"));
+        Self::new_internal(cfg, user_agent)
+    }
+
+    /// Creates a new client builder.
+    ///
+    /// # Example
+    /// ```
+    /// use hypersync_client::Client;
+    ///
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN").unwrap())
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn builder() -> ClientBuilder {
+        ClientBuilder::new()
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_agent(cfg: ClientConfig, user_agent: impl Into<String>) -> Result<Self> {
+        // Creates a new client with the given configuration and custom user agent.
+        // This is intended for use by language bindings (Python, Node.js) and HyperIndex.
+        Self::new_internal(cfg, user_agent.into())
+    }
+
+    /// Internal constructor that takes both config and user agent.
+    fn new_internal(cfg: ClientConfig, user_agent: String) -> Result<Self> {
+        let http_client = HttpClientWrapper::new(
+            user_agent,
+            cfg.api_token,
+            Duration::from_millis(cfg.http_req_timeout_millis),
+        );
+
+        let url = Url::parse(&cfg.url).context("url is malformed")?;
+
+        Ok(Self {
+            inner: Arc::new(ClientInner {
+                http_client,
+                url,
+                max_num_retries: cfg.max_num_retries,
+                retry_backoff_ms: cfg.retry_backoff_ms,
+                retry_base_ms: cfg.retry_base_ms,
+                retry_ceiling_ms: cfg.retry_ceiling_ms,
+                serialization_format: cfg.serialization_format,
+                rate_limit_state: std::sync::Mutex::new(None),
+                proactive_rate_limit_sleep: cfg.proactive_rate_limit_sleep,
+            }),
+        })
+    }
+
+    /// Retrieves blocks, transactions, traces, and logs through a stream using the provided
+    /// query and stream configuration.
+    ///
+    /// ### Implementation
+    /// Runs multiple queries simultaneously based on config.concurrency.
+    ///
+    /// Each query runs until it reaches query.to, server height, any max_num_* query param,
+    /// or execution timed out by server.
+    ///
+    /// # ⚠️ Important Warning
+    ///
+    /// This method will continue executing until the query has run to completion from beginning
+    /// to the end of the block range defined in the query. For heavy queries with large block
+    /// ranges or high data volumes, consider:
+    ///
+    /// - Use [`stream()`](Self::stream) to interact with each streamed chunk individually
+    /// - Use [`get()`](Self::get) which returns a `next_block` that can be paginated for the next query
+    /// - Break large queries into smaller block ranges
+    ///
+    /// # Example
+    /// ```no_run
+    /// use hypersync_client::{Client, net_types::{Query, LogFilter, LogField}, StreamConfig};
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN")?)
+    ///     .build()?;
+    ///
+    /// // Query ERC20 transfer events
+    /// let query = Query::new()
+    ///     .from_block(19000000)
+    ///     .to_block_excl(19000010)
+    ///     .where_logs(
+    ///         LogFilter::all()
+    ///             .and_topic0(["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"])?
+    ///     )
+    ///     .select_log_fields([LogField::Address, LogField::Data]);
+    /// let response = client.collect(query, StreamConfig::default()).await?;
+    ///
+    /// println!("Collected {} events", response.data.logs.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn collect(&self, query: Query, config: StreamConfig) -> Result<QueryResponse> {
+        check_simple_stream_params(&config)?;
+
+        let mut recv = stream::stream_arrow(self, query, config)
+            .await
+            .context("start stream")?;
+
+        let mut data = ResponseData::default();
+        let mut archive_height = None;
+        let mut next_block = 0;
+        let mut total_execution_time = 0;
+
+        while let Some(res) = recv.recv().await {
+            let res = res.context("get response")?;
+            let res: QueryResponse =
+                QueryResponse::try_from(&res).context("convert arrow response")?;
+
+            for batch in res.data.blocks {
+                data.blocks.push(batch);
+            }
+            for batch in res.data.transactions {
+                data.transactions.push(batch);
+            }
+            for batch in res.data.logs {
+                data.logs.push(batch);
+            }
+            for batch in res.data.traces {
+                data.traces.push(batch);
+            }
+
+            archive_height = res.archive_height;
+            next_block = res.next_block;
+            total_execution_time += res.total_execution_time
+        }
+
+        Ok(QueryResponse {
+            archive_height,
+            next_block,
+            total_execution_time,
+            data,
+            rollback_guard: None,
+        })
+    }
+
+    /// Retrieves events through a stream using the provided query and stream configuration.
+    ///
+    /// # ⚠️ Important Warning
+    ///
+    /// This method will continue executing until the query has run to completion from beginning
+    /// to the end of the block range defined in the query. For heavy queries with large block
+    /// ranges or high data volumes, consider:
+    ///
+    /// - Use [`stream_events()`](Self::stream_events) to interact with each streamed chunk individually
+    /// - Use [`get_events()`](Self::get_events) which returns a `next_block` that can be paginated for the next query
+    /// - Break large queries into smaller block ranges
+    ///
+    /// # Example
+    /// ```no_run
+    /// use hypersync_client::{Client, net_types::{Query, TransactionFilter, TransactionField}, StreamConfig};
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN")?)
+    ///     .build()?;
+    ///
+    /// // Query transactions to a specific address
+    /// let query = Query::new()
+    ///     .from_block(19000000)
+    ///     .to_block_excl(19000100)
+    ///     .where_transactions(
+    ///         TransactionFilter::all()
+    ///             .and_to(["0xA0b86a33E6411b87Fd9D3DF822C8698FC06BBe4c"])?
+    ///     )
+    ///     .select_transaction_fields([TransactionField::Hash, TransactionField::From, TransactionField::Value]);
+    /// let response = client.collect_events(query, StreamConfig::default()).await?;
+    ///
+    /// println!("Collected {} events", response.data.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn collect_events(
+        &self,
+        mut query: Query,
+        config: StreamConfig,
+    ) -> Result<EventResponse> {
+        check_simple_stream_params(&config)?;
+
+        let event_join_strategy = InternalEventJoinStrategy::from(&query.field_selection);
+        event_join_strategy.add_join_fields_to_selection(&mut query.field_selection);
+
+        let mut recv = stream::stream_arrow(self, query, config)
+            .await
+            .context("start stream")?;
+
+        let mut data = Vec::new();
+        let mut archive_height = None;
+        let mut next_block = 0;
+        let mut total_execution_time = 0;
+
+        while let Some(res) = recv.recv().await {
+            let res = res.context("get response")?;
+            let res: QueryResponse =
+                QueryResponse::try_from(&res).context("convert arrow response")?;
+            let events = event_join_strategy.join_from_response_data(res.data);
+
+            data.extend(events);
+
+            archive_height = res.archive_height;
+            next_block = res.next_block;
+            total_execution_time += res.total_execution_time
+        }
+
+        Ok(EventResponse {
+            archive_height,
+            next_block,
+            total_execution_time,
+            data,
+            rollback_guard: None,
+        })
+    }
+
+    /// Retrieves blocks, transactions, traces, and logs in Arrow format through a stream using
+    /// the provided query and stream configuration.
+    ///
+    /// Returns data in Apache Arrow format for high-performance columnar processing.
+    /// Useful for analytics workloads or when working with Arrow-compatible tools.
+    ///
+    /// # ⚠️ Important Warning
+    ///
+    /// This method will continue executing until the query has run to completion from beginning
+    /// to the end of the block range defined in the query. For heavy queries with large block
+    /// ranges or high data volumes, consider:
+    ///
+    /// - Use [`stream_arrow()`](Self::stream_arrow) to interact with each streamed chunk individually
+    /// - Use [`get_arrow()`](Self::get_arrow) which returns a `next_block` that can be paginated for the next query
+    /// - Break large queries into smaller block ranges
+    ///
+    /// # Example
+    /// ```no_run
+    /// use hypersync_client::{Client, net_types::{Query, BlockFilter, BlockField}, StreamConfig};
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN")?)
+    ///     .build()?;
+    ///
+    /// // Get block data in Arrow format for analytics
+    /// let query = Query::new()
+    ///     .from_block(19000000)
+    ///     .to_block_excl(19000100)
+    ///     .include_all_blocks()
+    ///     .select_block_fields([BlockField::Number, BlockField::Timestamp, BlockField::GasUsed]);
+    /// let response = client.collect_arrow(query, StreamConfig::default()).await?;
+    ///
+    /// println!("Retrieved {} Arrow batches for blocks", response.data.blocks.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn collect_arrow(&self, query: Query, config: StreamConfig) -> Result<ArrowResponse> {
+        let mut recv = stream::stream_arrow(self, query, config)
+            .await
+            .context("start stream")?;
+
+        let mut data = ArrowResponseData::default();
+        let mut archive_height = None;
+        let mut next_block = 0;
+        let mut total_execution_time = 0;
+
+        while let Some(res) = recv.recv().await {
+            let res = res.context("get response")?;
+
+            for batch in res.data.blocks {
+                data.blocks.push(batch);
+            }
+            for batch in res.data.transactions {
+                data.transactions.push(batch);
+            }
+            for batch in res.data.logs {
+                data.logs.push(batch);
+            }
+            for batch in res.data.traces {
+                data.traces.push(batch);
+            }
+            for batch in res.data.decoded_logs {
+                data.decoded_logs.push(batch);
+            }
+
+            archive_height = res.archive_height;
+            next_block = res.next_block;
+            total_execution_time += res.total_execution_time
+        }
+
+        Ok(ArrowResponse {
+            archive_height,
+            next_block,
+            total_execution_time,
+            data,
+            rollback_guard: None,
+        })
+    }
+
+    /// Writes parquet file getting data through a stream using the provided path, query,
+    /// and stream configuration.
+    ///
+    /// Streams data directly to a Parquet file for efficient storage and later analysis.
+    /// Perfect for data exports or ETL pipelines.
+    ///
+    /// # ⚠️ Important Warning
+    ///
+    /// This method will continue executing until the query has run to completion from beginning
+    /// to the end of the block range defined in the query. For heavy queries with large block
+    /// ranges or high data volumes, consider:
+    ///
+    /// - Use [`stream_arrow()`](Self::stream_arrow) and write to Parquet incrementally
+    /// - Use [`get_arrow()`](Self::get_arrow) with pagination and append to Parquet files
+    /// - Break large queries into smaller block ranges
+    ///
+    /// # Example
+    /// ```no_run
+    /// use hypersync_client::{Client, net_types::{Query, LogFilter, LogField}, StreamConfig};
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN")?)
+    ///     .build()?;
+    ///
+    /// // Export all DEX trades to Parquet for analysis
+    /// let query = Query::new()
+    ///     .from_block(19000000)
+    ///     .to_block_excl(19010000)
+    ///     .where_logs(
+    ///         LogFilter::all()
+    ///             .and_topic0(["0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"])?
+    ///     )
+    ///     .select_log_fields([LogField::Address, LogField::Data, LogField::BlockNumber]);
+    /// client.collect_parquet("./trades.parquet", query, StreamConfig::default()).await?;
+    ///
+    /// println!("Trade data exported to trades.parquet");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn collect_parquet(
+        &self,
+        path: &str,
+        query: Query,
+        config: StreamConfig,
+    ) -> Result<()> {
+        parquet_out::collect_parquet(self, path, query, config).await
+    }
+
+    /// Internal implementation of getting chain_id from server
+    async fn get_chain_id_impl(&self) -> Result<u64> {
+        let mut url = self.inner.url.clone();
+        let mut segments = url.path_segments_mut().ok().context("get path segments")?;
+        segments.push("chain_id");
+        std::mem::drop(segments);
+        let req = self.inner.http_client.request(Method::GET, url);
+
+        let res = req.send().await.context("execute http req")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            return Err(anyhow!("http response status code {}", status));
+        }
+
+        let chain_id: ChainId = res.json().await.context("read response body json")?;
+
+        Ok(chain_id.chain_id)
+    }
+
+    /// Internal implementation of getting height from server
+    async fn get_height_impl(&self, http_timeout_override: Option<Duration>) -> Result<u64> {
+        let mut url = self.inner.url.clone();
+        let mut segments = url.path_segments_mut().ok().context("get path segments")?;
+        segments.push("height");
+        std::mem::drop(segments);
+        let mut req = self.inner.http_client.request(Method::GET, url);
+        if let Some(http_timeout_override) = http_timeout_override {
+            req = req.timeout(http_timeout_override);
+        }
+
+        let res = req.send().await.context("execute http req")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            return Err(anyhow!("http response status code {}", status));
+        }
+
+        let height: ArchiveHeight = res.json().await.context("read response body json")?;
+
+        Ok(height.height.unwrap_or(0))
+    }
+
+    /// Get the chain_id from the server with retries.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use hypersync_client::Client;
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN")?)
+    ///     .build()?;
+    ///
+    /// let chain_id = client.get_chain_id().await?;
+    /// println!("Connected to chain ID: {}", chain_id);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_chain_id(&self) -> Result<u64> {
+        let mut base = self.inner.retry_base_ms;
+
+        let mut err = anyhow!("");
+
+        for _ in 0..self.inner.max_num_retries + 1 {
+            match self.get_chain_id_impl().await {
+                Ok(res) => return Ok(res),
+                Err(e) => {
+                    log::error!(
+                        "failed to get chain_id from server, retrying... The error was: {e:?}"
+                    );
+                    err = err.context(format!("{e:?}"));
+                }
+            }
+
+            let base_ms = Duration::from_millis(base);
+            let jitter = Duration::from_millis(fastrange_rs::fastrange_64(
+                rand::random(),
+                self.inner.retry_backoff_ms,
+            ));
+
+            tokio::time::sleep(base_ms + jitter).await;
+
+            base = std::cmp::min(
+                base + self.inner.retry_backoff_ms,
+                self.inner.retry_ceiling_ms,
+            );
+        }
+
+        Err(err)
+    }
+
+    /// Get the height of from server with retries.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use hypersync_client::Client;
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN")?)
+    ///     .build()?;
+    ///
+    /// let height = client.get_height().await?;
+    /// println!("Current block height: {}", height);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_height(&self) -> Result<u64> {
+        let mut base = self.inner.retry_base_ms;
+
+        let mut err = anyhow!("");
+
+        for _ in 0..self.inner.max_num_retries + 1 {
+            match self.get_height_impl(None).await {
+                Ok(res) => return Ok(res),
+                Err(e) => {
+                    log::error!(
+                        "failed to get height from server, retrying... The error was: {e:?}"
+                    );
+                    err = err.context(format!("{e:?}"));
+                }
+            }
+
+            let base_ms = Duration::from_millis(base);
+            let jitter = Duration::from_millis(fastrange_rs::fastrange_64(
+                rand::random(),
+                self.inner.retry_backoff_ms,
+            ));
+
+            tokio::time::sleep(base_ms + jitter).await;
+
+            base = std::cmp::min(
+                base + self.inner.retry_backoff_ms,
+                self.inner.retry_ceiling_ms,
+            );
+        }
+
+        Err(err)
+    }
+
+    /// Get the height of the Client instance for health checks.
+    ///
+    /// Doesn't do any retries and the `http_req_timeout` parameter will override the http timeout config set when creating the client.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use hypersync_client::Client;
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN")?)
+    ///     .build()?;
+    ///
+    /// // Quick health check with 5 second timeout
+    /// let height = client.health_check(Some(Duration::from_secs(5))).await?;
+    /// println!("Server is healthy at block: {}", height);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn health_check(&self, http_req_timeout: Option<Duration>) -> Result<u64> {
+        self.get_height_impl(http_req_timeout).await
+    }
+
+    /// Executes query with retries and returns the response.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use hypersync_client::{Client, net_types::{Query, BlockFilter, BlockField}};
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN")?)
+    ///     .build()?;
+    ///
+    /// // Query all blocks from a specific range
+    /// let query = Query::new()
+    ///     .from_block(19000000)
+    ///     .to_block_excl(19000010)
+    ///     .include_all_blocks()
+    ///     .select_block_fields([BlockField::Number, BlockField::Hash, BlockField::Timestamp]);
+    /// let response = client.get(&query).await?;
+    ///
+    /// println!("Retrieved {} blocks", response.data.blocks.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get(&self, query: &Query) -> Result<QueryResponse> {
+        let arrow_response = self.get_arrow(query).await.context("get data")?;
+        let converted =
+            QueryResponse::try_from(&arrow_response).context("convert arrow response")?;
+        Ok(converted)
+    }
+
+    /// Add block, transaction and log fields selection to the query, executes it with retries
+    /// and returns the response.
+    ///
+    /// This method automatically joins blocks, transactions, and logs into unified events,
+    /// making it easier to work with related blockchain data.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use hypersync_client::{Client, net_types::{Query, LogFilter, LogField, TransactionField}};
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN")?)
+    ///     .build()?;
+    ///
+    /// // Query ERC20 transfers with transaction context
+    /// let query = Query::new()
+    ///     .from_block(19000000)
+    ///     .to_block_excl(19000010)
+    ///     .where_logs(
+    ///         LogFilter::all()
+    ///             .and_topic0(["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"])?
+    ///     )
+    ///     .select_log_fields([LogField::Address, LogField::Data])
+    ///     .select_transaction_fields([TransactionField::Hash, TransactionField::From]);
+    /// let response = client.get_events(query).await?;
+    ///
+    /// println!("Retrieved {} joined events", response.data.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_events(&self, mut query: Query) -> Result<EventResponse> {
+        let event_join_strategy = InternalEventJoinStrategy::from(&query.field_selection);
+        event_join_strategy.add_join_fields_to_selection(&mut query.field_selection);
+        let arrow_response = self.get_arrow(&query).await.context("get data")?;
+        EventResponse::try_from_arrow_response(&arrow_response, &event_join_strategy)
+    }
+
+    /// Executes query once and returns the result using JSON serialization.
+    async fn get_arrow_impl_json(
+        &self,
+        query: &Query,
+    ) -> std::result::Result<ArrowImplResponse, HyperSyncResponseError> {
+        let mut url = self.inner.url.clone();
+        let mut segments = url.path_segments_mut().ok().context("get path segments")?;
+        segments.push("query");
+        segments.push("arrow-ipc");
+        std::mem::drop(segments);
+        let req = self.inner.http_client.request(Method::POST, url);
+
+        let res = req.json(&query).send().await.context("execute http req")?;
+
+        let status = res.status();
+        let rate_limit = RateLimitInfo::from_response(&res);
+
+        if status == StatusCode::PAYLOAD_TOO_LARGE {
+            return Err(HyperSyncResponseError::PayloadTooLarge);
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(HyperSyncResponseError::RateLimited { rate_limit });
+        }
+        if !status.is_success() {
+            let text = res.text().await.context("read text to see error")?;
+
+            return Err(HyperSyncResponseError::Other(anyhow!(
+                "http response status code {}, err body: {}",
+                status,
+                text
+            )));
+        }
+
+        let bytes = res.bytes().await.context("read response body bytes")?;
+
+        let res = tokio::task::block_in_place(|| {
+            parse_query_response(&bytes).context("parse query response")
+        })?;
+
+        Ok(ArrowImplResponse {
+            response: res,
+            response_bytes: bytes.len().try_into().unwrap(),
+            rate_limit,
+        })
+    }
+
+    fn should_cache_queries(&self) -> bool {
+        matches!(
+            self.inner.serialization_format,
+            SerializationFormat::CapnProto {
+                should_cache_queries: true
+            }
+        )
+    }
+
+    /// Executes query once and returns the result using Cap'n Proto serialization.
+    async fn get_arrow_impl_capnp(
+        &self,
+        query: &Query,
+    ) -> std::result::Result<ArrowImplResponse, HyperSyncResponseError> {
+        let mut url = self.inner.url.clone();
+        let mut segments = url.path_segments_mut().ok().context("get path segments")?;
+        segments.push("query");
+        segments.push("arrow-ipc");
+        segments.push("capnp");
+        std::mem::drop(segments);
+
+        let should_cache = self.should_cache_queries();
+
+        if should_cache {
+            let query_with_id = {
+                let mut message = capnp::message::Builder::new_default();
+                let mut request_builder =
+                    message.init_root::<hypersync_net_types_capnp::request::Builder>();
+
+                request_builder
+                    .build_query_id_from_query(query)
+                    .context("build query id")?;
+                let mut query_with_id = Vec::new();
+                capnp::serialize_packed::write_message(&mut query_with_id, &message)
+                    .context("write capnp message")?;
+                query_with_id
+            };
+
+            let req = self.inner.http_client.request(Method::POST, url.clone());
+
+            let res = req
+                .body(query_with_id)
+                .send()
+                .await
+                .context("execute http req")?;
+
+            let status = res.status();
+            let rate_limit = RateLimitInfo::from_response(&res);
+
+            if status == StatusCode::PAYLOAD_TOO_LARGE {
+                return Err(HyperSyncResponseError::PayloadTooLarge);
+            }
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                return Err(HyperSyncResponseError::RateLimited { rate_limit });
+            }
+            if status.is_success() {
+                let bytes = res.bytes().await.context("read response body bytes")?;
+
+                let mut opts = capnp::message::ReaderOptions::new();
+                opts.nesting_limit(i32::MAX).traversal_limit_in_words(None);
+                let message_reader = capnp::serialize_packed::read_message(bytes.as_ref(), opts)
+                    .context("create message reader")?;
+                let query_response = message_reader
+                    .get_root::<hypersync_net_types_capnp::cached_query_response::Reader>()
+                    .context("get cached_query_response root")?;
+                match query_response.get_either().which().context("get either")? {
+                hypersync_net_types_capnp::cached_query_response::either::Which::QueryResponse(
+                    query_response,
+                ) => {
+                    let res = tokio::task::block_in_place(|| {
+                        let res = query_response?;
+                        read_query_response(&res).context("parse query response cached")
+                    })?;
+                    return Ok(ArrowImplResponse {
+                        response: res,
+                        response_bytes: bytes.len().try_into().unwrap(),
+                        rate_limit,
+                    });
+                }
+                hypersync_net_types_capnp::cached_query_response::either::Which::NotCached(()) => {
+                    log::trace!("query was not cached, retrying with full query");
+                }
+            }
+            } else {
+                let text = res.text().await.context("read text to see error")?;
+                log::warn!(
+                    "Failed cache query, will retry full query. {}, err body: {}",
+                    status,
+                    text
+                );
+            }
+        };
+
+        let full_query_bytes = {
+            let mut message = capnp::message::Builder::new_default();
+            let mut query_builder =
+                message.init_root::<hypersync_net_types_capnp::request::Builder>();
+
+            query_builder
+                .build_full_query_from_query(query, should_cache)
+                .context("build full query")?;
+            let mut bytes = Vec::new();
+            capnp::serialize_packed::write_message(&mut bytes, &message)
+                .context("write full query capnp message")?;
+            bytes
+        };
+
+        let req = self.inner.http_client.request(Method::POST, url);
+
+        let res = req
+            .body(full_query_bytes)
+            .send()
+            .await
+            .context("execute http req")?;
+
+        let status = res.status();
+        let rate_limit = RateLimitInfo::from_response(&res);
+
+        if status == StatusCode::PAYLOAD_TOO_LARGE {
+            return Err(HyperSyncResponseError::PayloadTooLarge);
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(HyperSyncResponseError::RateLimited { rate_limit });
+        }
+        if !status.is_success() {
+            let text = res.text().await.context("read text to see error")?;
+
+            return Err(HyperSyncResponseError::Other(anyhow!(
+                "http response status code {}, err body: {}",
+                status,
+                text
+            )));
+        }
+
+        let bytes = res.bytes().await.context("read response body bytes")?;
+
+        let res = tokio::task::block_in_place(|| {
+            parse_query_response(&bytes).context("parse query response")
+        })?;
+
+        Ok(ArrowImplResponse {
+            response: res,
+            response_bytes: bytes.len().try_into().unwrap(),
+            rate_limit,
+        })
+    }
+
+    /// Executes query once and returns the result, handling payload-too-large by halving block range.
+    async fn get_arrow_impl(
+        &self,
+        query: &Query,
+    ) -> std::result::Result<ArrowImplResponse, HyperSyncResponseError> {
+        let mut query = query.clone();
+        loop {
+            let res = match self.inner.serialization_format {
+                SerializationFormat::Json => self.get_arrow_impl_json(&query).await,
+                SerializationFormat::CapnProto { .. } => self.get_arrow_impl_capnp(&query).await,
+            };
+            match res {
+                Ok(res) => return Ok(res),
+                Err(
+                    e @ (HyperSyncResponseError::Other(_)
+                    | HyperSyncResponseError::RateLimited { .. }),
+                ) => return Err(e),
+                Err(HyperSyncResponseError::PayloadTooLarge) => {
+                    let block_range = if let Some(to_block) = query.to_block {
+                        let current = to_block - query.from_block;
+                        if current < 2 {
+                            return Err(HyperSyncResponseError::Other(anyhow!(
+                                "Payload is too large and query is using the minimum block range."
+                            )));
+                        }
+                        // Half the current block range
+                        current / 2
+                    } else {
+                        200
+                    };
+                    let to_block = query.from_block + block_range;
+                    query.to_block = Some(to_block);
+
+                    log::trace!(
+                        "Payload is too large, retrying with block range from: {} to: {}",
+                        query.from_block,
+                        to_block
+                    );
+                }
+            }
+        }
+    }
+
+    /// Executes query with retries and returns the response in Arrow format.
+    pub async fn get_arrow(&self, query: &Query) -> Result<ArrowResponse> {
+        const WAIT_ON_RATE_LIMIT: bool = true;
+        self.get_arrow_with_size(query, WAIT_ON_RATE_LIMIT)
+            .await
+            .map(|res| res.response)
+    }
+
+    /// Internal implementation for get_arrow.
+    ///
+    /// When `wait_on_rate_limit` is `false`, a 429 response is returned
+    /// immediately with the rate limit info instead of being retried.
+    async fn get_arrow_with_size(
+        &self,
+        query: &Query,
+        wait_on_rate_limit: bool,
+    ) -> Result<ArrowImplResponse> {
+        let mut base = self.inner.retry_base_ms;
+
+        let mut err = anyhow!("");
+
+        if self.inner.proactive_rate_limit_sleep {
+            if wait_on_rate_limit {
+                self.wait_for_rate_limit().await;
+            } else if let Some(rate_limit) = self.get_proactive_rate_limit_info() {
+                return Err(anyhow::anyhow!(HyperSyncResponseError::RateLimited {
+                    rate_limit
+                }));
+            }
+        }
+
+        for _ in 0..self.inner.max_num_retries + 1 {
+            match self.get_arrow_impl(query).await {
+                Ok(res) => {
+                    self.update_rate_limit_state(&res.rate_limit);
+                    return Ok(res);
+                }
+                Err(HyperSyncResponseError::RateLimited { rate_limit }) => {
+                    self.update_rate_limit_state(&rate_limit);
+                    if !wait_on_rate_limit {
+                        return Err(anyhow::anyhow!(HyperSyncResponseError::RateLimited {
+                            rate_limit
+                        }));
+                    }
+                    let wait_secs = rate_limit.suggested_wait_secs().unwrap_or(1) + 1;
+                    log::warn!(
+                        "rate limited by server ({rate_limit}), waiting {wait_secs}s before retry. To increase your rate limits, upgrade your plan at https://envio.dev/app/api-tokens. For more info: https://docs.envio.dev/docs/HyperSync/api-tokens"
+                    );
+                    err = err.context(format!("rate limited by server ({rate_limit}). To increase your rate limits, upgrade your plan at https://envio.dev/app/api-tokens"));
+                    tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+                    continue;
+                }
+                Err(HyperSyncResponseError::Other(e)) => {
+                    log::error!(
+                        "failed to get arrow data from server, retrying... The error was: {e:?}"
+                    );
+                    err = err.context(format!("{e:?}"));
+                }
+                Err(HyperSyncResponseError::PayloadTooLarge) => {
+                    // This shouldn't happen since get_arrow_impl handles it, but just in case
+                    log::error!("unexpected PayloadTooLarge from get_arrow_impl, retrying...");
+                    err = err.context("unexpected PayloadTooLarge");
+                }
+            }
+
+            let base_ms = Duration::from_millis(base);
+            let jitter = Duration::from_millis(fastrange_rs::fastrange_64(
+                rand::random(),
+                self.inner.retry_backoff_ms,
+            ));
+
+            tokio::time::sleep(base_ms + jitter).await;
+
+            base = std::cmp::min(
+                base + self.inner.retry_backoff_ms,
+                self.inner.retry_ceiling_ms,
+            );
+        }
+
+        Err(err)
+    }
+
+    /// Spawns task to execute query and return data via a channel.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use hypersync_client::{Client, net_types::{Query, LogFilter, LogField}, StreamConfig};
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN")?)
+    ///     .build()?;
+    ///
+    /// // Stream all ERC20 transfer events
+    /// let query = Query::new()
+    ///     .from_block(19000000)
+    ///     .where_logs(
+    ///         LogFilter::all()
+    ///             .and_topic0(["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"])?
+    ///     )
+    ///     .select_log_fields([LogField::Address, LogField::Topic1, LogField::Topic2, LogField::Data]);
+    /// let mut receiver = client.stream(query, StreamConfig::default()).await?;
+    ///
+    /// while let Some(response) = receiver.recv().await {
+    ///     let response = response?;
+    ///     println!("Got {} events up to block: {}", response.data.logs.len(), response.next_block);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn stream(
+        &self,
+        query: Query,
+        config: StreamConfig,
+    ) -> Result<mpsc::Receiver<Result<QueryResponse>>> {
+        check_simple_stream_params(&config)?;
+
+        let (tx, rx): (_, mpsc::Receiver<Result<QueryResponse>>) =
+            mpsc::channel(config.concurrency);
+
+        let mut inner_rx = self
+            .stream_arrow(query, config)
+            .await
+            .context("start inner stream")?;
+
+        tokio::spawn(async move {
+            while let Some(resp) = inner_rx.recv().await {
+                let msg = resp
+                    .context("inner receiver")
+                    .and_then(|r| QueryResponse::try_from(&r));
+                let is_err = msg.is_err();
+                if tx.send(msg).await.is_err() || is_err {
+                    return;
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+
+    /// Add block, transaction and log fields selection to the query and spawns task to execute it,
+    /// returning data via a channel.
+    ///
+    /// This method automatically joins blocks, transactions, and logs into unified events,
+    /// then streams them via a channel for real-time processing.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use hypersync_client::{Client, net_types::{Query, LogFilter, LogField, TransactionField}, StreamConfig};
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN")?)
+    ///     .build()?;
+    ///
+    /// // Stream NFT transfer events with transaction context
+    /// let query = Query::new()
+    ///     .from_block(19000000)
+    ///     .where_logs(
+    ///         LogFilter::all()
+    ///             .and_topic0(["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"])?
+    ///     )
+    ///     .select_log_fields([LogField::Address, LogField::Topic1, LogField::Topic2])
+    ///     .select_transaction_fields([TransactionField::Hash, TransactionField::From]);
+    /// let mut receiver = client.stream_events(query, StreamConfig::default()).await?;
+    ///
+    /// while let Some(response) = receiver.recv().await {
+    ///     let response = response?;
+    ///     println!("Got {} joined events up to block: {}", response.data.len(), response.next_block);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn stream_events(
+        &self,
+        mut query: Query,
+        config: StreamConfig,
+    ) -> Result<mpsc::Receiver<Result<EventResponse>>> {
+        check_simple_stream_params(&config)?;
+
+        let event_join_strategy = InternalEventJoinStrategy::from(&query.field_selection);
+
+        event_join_strategy.add_join_fields_to_selection(&mut query.field_selection);
+
+        let (tx, rx): (_, mpsc::Receiver<Result<EventResponse>>) =
+            mpsc::channel(config.concurrency);
+
+        let mut inner_rx = self
+            .stream_arrow(query, config)
+            .await
+            .context("start inner stream")?;
+
+        tokio::spawn(async move {
+            while let Some(resp) = inner_rx.recv().await {
+                let msg = resp
+                    .context("inner receiver")
+                    .and_then(|r| EventResponse::try_from_arrow_response(&r, &event_join_strategy));
+                let is_err = msg.is_err();
+                if tx.send(msg).await.is_err() || is_err {
+                    return;
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+
+    /// Spawns task to execute query and return data via a channel in Arrow format.
+    ///
+    /// Returns raw Apache Arrow data via a channel for high-performance processing.
+    /// Ideal for applications that need to work directly with columnar data.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use hypersync_client::{Client, net_types::{Query, TransactionFilter, TransactionField}, StreamConfig};
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN")?)
+    ///     .build()?;
+    ///
+    /// // Stream transaction data in Arrow format for analytics
+    /// let query = Query::new()
+    ///     .from_block(19000000)
+    ///     .to_block_excl(19000100)
+    ///     .where_transactions(
+    ///         TransactionFilter::all()
+    ///             .and_contract_address(["0xA0b86a33E6411b87Fd9D3DF822C8698FC06BBe4c"])?
+    ///     )
+    ///     .select_transaction_fields([TransactionField::Hash, TransactionField::From, TransactionField::Value]);
+    /// let mut receiver = client.stream_arrow(query, StreamConfig::default()).await?;
+    ///
+    /// while let Some(response) = receiver.recv().await {
+    ///     let response = response?;
+    ///     println!("Got {} Arrow batches for transactions", response.data.transactions.len());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn stream_arrow(
+        &self,
+        query: Query,
+        config: StreamConfig,
+    ) -> Result<mpsc::Receiver<Result<ArrowResponse>>> {
+        stream::stream_arrow(self, query, config).await
+    }
+
+    /// Like [`stream_arrow`](Self::stream_arrow), but reports streaming metrics to
+    /// the given [`StreamObserver`].
+    ///
+    /// The engine calls [`StreamObserver::on_request`] for every completed HTTP
+    /// request, [`StreamObserver::on_progress`] once per scheduler iteration, and
+    /// [`StreamObserver::on_finish`] with the final [`StreamSummary`]. Pass an
+    /// `Arc<`[`StreamMetrics`]`>` for a ready-made aggregate handle you can read
+    /// during or after the stream, or implement the trait for custom exporters.
+    ///
+    /// This is the only entry point that does any metrics work; the plain
+    /// `stream*` methods have zero observability overhead.
+    ///
+    /// [`StreamMetrics`]: crate::StreamMetrics
+    /// [`StreamObserver`]: crate::StreamObserver
+    /// [`StreamSummary`]: crate::StreamSummary
+    pub async fn stream_arrow_with_observer(
+        &self,
+        query: Query,
+        config: StreamConfig,
+        observer: Arc<dyn crate::StreamObserver>,
+    ) -> Result<mpsc::Receiver<Result<ArrowResponse>>> {
+        stream::stream_arrow_with_observer(self, query, config, observer).await
+    }
+
+    /// Executes query and returns the response in Arrow format along with
+    /// rate limit information from the server.
+    ///
+    /// Unlike [`get_arrow`](Self::get_arrow), this method does **not** retry on
+    /// HTTP 429 responses. Instead it returns
+    /// [`RateLimitResponse::RateLimited`] so the caller can implement their own
+    /// back-off. Other transient errors are still retried normally.
+    pub async fn get_arrow_with_rate_limit(
+        &self,
+        query: &Query,
+    ) -> Result<RateLimitResponse<ArrowResponseData>> {
+        const WAIT_ON_RATE_LIMIT: bool = false;
+        match self.get_arrow_with_size(query, WAIT_ON_RATE_LIMIT).await {
+            Ok(result) => Ok(RateLimitResponse::Success {
+                response: result.response,
+                rate_limit: result.rate_limit,
+            }),
+            Err(e) => match e.downcast::<HyperSyncResponseError>() {
+                Ok(HyperSyncResponseError::RateLimited { rate_limit }) => {
+                    Ok(RateLimitResponse::RateLimited(rate_limit))
+                }
+                Ok(other) => Err(other.into()),
+                Err(e) => Err(e),
+            },
+        }
+    }
+
+    /// Executes query and returns the response along with
+    /// rate limit information from the server.
+    ///
+    /// Unlike [`get`](Self::get), this method does **not** retry on HTTP 429
+    /// responses. Instead it returns
+    /// [`RateLimitResponse::RateLimited`] so the caller can implement their own
+    /// back-off. Other transient errors are still retried normally.
+    pub async fn get_with_rate_limit(
+        &self,
+        query: &Query,
+    ) -> Result<RateLimitResponse<ResponseData>> {
+        match self.get_arrow_with_rate_limit(query).await? {
+            RateLimitResponse::Success {
+                response,
+                rate_limit,
+            } => {
+                let converted =
+                    QueryResponse::try_from(&response).context("convert arrow response")?;
+                Ok(RateLimitResponse::Success {
+                    response: converted,
+                    rate_limit,
+                })
+            }
+            RateLimitResponse::RateLimited(info) => Ok(RateLimitResponse::RateLimited(info)),
+        }
+    }
+
+    /// Executes query and returns joined events along with rate limit
+    /// information from the server.
+    ///
+    /// Unlike [`get_events`](Self::get_events), this method does **not** retry
+    /// on HTTP 429 responses. Instead it returns
+    /// [`RateLimitResponse::RateLimited`] so the caller can implement their own
+    /// back-off. Other transient errors are still retried normally.
+    pub async fn get_events_with_rate_limit(
+        &self,
+        mut query: Query,
+    ) -> Result<RateLimitResponse<Vec<simple_types::Event>>> {
+        let event_join_strategy = InternalEventJoinStrategy::from(&query.field_selection);
+        event_join_strategy.add_join_fields_to_selection(&mut query.field_selection);
+        match self.get_arrow_with_rate_limit(&query).await? {
+            RateLimitResponse::Success {
+                response,
+                rate_limit,
+            } => {
+                let converted =
+                    EventResponse::try_from_arrow_response(&response, &event_join_strategy)?;
+                Ok(RateLimitResponse::Success {
+                    response: converted,
+                    rate_limit,
+                })
+            }
+            RateLimitResponse::RateLimited(info) => Ok(RateLimitResponse::RateLimited(info)),
+        }
+    }
+
+    /// Returns the most recently observed rate limit information, if any.
+    ///
+    /// Updated after every request (including inside streams). Returns `None`
+    /// if no requests have been made yet or the server hasn't returned rate limit headers.
+    pub fn rate_limit_info(&self) -> Option<RateLimitInfo> {
+        self.inner
+            .rate_limit_state
+            .lock()
+            .expect("rate_limit_state mutex poisoned")
+            .as_ref()
+            .map(|(info, _captured_at)| info.clone())
+    }
+
+    /// Returns the current rate limit info if the client is known to be rate-limited
+    /// and the reset window has not yet elapsed.
+    fn get_proactive_rate_limit_info(&self) -> Option<RateLimitInfo> {
+        let state = self
+            .inner
+            .rate_limit_state
+            .lock()
+            .expect("rate_limit_state mutex poisoned");
+        match state.as_ref() {
+            Some((info, captured_at)) if info.is_rate_limited() => {
+                let remaining_wait = info.suggested_wait_secs().map(|secs| {
+                    let elapsed = captured_at.elapsed().as_secs();
+                    secs.saturating_sub(elapsed)
+                });
+                if remaining_wait.unwrap_or(0) > 0 {
+                    Some(info.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Waits until the current rate limit window resets, if the client is rate limited.
+    ///
+    /// Returns immediately if:
+    /// - No rate limit information has been observed yet
+    /// - There is remaining quota in the current window
+    ///
+    /// This method is useful for consumers who want to explicitly wait before making
+    /// requests, for example when coordinating rate limits across multiple systems.
+    pub async fn wait_for_rate_limit(&self) {
+        if let Some(info) = self.get_proactive_rate_limit_info() {
+            let secs = info.suggested_wait_secs().unwrap_or(0);
+            if secs > 0 {
+                log::warn!(
+                    "rate limit exhausted ({info}), proactively waiting {secs}s for window reset. To increase your rate limits, upgrade your plan at https://envio.dev/app/api-tokens. For more info: https://docs.envio.dev/docs/HyperSync/api-tokens"
+                );
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+            }
+        }
+    }
+
+    /// Updates the internally tracked rate limit state with the current timestamp.
+    fn update_rate_limit_state(&self, rate_limit: &RateLimitInfo) {
+        // Only update if the response actually contained rate limit headers
+        if rate_limit.limit.is_some()
+            || rate_limit.remaining.is_some()
+            || rate_limit.reset_secs.is_some()
+        {
+            let mut state = self
+                .inner
+                .rate_limit_state
+                .lock()
+                .expect("rate_limit_state mutex poisoned");
+            *state = Some((rate_limit.clone(), Instant::now()));
+        }
+    }
+
+    /// Getter for url field.
+    ///
+    /// # Example
+    /// ```
+    /// use hypersync_client::Client;
+    ///
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN").unwrap())
+    ///     .build()
+    ///     .unwrap();
+    ///
+    /// println!("Client URL: {}", client.url());
+    /// ```
+    pub fn url(&self) -> &Url {
+        &self.inner.url
+    }
+}
+
+/// Builder for creating a hypersync client with configuration options.
+///
+/// This builder provides a fluent API for configuring client settings like URL,
+/// authentication, timeouts, and retry behavior.
+///
+/// # Example
+/// ```
+/// use hypersync_client::{Client, SerializationFormat};
+///
+/// let client = Client::builder()
+///     .chain_id(1)
+///     .api_token(std::env::var("ENVIO_API_TOKEN").unwrap())
+///     .http_req_timeout_millis(30000)
+///     .max_num_retries(3)
+///     .build()
+///     .unwrap();
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct ClientBuilder(ClientConfig);
+
+impl ClientBuilder {
+    /// Creates a new ClientBuilder with default configuration.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the chain ID and automatically configures the URL for the hypersync endpoint.
+    ///
+    /// This is a convenience method that sets the URL to `https://{chain_id}.hypersync.xyz`.
+    ///
+    /// # Arguments
+    /// * `chain_id` - The blockchain chain ID (e.g., 1 for Ethereum mainnet)
+    ///
+    /// # Example
+    /// ```
+    /// use hypersync_client::Client;
+    ///
+    /// let client = Client::builder()
+    ///     .chain_id(1) // Ethereum mainnet
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN").unwrap())
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn chain_id(mut self, chain_id: u64) -> Self {
+        self.0.url = format!("https://{chain_id}.hypersync.xyz");
+        self
+    }
+
+    /// Sets a custom URL for the hypersync server.
+    ///
+    /// Use this method when you need to connect to a custom hypersync endpoint
+    /// instead of the default public endpoints.
+    ///
+    /// # Arguments
+    /// * `url` - The hypersync server URL
+    ///
+    /// # Example
+    /// ```
+    /// use hypersync_client::Client;
+    ///
+    /// let client = Client::builder()
+    ///     .url("https://my-custom-hypersync.example.com")
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN").unwrap())
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn url<S: ToString>(mut self, url: S) -> Self {
+        self.0.url = url.to_string();
+        self
+    }
+
+    /// Sets the api token for authentication.
+    ///
+    /// Required for accessing authenticated hypersync endpoints.
+    ///
+    /// # Arguments
+    /// * `api_token` - The authentication token
+    ///
+    /// # Example
+    /// ```
+    /// use hypersync_client::Client;
+    ///
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN").unwrap())
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn api_token<S: ToString>(mut self, api_token: S) -> Self {
+        self.0.api_token = api_token.to_string();
+        self
+    }
+
+    /// Sets the HTTP request timeout in milliseconds.
+    ///
+    /// # Arguments
+    /// * `http_req_timeout_millis` - Timeout in milliseconds (default: 30000)
+    ///
+    /// # Example
+    /// ```
+    /// use hypersync_client::Client;
+    ///
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN").unwrap())
+    ///     .http_req_timeout_millis(60000) // 60 second timeout
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn http_req_timeout_millis(mut self, http_req_timeout_millis: u64) -> Self {
+        self.0.http_req_timeout_millis = http_req_timeout_millis;
+        self
+    }
+
+    /// Sets the maximum number of retries for failed requests.
+    ///
+    /// # Arguments
+    /// * `max_num_retries` - Maximum number of retries (default: 10)
+    ///
+    /// # Example
+    /// ```
+    /// use hypersync_client::Client;
+    ///
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN").unwrap())
+    ///     .max_num_retries(5)
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn max_num_retries(mut self, max_num_retries: usize) -> Self {
+        self.0.max_num_retries = max_num_retries;
+        self
+    }
+
+    /// Sets the backoff increment for retry delays.
+    ///
+    /// This value is added to the base delay on each retry attempt.
+    ///
+    /// # Arguments
+    /// * `retry_backoff_ms` - Backoff increment in milliseconds (default: 500)
+    ///
+    /// # Example
+    /// ```
+    /// use hypersync_client::Client;
+    ///
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN").unwrap())
+    ///     .retry_backoff_ms(1000) // 1 second backoff increment
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn retry_backoff_ms(mut self, retry_backoff_ms: u64) -> Self {
+        self.0.retry_backoff_ms = retry_backoff_ms;
+        self
+    }
+
+    /// Sets the initial delay for retry attempts.
+    ///
+    /// # Arguments
+    /// * `retry_base_ms` - Initial retry delay in milliseconds (default: 500)
+    ///
+    /// # Example
+    /// ```
+    /// use hypersync_client::Client;
+    ///
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN").unwrap())
+    ///     .retry_base_ms(1000) // Start with 1 second delay
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn retry_base_ms(mut self, retry_base_ms: u64) -> Self {
+        self.0.retry_base_ms = retry_base_ms;
+        self
+    }
+
+    /// Sets the maximum delay for retry attempts.
+    ///
+    /// The retry delay will not exceed this value, even with backoff increments.
+    ///
+    /// # Arguments
+    /// * `retry_ceiling_ms` - Maximum retry delay in milliseconds (default: 10000)
+    ///
+    /// # Example
+    /// ```
+    /// use hypersync_client::Client;
+    ///
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN").unwrap())
+    ///     .retry_ceiling_ms(30000) // Cap at 30 seconds
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn retry_ceiling_ms(mut self, retry_ceiling_ms: u64) -> Self {
+        self.0.retry_ceiling_ms = retry_ceiling_ms;
+        self
+    }
+
+    /// Sets whether to proactively sleep when rate limited.
+    ///
+    /// When enabled (default), the client will wait for the rate limit window to reset
+    /// before sending requests it knows will be rejected. Set to `false` to disable
+    /// this behavior and handle rate limits yourself.
+    ///
+    /// # Arguments
+    /// * `proactive_rate_limit_sleep` - Whether to enable proactive rate limit sleeping (default: true)
+    pub fn proactive_rate_limit_sleep(mut self, proactive_rate_limit_sleep: bool) -> Self {
+        self.0.proactive_rate_limit_sleep = proactive_rate_limit_sleep;
+        self
+    }
+
+    /// Sets the serialization format for client-server communication.
+    ///
+    /// # Arguments
+    /// * `serialization_format` - The format to use (JSON or CapnProto)
+    ///
+    /// # Example
+    /// ```
+    /// use hypersync_client::{Client, SerializationFormat};
+    ///
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN").unwrap())
+    ///     .serialization_format(SerializationFormat::Json)
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn serialization_format(mut self, serialization_format: SerializationFormat) -> Self {
+        self.0.serialization_format = serialization_format;
+        self
+    }
+
+    /// Builds the client with the configured settings.
+    ///
+    /// # Returns
+    /// * `Result<Client>` - The configured client or an error if configuration is invalid
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// * The URL is malformed
+    /// * Required configuration is missing
+    ///
+    /// # Example
+    /// ```
+    /// use hypersync_client::Client;
+    ///
+    /// let client = Client::builder()
+    ///     .chain_id(1)
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN").unwrap())
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn build(self) -> Result<Client> {
+        if self.0.url.is_empty() {
+            anyhow::bail!(
+                "endpoint needs to be set, try using builder.chain_id(1) or\
+                builder.url(\"https://eth.hypersync.xyz\") to set the endpoint"
+            )
+        }
+        Client::new(self.0)
+    }
+}
+
+/// 200ms
+const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(200);
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+/// Timeout for detecting dead connections. Server sends keepalive pings every 5s,
+/// so we timeout after 15s (3x the ping interval).
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Events emitted by the height stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeightStreamEvent {
+    /// Successfully connected or reconnected to the SSE stream.
+    Connected,
+    /// Received a height update from the server.
+    Height(u64),
+    /// Connection lost, will attempt to reconnect after the specified delay.
+    Reconnecting {
+        /// Duration to wait before attempting reconnection.
+        delay: Duration,
+        /// The error that caused the reconnection.
+        error_msg: String,
+    },
+}
+
+enum InternalStreamEvent {
+    Publish(HeightStreamEvent),
+    Ping,
+    Unknown(String),
+}
+
+impl Client {
+    fn get_es_stream(&self) -> Result<EventSource> {
+        // Build the GET /height/sse request
+        let mut url = self.inner.url.clone();
+        url.path_segments_mut()
+            .ok()
+            .context("invalid base URL")?
+            .extend(&["height", "sse"]);
+
+        let req = self
+            .inner
+            .http_client
+            // Don't set timeout for SSE stream
+            .request_no_timeout(Method::GET, url);
+
+        // Configure exponential backoff for library-level retries
+        let retry_policy = ExponentialBackoff::new(
+            INITIAL_RECONNECT_DELAY,
+            2.0,
+            Some(MAX_RECONNECT_DELAY),
+            None, // unlimited retries
+        );
+
+        // Turn the request into an EventSource stream with retries
+        let mut es = reqwest_eventsource::EventSource::new(req)
+            .context("unexpected error creating EventSource")?;
+        es.set_retry_policy(Box::new(retry_policy));
+        Ok(es)
+    }
+
+    async fn next_height(event_source: &mut EventSource) -> Result<Option<InternalStreamEvent>> {
+        let Some(res) = tokio::time::timeout(READ_TIMEOUT, event_source.next())
+            .await
+            .map_err(|d| anyhow::anyhow!("stream timed out after {d}"))?
+        else {
+            return Ok(None);
+        };
+
+        let e = match res.context("failed response")? {
+            Event::Open => InternalStreamEvent::Publish(HeightStreamEvent::Connected),
+            Event::Message(event) => match event.event.as_str() {
+                "height" => {
+                    let height = event
+                        .data
+                        .trim()
+                        .parse::<u64>()
+                        .context("parsing height from event data")?;
+                    InternalStreamEvent::Publish(HeightStreamEvent::Height(height))
+                }
+                "ping" => InternalStreamEvent::Ping,
+                _ => InternalStreamEvent::Unknown(format!("unknown event: {:?}", event)),
+            },
+        };
+
+        Ok(Some(e))
+    }
+
+    async fn stream_height_events(
+        es: &mut EventSource,
+        tx: &mpsc::Sender<HeightStreamEvent>,
+    ) -> Result<bool> {
+        let mut received_an_event = false;
+        while let Some(event) = Self::next_height(es).await.context("failed next height")? {
+            match event {
+                InternalStreamEvent::Publish(event) => {
+                    received_an_event = true;
+                    if tx.send(event).await.is_err() {
+                        return Ok(received_an_event); // Receiver dropped, exit task
+                    }
+                }
+                InternalStreamEvent::Ping => (), // ignore pings
+                InternalStreamEvent::Unknown(_event) => (), // ignore unknown events
+            }
+        }
+        Ok(received_an_event)
+    }
+
+    fn get_delay(consecutive_failures: u32) -> Duration {
+        if consecutive_failures > 0 {
+            /// helper function to calculate 2^x
+            /// optimization using bit shifting
+            const fn two_to_pow(x: u32) -> u32 {
+                1 << x
+            }
+            // Exponential backoff: 200ms, 400ms, 800ms, ... up to 30s
+            INITIAL_RECONNECT_DELAY
+                .saturating_mul(two_to_pow(consecutive_failures - 1))
+                .min(MAX_RECONNECT_DELAY)
+        } else {
+            // On zero consecutive failures, 0 delay
+            Duration::from_millis(0)
+        }
+    }
+
+    async fn stream_height_events_with_retry(
+        &self,
+        tx: &mpsc::Sender<HeightStreamEvent>,
+    ) -> Result<()> {
+        let mut consecutive_failures = 0u32;
+
+        loop {
+            // should always be able to creat a new es stream
+            // something is wrong with the req builder otherwise
+            let mut es = self.get_es_stream().context("get es stream")?;
+
+            let mut error = anyhow!("");
+
+            match Self::stream_height_events(&mut es, tx).await {
+                Ok(received_an_event) => {
+                    if received_an_event {
+                        consecutive_failures = 0; // Reset after successful connection that then failed
+                    }
+                    log::trace!("Stream height exited");
+                }
+                Err(e) => {
+                    log::trace!("Stream height failed: {e:?}");
+                    error = e;
+                }
+            }
+
+            es.close();
+
+            // If the receiver is closed, exit the task
+            if tx.is_closed() {
+                break;
+            }
+
+            let delay = Self::get_delay(consecutive_failures);
+            log::trace!("Reconnecting in {:?}...", delay);
+
+            let error_msg = format!("{error:?}");
+
+            if tx
+                .send(HeightStreamEvent::Reconnecting { delay, error_msg })
+                .await
+                .is_err()
+            {
+                return Ok(()); // Receiver dropped, exit task
+            }
+            tokio::time::sleep(delay).await;
+
+            // increment consecutive failures so that on the next try
+            // it will start using back offs
+            consecutive_failures += 1;
+        }
+
+        Ok(())
+    }
+
+    /// Streams archive height updates from the server via Server-Sent Events.
+    ///
+    /// Establishes a long-lived SSE connection to `/height/sse` that automatically reconnects
+    /// on disconnection with exponential backoff (200ms → 400ms → ... → max 30s).
+    ///
+    /// The stream emits [`HeightStreamEvent`] to notify consumers of connection state changes
+    /// and height updates. This allows applications to display connection status to users.
+    ///
+    /// # Returns
+    /// Channel receiver yielding [`HeightStreamEvent`]s. The background task handles connection
+    /// lifecycle and sends events through this channel.
+    ///
+    /// # Example
+    /// ```
+    /// # use hypersync_client::{Client, HeightStreamEvent};
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let client = Client::builder()
+    ///     .url("https://eth.hypersync.xyz")
+    ///     .api_token(std::env::var("ENVIO_API_TOKEN").unwrap())
+    ///     .build()?;
+    ///
+    /// let mut rx = client.stream_height();
+    ///
+    /// while let Some(event) = rx.recv().await {
+    ///     match event {
+    ///         HeightStreamEvent::Connected => println!("Connected to stream"),
+    ///         HeightStreamEvent::Height(h) => println!("Height: {}", h),
+    ///         HeightStreamEvent::Reconnecting { delay, error_msg } => {
+    ///             println!("Reconnecting in {delay:?} due to error: {error_msg}")
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn stream_height(&self) -> mpsc::Receiver<HeightStreamEvent> {
+        let (tx, rx) = mpsc::channel(16);
+        let client = self.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = client.stream_height_events_with_retry(&tx).await {
+                log::error!("Stream height failed unexpectedly: {e:?}");
+            }
+        });
+
+        rx
+    }
+}
+
+/// Validate a [`StreamConfig`] for the simple-type functions (`collect`, `collect_events`,
+/// `stream`, `stream_events`).
+///
+/// These functions decode raw binary Arrow columns into simple types, so the Arrow-only options
+/// (`event_signature`, `column_mapping`, `hex_output`) are rejected rather than silently ignored.
+fn check_simple_stream_params(config: &StreamConfig) -> Result<()> {
+    if config.event_signature.is_some() {
+        return Err(anyhow!(
+            "config.event_signature can't be passed to simple type function. User is expected to \
+             decode the logs using Decoder."
+        ));
+    }
+    if config.column_mapping.is_some() {
+        return Err(anyhow!(
+            "config.column_mapping can't be passed to single type function. User is expected to \
+             map values manually."
+        ));
+    }
+    if config.hex_output != HexOutput::NoEncode {
+        return Err(anyhow!(
+            "config.hex_output must be HexOutput::NoEncode for simple type functions. The simple \
+             types hold raw bytes and format them as hex themselves; hex_output only applies to \
+             collect_arrow, collect_parquet and stream_arrow."
+        ));
+    }
+
+    Ok(())
+}
+
+/// Used to indicate whether or not a retry should be attempted.
+#[derive(Debug, thiserror::Error)]
+pub enum HyperSyncResponseError {
+    /// Means that the client should retry with a smaller block range.
+    #[error("hypersync responded with 'payload too large' error")]
+    PayloadTooLarge,
+    /// Server responded with 429 Too Many Requests.
+    #[error("rate limited by server. To increase your rate limits, upgrade your plan at https://envio.dev/app/api-tokens. For more info: https://docs.envio.dev/docs/HyperSync/api-tokens")]
+    RateLimited {
+        /// Rate limit information from the 429 response headers.
+        rate_limit: RateLimitInfo,
+    },
+    /// Any other server error.
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+/// Result of a single Arrow query execution, before retry logic.
+struct ArrowImplResponse {
+    /// The parsed Arrow response data.
+    response: ArrowResponse,
+    /// Size of the response body in bytes.
+    response_bytes: u64,
+    /// Rate limit information parsed from response headers.
+    rate_limit: RateLimitInfo,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simple_stream_params_reject_hex_output() {
+        for hex_output in [HexOutput::Prefixed, HexOutput::NonPrefixed] {
+            let config = StreamConfig {
+                hex_output,
+                ..Default::default()
+            };
+            assert!(check_simple_stream_params(&config).is_err());
+        }
+        assert!(check_simple_stream_params(&StreamConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn simple_stream_params_reject_event_signature_and_column_mapping() {
+        let config = StreamConfig {
+            event_signature: Some("Transfer(address,address,uint256)".to_owned()),
+            ..Default::default()
+        };
+        assert!(check_simple_stream_params(&config).is_err());
+
+        let config = StreamConfig {
+            column_mapping: Some(ColumnMapping::default()),
+            ..Default::default()
+        };
+        assert!(check_simple_stream_params(&config).is_err());
+    }
+    #[test]
+    fn test_get_delay() {
+        assert_eq!(
+            Client::get_delay(0),
+            Duration::from_millis(0),
+            "starts with 0 delay"
+        );
+        // powers of 2 backoff
+        assert_eq!(Client::get_delay(1), Duration::from_millis(200));
+        assert_eq!(Client::get_delay(2), Duration::from_millis(400));
+        assert_eq!(Client::get_delay(3), Duration::from_millis(800));
+        // maxes out at 30s
+        assert_eq!(
+            Client::get_delay(9),
+            Duration::from_secs(30),
+            "max delay is 30s"
+        );
+        assert_eq!(
+            Client::get_delay(10),
+            Duration::from_secs(30),
+            "max delay is 30s"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test requiring live hs server"]
+    async fn test_http2_is_used() -> anyhow::Result<()> {
+        let api_token = std::env::var("ENVIO_API_TOKEN")?;
+        let client = reqwest::Client::builder()
+            .no_gzip()
+            .user_agent("hscr-test")
+            .build()?;
+
+        let res = client
+            .get("https://eth.hypersync.xyz/height")
+            .bearer_auth(&api_token)
+            .send()
+            .await?;
+
+        assert_eq!(
+            res.version(),
+            reqwest::Version::HTTP_2,
+            "expected HTTP/2 but got {:?}",
+            res.version()
+        );
+        assert!(res.status().is_success());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "integration test with live hs server for height stream"]
+    async fn test_stream_height_events() -> anyhow::Result<()> {
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = tokio::spawn(async move {
+            let client = Client::builder()
+                .url("https://monad-testnet.hypersync.xyz")
+                .api_token(std::env::var("ENVIO_API_TOKEN").unwrap())
+                .build()?;
+            let mut es = client.get_es_stream().context("get es stream")?;
+            Client::stream_height_events(&mut es, &tx).await
+        });
+
+        let val = rx.recv().await;
+        assert!(val.is_some());
+        assert_eq!(val.unwrap(), HeightStreamEvent::Connected);
+        let Some(HeightStreamEvent::Height(height)) = rx.recv().await else {
+            panic!("should have received height")
+        };
+        let Some(HeightStreamEvent::Height(height2)) = rx.recv().await else {
+            panic!("should have received height")
+        };
+        assert!(height2 > height);
+        drop(rx);
+
+        let res = handle.await.expect("should have joined");
+        let received_an_event =
+            res.expect("should have ended the stream gracefully after dropping rx");
+        assert!(received_an_event, "should have received an event");
+
+        Ok(())
+    }
+}

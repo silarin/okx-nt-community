@@ -113,6 +113,7 @@ repos:
       - id: codespell
         description: Checks for common misspellings
         types_or: [rust, python, toml, yaml, rst, markdown]
+        exclude: ^patches/hypersync-(client|net-types)/
 
   - repo: https://github.com/gitleaks/gitleaks
     # Pinned to v8.30.1: autoupdate occasionally selects the lower v8.30.0 tag

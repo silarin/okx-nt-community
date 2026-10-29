@@ -1,0 +1,145 @@
+use crate::rate_limit::RateLimitInfo;
+use crate::simple_types::{Block, Event, InternalEventJoinStrategy, Log, Trace, Transaction};
+use anyhow::Context;
+use arrow::array::RecordBatch;
+use hypersync_net_types::RollbackGuard;
+
+/// Query response in Arrow format
+#[derive(Default, Debug, Clone)]
+pub struct ArrowResponseData {
+    /// Query blocks response
+    pub blocks: Vec<RecordBatch>,
+    /// Query transactions response
+    pub transactions: Vec<RecordBatch>,
+    /// Query logs response
+    pub logs: Vec<RecordBatch>,
+    /// Query traces response
+    pub traces: Vec<RecordBatch>,
+    /// Query decoded_logs response.
+    ///
+    /// Populated only if event_signature is present.
+    pub decoded_logs: Vec<RecordBatch>,
+}
+
+/// Query response data in Rust native format
+#[derive(Default, Debug, Clone)]
+pub struct ResponseData {
+    /// Query blocks response
+    pub blocks: Vec<Vec<Block>>,
+    /// Query transactions response
+    pub transactions: Vec<Vec<Transaction>>,
+    /// Query logs response
+    pub logs: Vec<Vec<Log>>,
+    /// Query traces response
+    pub traces: Vec<Vec<Trace>>,
+}
+
+impl EventResponse {
+    /// Create EventResponse from ArrowResponse with the specified event join strategy
+    pub(crate) fn try_from_arrow_response(
+        arrow_response: &ArrowResponse,
+        event_join_strategy: &InternalEventJoinStrategy,
+    ) -> anyhow::Result<Self> {
+        let r: QueryResponse = arrow_response
+            .try_into()
+            .context("convert arrow response")?;
+        Ok(Self {
+            archive_height: r.archive_height,
+            next_block: r.next_block,
+            total_execution_time: r.total_execution_time,
+            data: event_join_strategy.join_from_response_data(r.data),
+            rollback_guard: r.rollback_guard,
+        })
+    }
+}
+
+impl TryFrom<&'_ ArrowResponse> for QueryResponse {
+    type Error = anyhow::Error;
+    fn try_from(arrow_response: &ArrowResponse) -> Result<Self, Self::Error> {
+        let blocks = arrow_response
+            .data
+            .blocks
+            .iter()
+            .map(Block::from_arrow)
+            .collect::<anyhow::Result<Vec<_>>>()
+            .context("convert blocks")?;
+
+        let transactions = arrow_response
+            .data
+            .transactions
+            .iter()
+            .map(Transaction::from_arrow)
+            .collect::<anyhow::Result<Vec<_>>>()
+            .context("convert transactions")?;
+
+        let logs = arrow_response
+            .data
+            .logs
+            .iter()
+            .map(Log::from_arrow)
+            .collect::<anyhow::Result<Vec<_>>>()
+            .context("convert logs")?;
+        let traces = arrow_response
+            .data
+            .traces
+            .iter()
+            .map(Trace::from_arrow)
+            .collect::<anyhow::Result<Vec<_>>>()
+            .context("convert traces")?;
+
+        Ok(QueryResponse {
+            archive_height: arrow_response.archive_height,
+            next_block: arrow_response.next_block,
+            total_execution_time: arrow_response.total_execution_time,
+            data: ResponseData {
+                blocks,
+                transactions,
+                logs,
+                traces,
+            },
+            rollback_guard: arrow_response.rollback_guard.clone(),
+        })
+    }
+}
+
+/// Query response from hypersync instance.
+/// Contain next_block field in case query didn't process all the block range
+#[derive(Debug, Clone)]
+pub struct QueryResponse<T = ResponseData> {
+    /// Current height of the source hypersync instance
+    pub archive_height: Option<u64>,
+    /// Next block to query for, the responses are paginated so
+    /// the caller should continue the query from this block if they
+    /// didn't get responses up to the to_block they specified in the Query.
+    pub next_block: u64,
+    /// Total time it took the hypersync instance to execute the query.
+    pub total_execution_time: u64,
+    /// Response data
+    pub data: T,
+    /// Rollback guard
+    pub rollback_guard: Option<RollbackGuard>,
+}
+
+/// Alias for Arrow Query response
+pub type ArrowResponse = QueryResponse<ArrowResponseData>;
+/// Alias for Event oriented, vectorized QueryResponse
+pub type EventResponse = QueryResponse<Vec<Event>>;
+
+/// Response from a `_with_rate_limit` method.
+///
+/// On a successful query the `Success` variant contains both the response data
+/// and the rate limit headers. When the server responds with HTTP 429, the
+/// `RateLimited` variant is returned immediately (without internal retry) so
+/// the caller can implement their own back-off.
+#[derive(Debug, Clone)]
+pub enum RateLimitResponse<T = ResponseData> {
+    /// The query succeeded.
+    Success {
+        /// The query response data.
+        response: QueryResponse<T>,
+        /// Rate limit information from response headers (if present).
+        rate_limit: RateLimitInfo,
+    },
+    /// The server responded with 429 Too Many Requests.
+    RateLimited(RateLimitInfo),
+}
