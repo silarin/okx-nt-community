@@ -269,6 +269,8 @@ pub fn evaluate_order_fee_evidence(
                 Some(CommissionBasis::UniformLiquidity) => match *roles {
                     0 | 2 => Some(0),
                     1 => Some(2),
+                    // Mixed maker/taker fees are unambiguous when both aggregates agree
+                    3 if totals[0] == totals[2] => Some(0),
                     _ => None,
                 },
                 None => None,
@@ -674,6 +676,65 @@ mod tests {
         pure.anchor_trade_time = Some(fills[0].ts_event);
         pure.constraints[0].amount = Some(Decimal::from(2));
         assert_eq!(check(&pure, &fills, true), FeeEvidenceState::Satisfied);
+    }
+
+    #[rstest]
+    #[case::positive("0.02 USD", "0.03 USD", "0.05")]
+    #[case::zero_maker("0.02 USD", "0 USD", "0.02")]
+    #[case::zero_taker("0 USD", "0.03 USD", "0.03")]
+    #[case::zero_fees("0 USD", "0 USD", "0")]
+    fn cumulative_commission_mixed_liquidity_requires_identical_fee_interpretations(
+        #[case] taker_fee: &str,
+        #[case] maker_fee: &str,
+        #[case] total: &str,
+        #[values(false, true)] reverse: bool,
+    ) {
+        let mut fills = [
+            fill("T1", "1", taker_fee, 1, LiquiditySide::Taker),
+            fill("T2", "1", maker_fee, 2, LiquiditySide::Maker),
+        ];
+
+        for fill in &mut fills {
+            fill.order_side = OrderSide::Sell;
+        }
+
+        if reverse {
+            fills.reverse();
+        }
+        let mut observed = evidence(
+            "2",
+            Some(("T2", 2)),
+            &[
+                (CommissionBasis::UniformLiquidity, total, Currency::USD()),
+                (CommissionBasis::RebatesOnly, "0", Currency::USD()),
+            ],
+        );
+        observed.order_side = OrderSide::Sell;
+        assert_eq!(check(&observed, &fills, true), FeeEvidenceState::Satisfied);
+        assert_eq!(check(&observed, &fills, false), FeeEvidenceState::Pending);
+
+        let mut conflicting = observed.clone();
+        conflicting.constraints[0].amount = Some(total.parse::<Decimal>().unwrap() + Decimal::ONE);
+        assert_eq!(
+            check(&conflicting, &fills, true),
+            FeeEvidenceState::Conflict
+        );
+        conflicting = observed.clone();
+        conflicting.constraints[1].amount = Some(-Decimal::ONE);
+        assert_eq!(
+            check(&conflicting, &fills, true),
+            FeeEvidenceState::Conflict
+        );
+
+        let mut missing = observed.clone();
+        missing.constraints[1].amount = None;
+        assert_eq!(check(&missing, &fills, true), FeeEvidenceState::Pending);
+        missing = observed.clone();
+        missing.constraints[0].currency = None;
+        assert_eq!(check(&missing, &fills, true), FeeEvidenceState::Pending);
+
+        fills[0].liquidity_side = LiquiditySide::NoLiquiditySide;
+        assert_eq!(check(&observed, &fills, true), FeeEvidenceState::Pending);
     }
 
     #[rstest]

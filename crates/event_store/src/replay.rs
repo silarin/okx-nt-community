@@ -5225,12 +5225,15 @@ mod tests {
     }
 
     #[rstest]
-    #[case::matching(false, false)]
-    #[case::conflicting(true, false)]
-    #[case::mixed(false, true)]
+    #[case::matching(false, false, false)]
+    #[case::conflicting(true, false, false)]
+    #[case::mixed(false, true, false)]
+    #[case::mixed_conflicting(true, true, false)]
+    #[case::mixed_rebate(false, true, true)]
     fn cumulative_commission_before_snapshot_anchor_is_enforced(
         #[case] conflict: bool,
         #[case] mixed: bool,
+        #[case] rebate: bool,
         #[values(false, true)] repeated_queries: bool,
         #[values(false, true)] snapshot: bool,
     ) {
@@ -5271,7 +5274,7 @@ mod tests {
             .account_id(submitted.account_id)
             .last_qty(Quantity::from("60000"))
             .trade_id(TradeId::from("FEE-2"))
-            .commission(Money::from("2 USD"))
+            .commission(Money::from(if rebate { "-2 USD" } else { "2 USD" }))
             .liquidity_side(if mixed {
                 LiquiditySide::Maker
             } else {
@@ -5301,7 +5304,17 @@ mod tests {
                 } else {
                     CommissionBasis::ChargesOnly
                 }),
-                amount: Some(if conflict { "4" } else { "3" }.parse().unwrap()),
+                amount: Some(
+                    if conflict {
+                        "4"
+                    } else if rebate {
+                        "1"
+                    } else {
+                        "3"
+                    }
+                    .parse()
+                    .unwrap(),
+                ),
                 currency: Some(Currency::USD()),
             }],
             unrepresentable_values: false,
@@ -5388,7 +5401,7 @@ mod tests {
                 Ok(())
             });
 
-        if conflict || mixed {
+        if conflict || rebate {
             assert!(
                 result
                     .unwrap_err()

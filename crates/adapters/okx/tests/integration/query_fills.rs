@@ -1964,11 +1964,14 @@ async fn test_persisted_restart_preserves_exact_fees_and_fill_authority(
 }
 
 #[rstest]
-#[case::canceled(false)]
-#[case::expired(true)]
+#[case::canceled(false, false)]
+#[case::expired(true, false)]
+#[case::mixed_canceled(false, true)]
+#[case::mixed_expired(true, true)]
 #[tokio::test]
 async fn test_managed_exit_waits_for_canceled_fill_recovery(
     #[case] expired: bool,
+    #[case] mixed_liquidity: bool,
     #[values(false, true)] recover: bool,
     #[values(false, true)] missing_status: bool,
 ) {
@@ -2111,12 +2114,24 @@ async fn test_managed_exit_waits_for_canceled_fill_recovery(
                 venue.updates.send(canceled).unwrap();
             }
 
-            *venue.fills.lock().await = json!({"code":"0", "msg":"", "data":[{
+            let mut history = json!({"code":"0", "msg":"", "data":[{
                 "instType":"SPOT", "instId":"BTC-USD", "ordId":VID, "clOrdId":CID,
                 "tradeId":"90001", "billId":"80001", "fillSz":"0.00040000", "fillPx":"50000.0",
                 "side":"sell", "posSide":"net", "execType":"T", "fee":"-0.02", "feeCcy":"USD",
                 "ts":(timestamp+10).to_string(), "fillTime":(timestamp+5).to_string()
             }]});
+
+            if mixed_liquidity {
+                history["data"][0]["fillSz"] = json!("0.00020000");
+                history["data"][0]["fee"] = json!("-0.01");
+                let mut maker = history["data"][0].clone();
+                maker["tradeId"] = json!("90002");
+                maker["billId"] = json!("80002");
+                maker["execType"] = json!("M");
+                maker["fillTime"] = json!((timestamp + 6).to_string());
+                history["data"].as_array_mut().unwrap().push(maker);
+            }
+            *venue.fills.lock().await = history;
             query(&cache);
             wait_until(|| cached(&cache).is_closed()).await;
             assert_eq!(
@@ -2128,6 +2143,10 @@ async fn test_managed_exit_waits_for_canceled_fill_recovery(
                 }
             );
             assert_eq!(cached(&cache).filled_qty(), Quantity::from("0.00040000"));
+            assert_eq!(
+                cached(&cache).trade_ids().len(),
+                if mixed_liquidity { 2 } else { 1 }
+            );
             tokio::time::timeout(DEADLINE, async {
                 while venue.submissions.lock().await.len() < 2 {
                     tokio::task::yield_now().await;
@@ -2157,7 +2176,7 @@ async fn test_managed_exit_waits_for_canceled_fill_recovery(
                 "filled",
                 "0.00060000",
                 "0.00060000",
-                "90002",
+                if mixed_liquidity { "90003" } else { "90002" },
                 "-0.03",
                 "-0.03",
                 close_order.ts_submitted().unwrap().as_u64() / 1_000_000 + 1,
@@ -2181,6 +2200,10 @@ async fn test_managed_exit_waits_for_canceled_fill_recovery(
             assert_eq!(
                 cache.borrow().positions(None, None, None, None, None).len(),
                 1
+            );
+            assert_eq!(
+                cache.borrow().position(&position_id).unwrap().commissions(),
+                vec![Money::from("0.05 USD")]
             );
         }
         handle.stop();
@@ -6260,23 +6283,43 @@ async fn test_startup_bulk_observations_precede_scoped_history(
 }
 
 #[rstest]
-#[case::first_matching(false, false, false, false)]
-#[case::first_conflicting(false, false, false, true)]
-#[case::contiguous_matching(true, false, false, false)]
-#[case::contiguous_conflicting(true, false, false, true)]
-#[case::missed_prefix_matching(false, true, false, false)]
-#[case::missed_prefix_conflicting(false, true, false, true)]
-#[case::rest_matching(false, true, true, false)]
-#[case::rest_conflicting(false, true, true, true)]
+#[case::first_matching(false, false, false, false, false)]
+#[case::first_conflicting(false, false, false, true, false)]
+#[case::contiguous_matching(true, false, false, false, false)]
+#[case::contiguous_conflicting(true, false, false, true, false)]
+#[case::missed_prefix_matching(false, true, false, false, false)]
+#[case::missed_prefix_conflicting(false, true, false, true, false)]
+#[case::rest_matching(false, true, true, false, false)]
+#[case::rest_conflicting(false, true, true, true, false)]
+#[case::mixed_contiguous_matching(true, false, false, false, true)]
+#[case::mixed_contiguous_conflicting(true, false, false, true, true)]
+#[case::mixed_missed_prefix_matching(false, true, false, false, true)]
+#[case::mixed_missed_prefix_conflicting(false, true, false, true, true)]
+#[case::mixed_rest_matching(false, true, true, false, true)]
+#[case::mixed_rest_conflicting(false, true, true, true, true)]
 #[tokio::test]
 async fn test_cumulative_commission_admission_and_restart(
     #[case] prefix: bool,
     #[case] recovery: bool,
     #[case] rest: bool,
     #[case] conflict: bool,
+    #[case] mixed_sell: bool,
 ) {
     let store = tempfile::TempDir::new().unwrap();
     let (addr, venue, server) = start_venue().await;
+    if mixed_sell {
+        let mut funded = venue.balance.lock().await;
+        let mut base = funded["data"][0]["details"][0].clone();
+        base["ccy"] = json!("BTC");
+        for field in ["availBal", "availEq", "cashBal", "eq"] {
+            base[field] = json!("1");
+        }
+        base["frozenBal"] = json!("0");
+        funded["data"][0]["details"]
+            .as_array_mut()
+            .unwrap()
+            .push(base);
+    }
     let events = Rc::new(RefCell::new(Vec::new()));
     let mut node = build_node_with_store(
         addr,
@@ -6289,6 +6332,14 @@ async fn test_cumulative_commission_admission_and_restart(
         }),
         Some(Rc::new(RefCell::new(None))),
     );
+
+    if mixed_sell {
+        let mut strategy =
+            try_get_actor_unchecked::<ProbeStrategy>(&StrategyId::from(STRATEGY).inner()).unwrap();
+        strategy.side = OrderSide::Sell;
+    }
+    let side = if mixed_sell { "sell" } else { "buy" };
+    let last_role = if mixed_sell { "M" } else { "T" };
     let instance = node.kernel().instance_id.to_string();
     let cache = node.kernel().cache.clone();
     let handle = node.handle();
@@ -6311,30 +6362,30 @@ async fn test_cumulative_commission_admission_and_restart(
         wait_until(|| cache.borrow().order_exists(&ClientOrderId::from(CID))).await;
         wait_until(|| cached(&cache).ts_submitted().is_some()).await;
         let timestamp = cached(&cache).ts_submitted().unwrap().as_u64() / 1_000_000;
-        venue
-            .updates
-            .send(wire_order("live", "0", "0", "", "0", "0", timestamp))
-            .unwrap();
+        let mut live = wire_order("live", "0", "0", "", "0", "0", timestamp);
+        live["data"][0]["side"] = json!(side);
+        venue.updates.send(live).unwrap();
         wait_until(|| cached(&cache).status() == OrderStatus::Accepted).await;
 
         if prefix {
-            venue
-                .updates
-                .send(wire_order(
-                    "partially_filled",
-                    "0.00040000",
-                    "0.00040000",
-                    "90001",
-                    "-0.02",
-                    "-0.02",
-                    timestamp,
-                ))
-                .unwrap();
+            let mut partial = wire_order(
+                "partially_filled",
+                "0.00040000",
+                "0.00040000",
+                "90001",
+                "-0.02",
+                "-0.02",
+                timestamp,
+            );
+            partial["data"][0]["side"] = json!(side);
+            partial["data"][0]["execType"] = json!("T");
+            partial["data"][0]["rebate"] = json!("0");
+            venue.updates.send(partial).unwrap();
             wait_until(|| cached(&cache).filled_qty() == Quantity::from("0.00040000")).await;
         }
         let before = snapshot(&cache);
         let split = prefix || recovery;
-        let frame = wire_order(
+        let mut frame = wire_order(
             "filled",
             "0.00100000",
             if split { "0.00060000" } else { "0.00100000" },
@@ -6343,6 +6394,9 @@ async fn test_cumulative_commission_admission_and_restart(
             if split { "-0.03" } else { "-0.05" },
             timestamp + 20,
         );
+        frame["data"][0]["side"] = json!(side);
+        frame["data"][0]["execType"] = json!(last_role);
+        frame["data"][0]["rebate"] = json!("0");
 
         if !rest {
             venue.updates.send(frame.clone()).unwrap();
@@ -6355,8 +6409,8 @@ async fn test_cumulative_commission_admission_and_restart(
         if recovery {
             *venue.report.lock().await = json!({"code":"0","msg":"","data":frame["data"]});
             *venue.fills.lock().await = json!({"code":"0","msg":"","data":[
-                {"instType":"SPOT","instId":"BTC-USD","ordId":VID,"clOrdId":CID,"tradeId":"90001","billId":"80001","fillSz":"0.00040000","fillPx":"50000.0","side":"buy","posSide":"net","execType":"T","fee":"-0.02","feeCcy":"USD","ts":(timestamp+5).to_string(),"fillTime":(timestamp+1).to_string()},
-                {"instType":"SPOT","instId":"BTC-USD","ordId":VID,"clOrdId":CID,"tradeId":"90002","billId":"80002","fillSz":"0.00060000","fillPx":"50000.0","side":"buy","posSide":"net","execType":"T","fee":"-0.03","feeCcy":"USD","ts":(timestamp+25).to_string(),"fillTime":(timestamp+21).to_string()}
+                {"instType":"SPOT","instId":"BTC-USD","ordId":VID,"clOrdId":CID,"tradeId":"90001","billId":"80001","fillSz":"0.00040000","fillPx":"50000.0","side":side,"posSide":"net","execType":"T","fee":"-0.02","feeCcy":"USD","ts":(timestamp+5).to_string(),"fillTime":(timestamp+1).to_string()},
+                {"instType":"SPOT","instId":"BTC-USD","ordId":VID,"clOrdId":CID,"tradeId":"90002","billId":"80002","fillSz":"0.00060000","fillPx":"50000.0","side":side,"posSide":"net","execType":last_role,"fee":"-0.03","feeCcy":"USD","ts":(timestamp+25).to_string(),"fillTime":(timestamp+21).to_string()}
             ]});
             query(&cache);
 
