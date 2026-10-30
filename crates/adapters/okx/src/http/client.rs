@@ -2682,6 +2682,7 @@ impl OKXHttpClient {
         account_id: AccountId,
         account_type: AccountType,
     ) -> anyhow::Result<AccountState> {
+        let request_started = self.generate_ts_init();
         let resp = self
             .inner
             .get_balance()
@@ -2689,15 +2690,16 @@ impl OKXHttpClient {
             .map_err(|e| anyhow::anyhow!(e))?;
 
         let ts_init = self.generate_ts_init();
-        let raw = resp
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("No account state returned from OKX"))?;
+        let [raw] = resp.as_slice() else {
+            anyhow::bail!("Expected exactly one OKX account balance snapshot");
+        };
         let account_state = parse_account_state_with_source(
             raw,
             account_id,
             account_type,
             ts_init,
             crate::common::account::OKXAccountUpdate::Rest,
+            Some(request_started),
         )?;
 
         Ok(account_state)
