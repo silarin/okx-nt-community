@@ -3061,6 +3061,7 @@ pub fn parse_account_state(
         account_type,
         ts_init,
         super::account::OKXAccountUpdate::Unknown,
+        None,
     )
 }
 
@@ -3070,10 +3071,12 @@ pub(crate) fn parse_account_state_with_source(
     account_type: AccountType,
     ts_init: UnixNanos,
     update: super::account::OKXAccountUpdate,
+    rest_request_started: Option<UnixNanos>,
 ) -> anyhow::Result<AccountState> {
     let mut balances = Vec::new();
     let mut info = super::account::OKXAccountStateInfo {
         update,
+        rest_request_started,
         ..Default::default()
     };
 

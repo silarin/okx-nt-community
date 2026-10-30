@@ -2943,6 +2943,152 @@ async fn test_http_get_balance_with_credentials_succeeds() {
 
 #[rstest]
 #[tokio::test]
+async fn test_account_snapshot_observation_begins_before_response() {
+    use nautilus_core::time::get_atomic_clock_realtime;
+    use nautilus_model::{enums::AccountType, types::Currency};
+    use nautilus_okx::common::account::{
+        reported_currency_balance, reported_currency_balance_after,
+    };
+
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let router = Router::new().route(
+        "/api/v5/account/balance",
+        get({
+            let arrived = Arc::clone(&arrived);
+            let release = Arc::clone(&release);
+            move || {
+                let arrived = Arc::clone(&arrived);
+                let release = Arc::clone(&release);
+                async move {
+                    arrived.notify_one();
+                    release.notified().await;
+                    Json(load_test_data("http_get_account_balance.json"))
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".into()),
+        Some("test_secret".into()),
+        Some("passphrase".into()),
+        Some(format!("http://{addr}")),
+        5,
+        0,
+        1,
+        1,
+        OKXEnvironment::Demo,
+        None,
+    )
+    .unwrap();
+    let account_id = AccountId::from("OKX-001");
+
+    let first = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .request_account_state(account_id, AccountType::Cash)
+                .await
+                .unwrap()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), arrived.notified())
+        .await
+        .unwrap();
+    // A fill received while the earlier balance request is in flight
+    let fill_received = get_atomic_clock_realtime().get_time_ns();
+    release.notify_one();
+    let first = first.await.unwrap();
+    let currency = Currency::get_or_create_crypto(
+        load_test_data("http_get_account_balance.json")["data"][0]["details"][0]["ccy"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(first.ts_init > fill_received);
+    assert!(
+        reported_currency_balance_after(&first, currency, fill_received)
+            .unwrap()
+            .is_none()
+    );
+
+    let second = tokio::spawn(async move {
+        client
+            .request_account_state(account_id, AccountType::Cash)
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(5), arrived.notified())
+        .await
+        .unwrap();
+    release.notify_one();
+    let second = second.await.unwrap();
+    assert_eq!(
+        reported_currency_balance(&first, currency).unwrap(),
+        reported_currency_balance(&second, currency).unwrap()
+    );
+    assert!(
+        reported_currency_balance_after(&second, currency, fill_received)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        reported_currency_balance_after(&first, currency, fill_received)
+            .unwrap()
+            .is_none()
+    );
+    server.abort();
+}
+
+#[rstest]
+#[case(0)]
+#[case(2)]
+#[tokio::test]
+async fn test_account_snapshot_rejects_ambiguous_cardinality(#[case] count: usize) {
+    use nautilus_model::enums::AccountType;
+
+    let mut response = load_test_data("http_get_account_balance.json");
+    response["data"] = json!(vec![response["data"][0].clone(); count]);
+    let router = Router::new().route(
+        "/api/v5/account/balance",
+        get(move || {
+            let response = response.clone();
+            async move { Json(response) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".into()),
+        Some("test_secret".into()),
+        Some("passphrase".into()),
+        Some(format!("http://{addr}")),
+        5,
+        0,
+        1,
+        1,
+        OKXEnvironment::Demo,
+        None,
+    )
+    .unwrap();
+    assert!(
+        client
+            .request_account_state(AccountId::from("OKX-001"), AccountType::Cash)
+            .await
+            .is_err()
+    );
+    server.abort();
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_http_get_instruments_handles_rate_limit_error() {
     let state = Arc::new(TestServerState::default());
     let addr = start_test_server(state.clone()).await;

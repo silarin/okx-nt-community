@@ -52,6 +52,10 @@ pub struct OKXAccountStateInfo {
     pub update: OKXAccountUpdate,
     /// Per-currency venue update times, independent of the account-wide timestamp.
     pub balance_timestamps: BTreeMap<String, UnixNanos>,
+    /// Local time captured before requesting this REST snapshot, including any retries.
+    /// This is observation provenance, not a replacement for venue update times.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rest_request_started: Option<UnixNanos>,
 }
 
 impl OKXAccountStateInfo {
@@ -119,12 +123,149 @@ pub fn reported_currency_balance(
     Ok(Some((*balance, *timestamp)))
 }
 
+/// Returns an explicitly reported balance from a REST request started after `after`.
+///
+/// `after` must be a nonzero local initialization timestamp (for example, a native
+/// order event's `ts_init`), never a venue timestamp. A late response to an earlier
+/// request cannot satisfy this boundary. Legacy events and WebSocket updates do
+/// not supply REST observation evidence. Currency update times remain unchanged;
+/// callers must still validate venue chronology, balances and lifecycle state.
+///
+/// # Errors
+///
+/// Returns an error if reported balance evidence or request chronology is invalid.
+pub fn reported_currency_balance_after(
+    state: &AccountState,
+    currency: Currency,
+    after: UnixNanos,
+) -> anyhow::Result<Option<(AccountBalance, UnixNanos)>> {
+    anyhow::ensure!(
+        after != UnixNanos::default(),
+        "Missing local observation boundary"
+    );
+    let balance = reported_currency_balance(state, currency)?;
+    let info: OKXAccountStateInfo = serde_json::from_value(
+        state
+            .info
+            .as_ref()
+            .and_then(|info| info.get("okx"))
+            .context("OKX AccountState is missing balance provenance")?
+            .clone(),
+    )?;
+    let Some(started) = info.rest_request_started else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        info.update == OKXAccountUpdate::Rest
+            && started != UnixNanos::default()
+            && started <= state.ts_init,
+        "Invalid OKX REST snapshot request chronology"
+    );
+    Ok(balance.filter(|_| started > after))
+}
+
 #[cfg(test)]
 mod tests {
     use nautilus_model::{enums::AccountType, identifiers::AccountId};
 
     use super::*;
     use crate::{common::parse::parse_account_state_with_source, http::models::OKXAccount};
+
+    #[rstest::rstest]
+    fn rest_observation_preserves_currency_time_and_rejects_replayed_snapshot() {
+        let response: serde_json::Value = serde_json::from_str(include_str!(
+            "../../test_data/http_get_account_balance.json"
+        ))
+        .unwrap();
+        let raw: OKXAccount = serde_json::from_value(response["data"][0].clone()).unwrap();
+        let currency = Currency::get_or_create_crypto(raw.details[0].ccy.as_str());
+        let state = parse_account_state_with_source(
+            &raw,
+            AccountId::from("OKX-001"),
+            AccountType::Cash,
+            300.into(),
+            OKXAccountUpdate::Rest,
+            Some(200.into()),
+        )
+        .unwrap();
+        let state: AccountState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(
+            reported_currency_balance_after(&state, currency, 199.into()).unwrap(),
+            reported_currency_balance(&state, currency).unwrap()
+        );
+
+        for boundary in [200, 201, 400] {
+            assert!(
+                reported_currency_balance_after(&state, currency, boundary.into())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let mut delayed = state.clone();
+        delayed.ts_init = 500.into();
+        assert!(
+            reported_currency_balance_after(&delayed, currency, 400.into())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reported_currency_balance_after(
+                &state,
+                Currency::get_or_create_crypto("ABSENT"),
+                199.into()
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(reported_currency_balance_after(&state, currency, 0.into()).is_err());
+        let mut invalid = state.clone();
+        invalid.is_reported = false;
+        assert!(reported_currency_balance_after(&invalid, currency, 199.into()).is_err());
+        invalid = state.clone();
+        invalid.balances.push(invalid.balances[0]);
+        assert!(reported_currency_balance_after(&invalid, currency, 199.into()).is_err());
+        invalid = state;
+        invalid.info = None;
+        assert!(reported_currency_balance_after(&invalid, currency, 199.into()).is_err());
+    }
+
+    #[rstest::rstest]
+    #[case(OKXAccountUpdate::Rest, None, false)]
+    #[case(OKXAccountUpdate::Unknown, None, false)]
+    #[case(OKXAccountUpdate::WebSocketUpdate, None, false)]
+    #[case(OKXAccountUpdate::WebSocketSnapshot { page: Some(1), last_page: Some(true) }, None, false)]
+    #[case(OKXAccountUpdate::Rest, Some(0), true)]
+    #[case(OKXAccountUpdate::Rest, Some(301), true)]
+    #[case(OKXAccountUpdate::WebSocketUpdate, Some(200), true)]
+    #[case(OKXAccountUpdate::Unknown, Some(200), true)]
+    fn rest_observation_requires_native_request_provenance(
+        #[case] update: OKXAccountUpdate,
+        #[case] started: Option<u64>,
+        #[case] error: bool,
+    ) {
+        let response: serde_json::Value = serde_json::from_str(include_str!(
+            "../../test_data/http_get_account_balance.json"
+        ))
+        .unwrap();
+        let raw: OKXAccount = serde_json::from_value(response["data"][0].clone()).unwrap();
+        let currency = Currency::get_or_create_crypto(raw.details[0].ccy.as_str());
+        let state = parse_account_state_with_source(
+            &raw,
+            AccountId::from("OKX-001"),
+            AccountType::Cash,
+            300.into(),
+            update,
+            started.map(UnixNanos::from),
+        )
+        .unwrap();
+        let result = reported_currency_balance_after(&state, currency, 199.into());
+        if error {
+            assert!(result.is_err());
+        } else {
+            assert!(result.unwrap().is_none());
+        }
+    }
 
     #[rstest::rstest]
     fn currency_freshness_survives_account_event_round_trip() {
@@ -143,6 +284,7 @@ mod tests {
             AccountType::Cash,
             UnixNanos::from(3_000_000_000),
             OKXAccountUpdate::WebSocketUpdate,
+            None,
         )
         .unwrap();
         let encoded = serde_json::to_vec(&state).unwrap();
@@ -174,6 +316,7 @@ mod tests {
             AccountType::Cash,
             UnixNanos::default(),
             OKXAccountUpdate::Rest,
+            None,
         )
         .unwrap();
         assert!(reported_currency_balance(&state, currency).is_err());

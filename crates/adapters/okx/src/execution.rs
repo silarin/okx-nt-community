@@ -1802,7 +1802,11 @@ impl ExecutionClient for OKXExecutionClient {
         Ok(())
     }
 
-    fn query_account(&self, _cmd: QueryAccount) -> anyhow::Result<()> {
+    fn query_account(&self, cmd: QueryAccount) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            cmd.account_id == self.core.account_id,
+            "OKX account query identity mismatch"
+        );
         self.update_account_state();
         Ok(())
     }

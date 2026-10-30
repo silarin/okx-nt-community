@@ -604,6 +604,7 @@ pub fn dispatch_ws_message(
                             account_type,
                             ts_init,
                             update.clone(),
+                            None,
                         ) {
                             Ok(account_state) => emitter.send_account_state(account_state),
                             Err(e) => log::error!("Failed to parse account state: {e}"),

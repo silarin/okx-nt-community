@@ -3617,19 +3617,26 @@ async fn test_query_account_does_not_block_within_runtime() {
         None, // correlation_id
     );
 
-    let result = client.query_account(cmd);
-    result.unwrap();
-
-    wait_until_async(
-        || {
-            let found = rx
-                .try_recv()
-                .is_ok_and(|e| matches!(e, ExecutionEvent::Account(_)));
-            async move { found }
-        },
-        Duration::from_secs(5),
-    )
-    .await;
+    let mut wrong_account = cmd.clone();
+    wrong_account.account_id = AccountId::from("OKX-OTHER");
+    assert!(client.query_account(wrong_account).is_err());
+    assert!(rx.try_recv().is_err());
+    let before = get_atomic_clock_realtime().get_time_ns();
+    client.query_account(cmd).unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let ExecutionEvent::Account(state) = event else {
+        panic!("Expected account state")
+    };
+    assert_eq!(state.account_id, AccountId::from("OKX-001"));
+    let currency = state.balances[0].currency;
+    assert!(
+        nautilus_okx::common::account::reported_currency_balance_after(&state, currency, before)
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[rstest]
