@@ -55,6 +55,7 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use nautilus_network::{
+    SocketState, SocketStateSink,
     http::create_standard_nautilus_headers,
     mode::ConnectionMode,
     ratelimiter::quota::Quota,
@@ -746,19 +747,37 @@ impl OKXWebSocketClient {
             ),
         ];
 
+        let (msg_tx, rx) = tokio::sync::mpsc::unbounded_channel::<OKXWsMessage>();
+        let disconnect_tx = msg_tx.clone();
+        let signal = Arc::clone(&self.signal);
+        let on_state = move |state| {
+            if state == SocketState::Disconnected && !signal.load(Ordering::Acquire) {
+                let _ =
+                    disconnect_tx.send(OKXWsMessage::Error(super::messages::OKXWebSocketError {
+                        code: String::new(),
+                        message: "WebSocket transport disconnected unexpectedly".to_string(),
+                        conn_id: None,
+                        timestamp: get_atomic_clock_realtime().get_time_ns().as_u64(),
+                    }));
+            }
+        };
+        let state_sink = if let Some(control) = &self.socket_control {
+            control.sink_with(on_state)
+        } else {
+            SocketStateSink::new(on_state)
+        };
+
         let client = WebSocketClient::builder()
             .config(config)
             .message_handler(message_handler)
             .keyed_quotas(keyed_quotas)
             .default_quota(*OKX_WS_CONNECTION_QUOTA)
-            .maybe_state_sink(self.socket_control.as_ref().map(|control| control.sink()))
+            .maybe_state_sink(Some(state_sink))
             .connect()
             .await?;
 
         let connection_mode = client.connection_mode_atomic();
         let reconnect_handle = client.reconnect_handle();
-
-        let (msg_tx, rx) = tokio::sync::mpsc::unbounded_channel::<OKXWsMessage>();
 
         self.out_rx = Some(Arc::new(rx));
 

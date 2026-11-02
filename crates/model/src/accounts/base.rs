@@ -55,6 +55,12 @@ pub struct BaseAccount {
     pub calculate_account_state: bool,
     /// The account state events, oldest first.
     pub events: Vec<AccountState>,
+    // Restored event lists cannot establish which intervening events were purged
+    #[serde(skip)]
+    event_history_start: Option<usize>,
+    // Maximum initialization time excluded from usable history; None means unbounded/unknown
+    #[serde(default)]
+    event_history_cutoff: Option<UnixNanos>,
     /// The commissions charged so far, keyed by currency.
     pub commissions: AHashMap<Currency, Money>,
     /// The current balances in the account, keyed by currency.
@@ -79,6 +85,8 @@ impl BaseAccount {
             base_currency: event.base_currency,
             calculate_account_state,
             events: vec![event],
+            event_history_start: Some(0),
+            event_history_cutoff: Some(UnixNanos::default()),
             commissions: AHashMap::new(),
             balances,
             balances_starting,
@@ -87,16 +95,20 @@ impl BaseAccount {
 
     #[must_use]
     pub(crate) fn clone_without_events(&self) -> Self {
-        Self {
+        let mut cloned = Self {
             id: self.id,
             account_type: self.account_type,
             base_currency: self.base_currency,
             calculate_account_state: self.calculate_account_state,
             events: Vec::new(),
+            event_history_start: Some(0),
+            event_history_cutoff: self.event_history_cutoff,
             commissions: self.commissions.clone(),
             balances: self.balances.clone(),
             balances_starting: self.balances_starting.clone(),
-        }
+        };
+        cloned.exclude_event_history(&self.events);
+        cloned
     }
 
     /// Returns a reference to the `AccountBalance` for the specified currency, or `None` if absent.
@@ -253,16 +265,41 @@ impl BaseAccount {
     pub fn base_apply(&mut self, event: AccountState) {
         check_equal(&event.account_id, &self.id, "event.account_id", "self.id").expect(FAILED);
         self.update_balances(&event.balances);
+
+        if self.event_history_start.is_none() {
+            let events = std::mem::take(&mut self.events);
+            self.exclude_event_history(&events);
+            self.events = events;
+            self.event_history_start = Some(self.events.len());
+        }
         self.events.push(event);
+    }
+
+    pub(crate) fn contiguous_events(&self) -> (&[AccountState], Option<UnixNanos>) {
+        let events = self
+            .event_history_start
+            .and_then(|start| self.events.get(start..))
+            .unwrap_or_default();
+        (events, self.event_history_cutoff)
+    }
+
+    pub(crate) fn invalidate_event_history(&mut self) {
+        self.event_history_start = None;
+        self.event_history_cutoff = None;
+    }
+
+    fn exclude_event_history(&mut self, events: &[AccountState]) {
+        for event in events {
+            self.event_history_cutoff = self
+                .event_history_cutoff
+                .filter(|_| event.ts_init != UnixNanos::default())
+                .map(|cutoff| cutoff.max(event.ts_init));
+        }
     }
 
     /// Purges all account state events which are outside the lookback window.
     ///
     /// Guaranteed to retain at least the latest event.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the purging implementation is changed and all events are purged.
     pub fn base_purge_account_events(&mut self, ts_now: UnixNanos, lookback_secs: u64) {
         let Ok(lookback_ns) = DurationNanos::try_from_secs(lookback_secs) else {
             log::warn!(
@@ -271,21 +308,35 @@ impl BaseAccount {
             return;
         };
         let purge_cutoff = ts_now.checked_sub(lookback_ns);
-
+        let history_start = self.event_history_start.unwrap_or(self.events.len());
         let mut retained_events = Vec::new();
+        let mut retained_start = 0;
 
-        for event in &self.events {
-            if purge_cutoff.is_none_or(|cutoff| event.ts_event > cutoff) {
+        for (index, event) in self.events.iter().enumerate() {
+            if index == history_start {
+                retained_start = retained_events.len();
+            }
+
+            if index + 1 == self.events.len()
+                || purge_cutoff.is_none_or(|cutoff| event.ts_event > cutoff)
+            {
                 retained_events.push(event.clone());
+            } else {
+                // A removed middle event must not reconnect previously separated evidence
+                retained_start = retained_events.len();
             }
         }
 
-        // Guarantee ≥ 1 event
-        if retained_events.is_empty() && !self.events.is_empty() {
-            retained_events.push(self.events.last().expect("events not empty").clone());
+        if history_start == self.events.len() {
+            retained_start = retained_events.len();
         }
-
+        // Exclude the entire old prefix, including retained records before the new frontier.
+        // A delayed event can have an earlier ts_init than an event removed ahead of it.
+        let old_events = std::mem::take(&mut self.events);
+        let suffix_len = retained_events.len() - retained_start;
+        self.exclude_event_history(&old_events[..old_events.len() - suffix_len]);
         self.events = retained_events;
+        self.event_history_start = Some(retained_start);
     }
 
     /// Calculates the amount of balance to lock for a new order based on the given side, quantity, and price.

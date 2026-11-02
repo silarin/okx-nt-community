@@ -75,6 +75,7 @@ impl OrderStatusReport {
         reduce_only=false,
         cancel_reason=None,
         ts_triggered=None,
+        parent_venue_order_id=None,
     ))]
     fn py_new(
         account_id: AccountId,
@@ -110,6 +111,7 @@ impl OrderStatusReport {
         reduce_only: bool,
         cancel_reason: Option<String>,
         ts_triggered: Option<u64>,
+        parent_venue_order_id: Option<VenueOrderId>,
     ) -> Self {
         let mut report = Self::new(
             account_id,
@@ -127,6 +129,8 @@ impl OrderStatusReport {
             ts_init.into(),
             report_id,
         );
+
+        report.parent_venue_order_id = parent_venue_order_id;
 
         if let Some(order_list_id) = order_list_id {
             report = report.with_order_list_id(order_list_id);
@@ -326,6 +330,12 @@ impl OrderStatusReport {
     }
 
     #[getter]
+    #[pyo3(name = "parent_venue_order_id")]
+    fn py_parent_venue_order_id(&self) -> Option<VenueOrderId> {
+        self.parent_venue_order_id
+    }
+
+    #[getter]
     #[pyo3(name = "parent_order_id")]
     fn py_parent_order_id(&self) -> Option<ClientOrderId> {
         self.parent_order_id
@@ -508,6 +518,11 @@ impl OrderStatusReport {
                 dict.set_item("linked_order_ids", py_list)?;
             }
             None => dict.set_item("linked_order_ids", py.None())?,
+        }
+
+        match &self.parent_venue_order_id {
+            Some(id) => dict.set_item("parent_venue_order_id", id.to_string())?,
+            None => dict.set_item("parent_venue_order_id", py.None())?,
         }
 
         match &self.parent_order_id {

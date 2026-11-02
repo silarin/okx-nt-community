@@ -74,8 +74,8 @@ use nautilus_execution::{
         process_mass_status_for_reconciliation,
         process_mass_status_for_reconciliation_without_synthetic_reports,
         query_fill_evidence_matches, query_fill_history_complete, query_fill_recovery_complete,
-        query_fills_match_cached_history, reconcile_order_report_with_commission,
-        should_reconciliation_update,
+        query_fill_witness_preserves_history, query_fills_match_cached_history,
+        reconcile_order_report_with_commission, should_reconciliation_update,
     },
 };
 use nautilus_model::{
@@ -247,7 +247,41 @@ struct PendingQueryFills {
 }
 
 impl QueryFillObligation {
+    fn is_pending(&self, order: Option<&OrderAny>, query_bounds: &[(Quantity, UnixNanos)]) -> bool {
+        // Native cache purging preserves completed evidence. While history is retained,
+        // later executions must still satisfy every cumulative query boundary.
+        if order.is_none() && self.complete {
+            return false;
+        }
+
+        if !self.stream || self.report.filled_qty.is_zero() {
+            return order.map_or_else(
+                || {
+                    !self.report.filled_qty.is_zero()
+                        || !query_fill_history_complete(&self.report, &self.fills)
+                },
+                |order| !self.is_complete(order, query_bounds),
+            );
+        }
+        !self.complete && order.is_none_or(|order| !self.is_complete(order, query_bounds))
+    }
+
     fn is_complete(&self, order: &OrderAny, query_bounds: &[(Quantity, UnixNanos)]) -> bool {
+        // A zero cumulative snapshot remains a bound on all executions through
+        // its venue time, including executions committed after the observation.
+        if self.report.filled_qty.is_zero() {
+            return query_fill_history_complete(&self.report, &self.fills)
+                && if self.stream {
+                    nautilus_execution::reconciliation::stream_fill_recovery_complete(
+                        order,
+                        &self.report,
+                        &self.fills,
+                        false,
+                    )
+                } else {
+                    query_fill_recovery_complete(order, &self.report, &self.fills, false)
+                };
+        }
         let complete_query_history = query_bounds.iter().any(|(quantity, time)| {
             (*quantity >= self.report.filled_qty && *time >= self.report.ts_last)
                 || (self.fills.is_empty()
@@ -258,6 +292,7 @@ impl QueryFillObligation {
                         &[],
                     ))
         });
+        let accounting = order;
         let complete = |order: &OrderAny| {
             if self.stream {
                 nautilus_execution::reconciliation::stream_fill_recovery_complete(
@@ -267,12 +302,13 @@ impl QueryFillObligation {
                     complete_query_history,
                 )
             } else {
-                query_fill_recovery_complete(
-                    order,
-                    &self.report,
-                    &self.fills,
-                    complete_query_history,
-                )
+                query_fill_witness_preserves_history(accounting, order, self.report.ts_last)
+                    && query_fill_recovery_complete(
+                        order,
+                        &self.report,
+                        &self.fills,
+                        complete_query_history,
+                    )
             }
         };
 
@@ -324,18 +360,15 @@ impl PendingQueryFills {
             return true;
         }
 
-        if self
-            .obligations
-            .iter()
-            .all(|obligation| obligation.complete)
-        {
+        if self.obligations.iter().all(|obligation| {
+            obligation.stream && obligation.complete && !obligation.report.filled_qty.is_zero()
+        }) {
             return false;
         }
         let query_bounds = order.map_or_else(Vec::new, |order| self.complete_query_bounds(order));
-        self.obligations.iter().any(|obligation| {
-            !obligation.complete
-                && order.is_none_or(|order| !obligation.is_complete(order, &query_bounds))
-        })
+        self.obligations
+            .iter()
+            .any(|obligation| obligation.is_pending(order, &query_bounds))
     }
 }
 
@@ -744,10 +777,9 @@ impl ExecutionManager {
         };
 
         if !pending.conflict
-            && pending
-                .obligations
-                .iter()
-                .all(|obligation| obligation.complete)
+            && pending.obligations.iter().all(|obligation| {
+                obligation.stream && obligation.complete && !obligation.report.filled_qty.is_zero()
+            })
         {
             return false;
         }
@@ -756,12 +788,10 @@ impl ExecutionManager {
             self.execution_query_bounds(client_order_id, order)
         });
         pending.conflict
-            || pending.obligations.iter().any(|obligation| {
-                !obligation.complete
-                    && order
-                        .as_ref()
-                        .is_none_or(|order| !obligation.is_complete(order, &bounds))
-            })
+            || pending
+                .obligations
+                .iter()
+                .any(|obligation| obligation.is_pending(order.as_ref(), &bounds))
     }
 
     fn get_execution_evidence_order(&self, id: ClientOrderId) -> Option<OrderAny> {
@@ -1628,7 +1658,7 @@ impl ExecutionManager {
         let startup_fills = mass_status.fill_reports();
 
         for report in startup_orders.values() {
-            if report.filled_qty.is_zero() || self.should_skip_order_report(report) {
+            if self.should_skip_order_report(report) {
                 continue;
             }
             let requires_fills = exec_engine
@@ -4723,7 +4753,44 @@ impl ExecutionManager {
             report.venue_order_id,
         );
 
+        if report
+            .client_order_id
+            .is_some_and(|id| Some(id) != canonical_client_order_id)
+            || order
+                .as_ref()
+                .is_some_and(|order| !report.matches_order_identity(order))
+            || std::iter::once(report.venue_order_id)
+                .chain(report.parent_venue_order_id)
+                .any(|venue| {
+                    cache
+                        .client_order_id(&venue)
+                        .is_some_and(|owner| Some(*owner) != canonical_client_order_id)
+                })
+        {
+            return false;
+        }
+
         if self.order_evidence_exhausted.contains(&key) {
+            return false;
+        }
+
+        if report.parent_venue_order_id.is_some_and(|parent| {
+            self.order_evidence_ids
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .filter_map(|id| self.order_query_fill_reports.get(id))
+                .flat_map(|pending| &pending.obligations)
+                .any(|previous| {
+                    previous.report.account_id == report.account_id
+                        && previous.report.instrument_id == report.instrument_id
+                        && previous.report.venue_order_id == report.venue_order_id
+                        && previous
+                            .report
+                            .parent_venue_order_id
+                            .is_some_and(|known| known != parent)
+                })
+        }) {
             return false;
         }
         let peers = self.fee_observations(key);
@@ -5204,9 +5271,10 @@ impl ExecutionManager {
     /// - `Position`: records position activity
     /// - `MassStatus`: no-op (handled separately via startup reconciliation)
     pub fn observe_execution_report(&mut self, report: &ExecutionReport) {
+        let mut fresh_query_receipt = true;
+
         if let ExecutionReport::OrderQueryWithFills(status, fills)
         | ExecutionReport::OrderFillEvidence(status, fills) = report
-            && status.filled_qty.is_positive()
         {
             let key = (
                 status.account_id,
@@ -5227,13 +5295,37 @@ impl ExecutionManager {
                 return;
             }
             let stream = matches!(report, ExecutionReport::OrderFillEvidence(..));
+            let observed_event_count = self.get_order(id).map_or(0, |order| order.events().len());
+            if !stream {
+                // Obsolete receipts cannot acquire new freshness authority after compaction.
+                fresh_query_receipt = !self.order_evidence_ids[&key]
+                    .iter()
+                    .filter_map(|owner| self.order_query_fill_reports.get(owner))
+                    .flat_map(|pending| &pending.obligations)
+                    .any(|previous| {
+                        !previous.stream
+                            && previous.report.ts_init >= status.ts_init
+                            && query_fill_evidence_matches(
+                                &previous.report,
+                                &previous.fills,
+                                status,
+                                fills,
+                            )
+                    });
+            }
+
             let covered = self
                 .order_query_fill_reports
                 .get(&id)
                 .is_some_and(|pending| {
                     pending.obligations.iter().any(|obligation| {
                         obligation.stream == stream
-                            && (stream || status.ts_init <= obligation.report.ts_init)
+                            && (stream
+                                || status.ts_init == obligation.report.ts_init
+                                || (status.ts_init < obligation.report.ts_init
+                                    && observed_event_count <= obligation.observed_event_count)
+                                || (status.ts_init > obligation.report.ts_init
+                                    && observed_event_count >= obligation.observed_event_count))
                             && query_fill_evidence_matches(
                                 &obligation.report,
                                 &obligation.fills,
@@ -5250,6 +5342,7 @@ impl ExecutionManager {
         }
 
         if let ExecutionReport::OrderQueryWithFills(status, fills) = report
+            && fresh_query_receipt
             && query_fill_history_complete(status, fills)
         {
             let key = (
@@ -5353,90 +5446,125 @@ impl ExecutionManager {
             | ExecutionReport::OrderFillEvidence(order_report, fills) => {
                 let stream = matches!(report, ExecutionReport::OrderFillEvidence(..));
 
-                if order_report.filled_qty.is_zero() {
-                    self.observe_order_report(order_report);
-                } else {
-                    let client_order_id = order_report
-                        .client_order_id
-                        .or_else(|| {
-                            self.cache
-                                .borrow()
-                                .client_order_id(&order_report.venue_order_id)
-                                .copied()
+                let client_order_id = order_report
+                    .client_order_id
+                    .or_else(|| {
+                        self.cache
+                            .borrow()
+                            .client_order_id(&order_report.venue_order_id)
+                            .copied()
+                    })
+                    .unwrap_or_else(|| ClientOrderId::from(order_report.venue_order_id.as_str()));
+                let first = !self.query_fill_recovery_pending(client_order_id);
+                let order = self.get_order(client_order_id);
+                // Missing cache history is not evidence of zero executions. Keep a
+                // rejected observation as a scope conflict after permitted purging.
+                let retained_completion = self
+                    .order_query_fill_reports
+                    .get(&client_order_id)
+                    .is_some_and(|pending| {
+                        pending.obligations.iter().any(|previous| {
+                            previous.complete
+                                && previous.stream == stream
+                                && (stream || previous.report.ts_init == order_report.ts_init)
+                                && query_fill_evidence_matches(
+                                    &previous.report,
+                                    &previous.fills,
+                                    order_report,
+                                    fills,
+                                )
                         })
-                        .unwrap_or_else(|| {
-                            ClientOrderId::from(order_report.venue_order_id.as_str())
-                        });
-                    let first = !self.query_fill_recovery_pending(client_order_id);
-                    let order = self.get_order(client_order_id);
+                    });
+                let missing_history_conflict = order.is_none()
+                    && !retained_completion
+                    && !self.query_fills_respect_observations(order_report, fills);
+                self.order_evidence_ids
+                    .entry((
+                        order_report.account_id,
+                        order_report.instrument_id,
+                        order_report.venue_order_id,
+                    ))
+                    .or_default()
+                    .insert(client_order_id);
+                // Retain contradictory fill identities under their own scope as well
+                for fill in fills {
                     self.order_evidence_ids
-                        .entry((
-                            order_report.account_id,
-                            order_report.instrument_id,
-                            order_report.venue_order_id,
-                        ))
+                        .entry((fill.account_id, fill.instrument_id, fill.venue_order_id))
                         .or_default()
                         .insert(client_order_id);
-                    // Retain contradictory fill identities under their own scope as well
-                    for fill in fills {
-                        self.order_evidence_ids
-                            .entry((fill.account_id, fill.instrument_id, fill.venue_order_id))
-                            .or_default()
-                            .insert(client_order_id);
-                    }
-                    let pending = self
-                        .order_query_fill_reports
-                        .entry(client_order_id)
-                        .or_insert_with(|| PendingQueryFills {
-                            latest_report: order_report.as_ref().clone(),
-                            obligations: Vec::new(),
-                            conflict: false,
-                        });
-                    pending.latest_report = order_report.as_ref().clone();
-
-                    let query_bounds = order
-                        .as_ref()
-                        .map_or_else(Vec::new, |order| pending.complete_query_bounds(order));
-                    for obligation in &mut pending.obligations {
-                        obligation.complete |= order
-                            .as_ref()
-                            .is_some_and(|order| obligation.is_complete(order, &query_bounds));
-                    }
-                    let covered = pending.obligations.iter().any(|obligation| {
-                        obligation.stream == stream
-                            && (stream || order_report.ts_init <= obligation.report.ts_init)
-                            && query_fill_evidence_matches(
-                                &obligation.report,
-                                &obligation.fills,
-                                order_report,
-                                fills,
-                            )
+                }
+                let pending = self
+                    .order_query_fill_reports
+                    .entry(client_order_id)
+                    .or_insert_with(|| PendingQueryFills {
+                        latest_report: order_report.as_ref().clone(),
+                        obligations: Vec::new(),
+                        conflict: false,
                     });
+                pending.latest_report = order_report.as_ref().clone();
+                pending.conflict |= missing_history_conflict;
 
-                    if !covered {
-                        let mut obligation = QueryFillObligation {
-                            report: order_report.as_ref().clone(),
-                            fills: fills.clone(),
-                            stream,
-                            observed_event_count: order
-                                .as_ref()
-                                .map_or(0, |order| order.events().len()),
-                            complete: false,
-                        };
-                        obligation.complete = order
-                            .as_ref()
-                            .is_some_and(|order| obligation.is_complete(order, &query_bounds));
-                        pending.obligations.push(obligation);
+                let query_bounds = order
+                    .as_ref()
+                    .map_or_else(Vec::new, |order| pending.complete_query_bounds(order));
+                for obligation in &mut pending.obligations {
+                    obligation.complete |= order
+                        .as_ref()
+                        .is_some_and(|order| obligation.is_complete(order, &query_bounds));
+                }
+                let observed_event_count = order.as_ref().map_or(0, |order| order.events().len());
+                let covered = pending.obligations.iter().any(|obligation| {
+                    obligation.stream == stream
+                        && (stream
+                            || order_report.ts_init == obligation.report.ts_init
+                            || (order_report.ts_init < obligation.report.ts_init
+                                && observed_event_count <= obligation.observed_event_count))
+                        && query_fill_evidence_matches(
+                            &obligation.report,
+                            &obligation.fills,
+                            order_report,
+                            fills,
+                        )
+                });
+
+                if !covered {
+                    if !stream {
+                        pending.obligations.retain(|previous| {
+                            previous.stream
+                                || previous.report.ts_init >= order_report.ts_init
+                                || previous.observed_event_count > observed_event_count
+                                || !query_fill_evidence_matches(
+                                    &previous.report,
+                                    &previous.fills,
+                                    order_report,
+                                    fills,
+                                )
+                        });
                     }
+                    let mut obligation = QueryFillObligation {
+                        report: order_report.as_ref().clone(),
+                        fills: fills.clone(),
+                        stream,
+                        observed_event_count,
+                        complete: false,
+                    };
+                    obligation.complete = order
+                        .as_ref()
+                        .is_some_and(|order| obligation.is_complete(order, &query_bounds));
+                    pending.obligations.push(obligation);
+                }
+
+                if !order_report.filled_qty.is_zero() {
                     self.remove_targeted_order_queries(&[client_order_id]);
-                    if self.query_fill_recovery_pending(client_order_id) {
-                        if first && !self.order_inflight_checks.contains_key(&client_order_id) {
-                            self.start_inflight_check(client_order_id);
-                        }
-                        self.record_local_activity(client_order_id);
-                    } else {
-                        self.observe_order_report(order_report);
+                }
+
+                if self.query_fill_recovery_pending(client_order_id) {
+                    if first && !self.order_inflight_checks.contains_key(&client_order_id) {
+                        self.start_inflight_check(client_order_id);
                     }
+                    self.record_local_activity(client_order_id);
+                } else {
+                    self.observe_order_report(order_report);
                 }
 
                 for fill in fills {
@@ -6690,6 +6818,11 @@ impl ExecutionManager {
         fill_queue: &mut ReconciliationFillQueue,
         commission_client: Option<&dyn ExecutionClient>,
     ) -> Vec<OrderEventAny> {
+        // A complete venue snapshot can predate newer committed executions. Strict clients
+        // reconcile authoritative executions without reversing fills from aggregate status.
+        let is_snapshot = is_snapshot
+            && !commission_client
+                .is_some_and(|client| client.requires_order_query_fills(report.instrument_id));
         self.confirm_submitted_report(report);
         let mut events = Vec::new();
         let mut working = order.clone();
@@ -9744,7 +9877,12 @@ mod tests {
             capped.confirm_submission_outcome(&cid);
             assert!(capped.query_fill_recovery_pending(cid));
             let mut exact_cap = capped.clone();
-            exact_cap.observe_execution_report(&recovery);
+            let mut later = fresh.clone();
+            later.ts_init = UnixNanos::from(4001);
+            exact_cap.observe_execution_report(&ExecutionReport::OrderQueryWithFills(
+                Box::new(later),
+                vec![fill.clone()],
+            ));
             exact_cap.confirm_submission_outcome(&cid);
             assert!(exact_cap.unresolved_query_fill_ids().is_empty());
             // One lost contradiction permanently holds the scope; later matching history
@@ -9800,7 +9938,16 @@ mod tests {
     #[rstest]
     #[cfg(feature = "node")]
     fn test_execution_observation_budget_holds_entire_order(
-        #[values("query", "stream", "standalone", "requires_query")] source: &str,
+        #[values(
+            "query",
+            "stream",
+            "query_zero",
+            "stream_zero",
+            "standalone",
+            "requires_query"
+        )]
+        source: &str,
+        #[values(false, true)] same_snapshot: bool,
     ) {
         let cache = Rc::new(RefCell::new(Cache::default()));
         let mut manager = ExecutionManager::new(
@@ -9828,8 +9975,10 @@ mod tests {
             None,
         );
         let key = (fill.account_id, fill.instrument_id, vid);
-        let bundled = matches!(source, "query" | "stream");
-        let capacity = MAX_ORDER_FILL_OBSERVATIONS / if bundled { 2 } else { 1 };
+        let zero = matches!(source, "query_zero" | "stream_zero");
+        let bundled = zero || matches!(source, "query" | "stream");
+        let compacted = same_snapshot && bundled;
+        let capacity = MAX_ORDER_FILL_OBSERVATIONS / if bundled && !zero { 2 } else { 1 };
         for index in 0..=capacity {
             fill.ts_init = UnixNanos::from(10 + index as u64);
             if source == "standalone" {
@@ -9845,18 +9994,27 @@ mod tests {
                     Some(fill.order_side),
                     OrderType::Limit,
                     TimeInForce::Gtc,
-                    OrderStatus::Filled,
+                    if zero {
+                        OrderStatus::Accepted
+                    } else {
+                        OrderStatus::Filled
+                    },
                     fill.last_qty,
-                    fill.last_qty,
+                    if zero {
+                        Quantity::from("0.0")
+                    } else {
+                        fill.last_qty
+                    },
                     UnixNanos::default(),
-                    UnixNanos::from(10 + index as u64),
+                    UnixNanos::from(if same_snapshot { 10 } else { 10 + index as u64 }),
                     fill.ts_init,
                     None,
                 );
-                let envelope = if source == "stream" {
-                    ExecutionReport::OrderFillEvidence(Box::new(report), vec![fill.clone()])
+                let fills = if zero { Vec::new() } else { vec![fill.clone()] };
+                let envelope = if matches!(source, "stream" | "stream_zero") {
+                    ExecutionReport::OrderFillEvidence(Box::new(report), fills)
                 } else {
-                    ExecutionReport::OrderQueryWithFills(Box::new(report), vec![fill.clone()])
+                    ExecutionReport::OrderQueryWithFills(Box::new(report), fills)
                 };
                 manager.observe_execution_report(&envelope);
                 manager.observe_execution_report(&envelope);
@@ -9866,7 +10024,7 @@ mod tests {
             }
             assert_eq!(
                 manager.order_evidence_exhausted.contains(&key),
-                index == capacity
+                index == capacity && !compacted
             );
         }
         let retained = if bundled {
@@ -9874,11 +10032,17 @@ mod tests {
         } else {
             manager.standalone_fill_reports[&cid].len()
         };
-        assert_eq!(retained, capacity);
-        assert!(manager.query_fill_recovery_pending(cid));
-        assert!(manager.unresolved_query_fill_ids().contains(&cid));
-        assert!(!manager.fill_observations_allow_fill(&fill));
-        assert!(manager.position_fill_recovery_pending(&(fill.instrument_id, fill.account_id)));
+        assert_eq!(retained, if compacted { 1 } else { capacity });
+        assert_eq!(
+            manager.query_fill_recovery_pending(cid),
+            !compacted || !zero
+        );
+
+        if !compacted {
+            assert!(manager.unresolved_query_fill_ids().contains(&cid));
+            assert!(!manager.fill_observations_allow_fill(&fill));
+            assert!(manager.position_fill_recovery_pending(&(fill.instrument_id, fill.account_id)));
+        }
         // Exhaustion is per venue order and survives missing cached client identity.
         fill.venue_order_id = VenueOrderId::from("UNRELATED");
         fill.client_order_id = Some(ClientOrderId::from("UNRELATED"));
@@ -9890,6 +10054,289 @@ mod tests {
                 .orders(None, None, None, None, None)
                 .is_empty()
         );
+    }
+
+    #[rstest]
+    #[case::known_before("known_before")]
+    #[case::unknown_before("unknown_before")]
+    #[case::known_after("known_after")]
+    fn zero_query_bounds_survive_later_native_fills(
+        #[case] observation: &str,
+        #[values(500, 1000, 2000)] snapshot_time: u64,
+        #[values(false, true)] stream: bool,
+    ) {
+        let cid = ClientOrderId::from("ZERO-BOUND");
+        let vid = VenueOrderId::from("ZERO-BOUND-VENUE");
+        let account = AccountId::from("TEST-001");
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let mut manager = ExecutionManager::new(
+            Rc::new(RefCell::new(VirtualClock::new())),
+            cache.clone(),
+            ExecutionManagerConfig::default(),
+        )
+        .unwrap();
+        let report = OrderStatusReport::new(
+            account,
+            instrument.id(),
+            Some(cid),
+            vid,
+            Some(OrderSide::Buy),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            Quantity::from("10.0"),
+            Quantity::from("0.0"),
+            UnixNanos::default(),
+            UnixNanos::from(snapshot_time),
+            UnixNanos::from(3000),
+            None,
+        );
+        let evidence = if stream {
+            ExecutionReport::OrderFillEvidence(Box::new(report), Vec::new())
+        } else {
+            ExecutionReport::OrderQueryWithFills(Box::new(report), Vec::new())
+        };
+
+        if observation == "unknown_before" {
+            manager.observe_execution_report(&evidence);
+            assert!(!manager.query_fill_recovery_pending(cid));
+            assert_eq!(manager.order_query_fill_reports[&cid].obligations.len(), 1);
+        }
+        insert_accepted_limit_order(&cache, cid, vid, instrument.id(), ClientId::from("TEST"));
+
+        if observation == "known_before" {
+            manager.observe_execution_report(&evidence);
+            assert!(!manager.query_fill_recovery_pending(cid));
+        }
+        let order = cache.borrow().order_owned(&cid).unwrap();
+        let mut event = TestOrderEventStubs::filled(
+            &order,
+            &instrument,
+            Some(TradeId::from("ZERO-BOUND-FILL")),
+            None,
+            Some(Price::from("100.0")),
+            Some(Quantity::from("1.0")),
+            Some(LiquiditySide::Taker),
+            Some(Money::from("0.01 USDT")),
+            None,
+            Some(account),
+        );
+        let OrderEventAny::Filled(fill) = &mut event else {
+            unreachable!();
+        };
+        fill.ts_event = UnixNanos::from(1000);
+        cache.borrow_mut().update_order(&event).unwrap();
+
+        if observation == "known_after" {
+            manager.observe_execution_report(&evidence);
+        }
+        let contradicts = snapshot_time > 1000 || (snapshot_time == 1000 && !stream);
+        assert_eq!(manager.query_fill_recovery_pending(cid), contradicts);
+        manager.clear_recon_tracking(&cid, true);
+        manager.observe_execution_report(&evidence);
+        assert_eq!(manager.query_fill_recovery_pending(cid), contradicts);
+        assert_eq!(manager.order_query_fill_reports[&cid].obligations.len(), 1);
+        assert_eq!(
+            cache.borrow().order(&cid).unwrap().filled_qty(),
+            Quantity::from("1.0")
+        );
+    }
+
+    #[rstest]
+    fn zero_query_compaction_preserves_fee_receipt_order(
+        #[values(false, true)] compact_before_fee: bool,
+        #[values(false, true)] fresh_after_fee: bool,
+    ) {
+        use nautilus_common::messages::execution::{
+            CommissionBasis, CumulativeCommissionConstraint, OrderFeeOrigin,
+        };
+        let cid = ClientOrderId::from("ZERO-FEE");
+        let vid = VenueOrderId::from("ZERO-FEE-VENUE");
+        let account = AccountId::from("TEST-001");
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let mut manager = ExecutionManager::new(
+            Rc::new(RefCell::new(VirtualClock::new())),
+            cache.clone(),
+            ExecutionManagerConfig::default(),
+        )
+        .unwrap();
+        insert_accepted_limit_order(&cache, cid, vid, instrument.id(), ClientId::from("TEST"));
+        let mut report = OrderStatusReport::new(
+            account,
+            instrument.id(),
+            Some(cid),
+            vid,
+            Some(OrderSide::Buy),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            Quantity::from("10.0"),
+            Quantity::from("0.0"),
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+            UnixNanos::from(10),
+            None,
+        );
+        manager.observe_execution_report(&ExecutionReport::OrderQueryWithFills(
+            Box::new(report.clone()),
+            Vec::new(),
+        ));
+
+        if compact_before_fee {
+            report.ts_init = UnixNanos::from(30);
+            manager.observe_execution_report(&ExecutionReport::OrderQueryWithFills(
+                Box::new(report.clone()),
+                Vec::new(),
+            ));
+        }
+        let fee = OrderFeeEvidence {
+            account_id: account,
+            instrument_id: instrument.id(),
+            venue_order_id: vid,
+            client_order_id: Some(cid),
+            venue_position_id: None,
+            order_side: OrderSide::Buy,
+            boundary_quantity: Some(dec!(0)),
+            boundary_time: Some(UnixNanos::from(2)),
+            anchor_trade_id: None,
+            anchor_trade_time: None,
+            origin: OrderFeeOrigin::Stream,
+            constraints: vec![CumulativeCommissionConstraint {
+                basis: Some(CommissionBasis::ChargesOnly),
+                amount: None,
+                currency: Some(Currency::USDT()),
+            }],
+            unrepresentable_values: false,
+            requires_fresh_query: true,
+            ts_init: UnixNanos::from(5),
+        };
+        manager.retain_order_fee_report(&fee, None);
+        assert!(manager.query_fill_recovery_pending(cid));
+        report.ts_init = UnixNanos::from(if fresh_after_fee { 40 } else { 10 });
+        manager.observe_execution_report(&ExecutionReport::OrderQueryWithFills(
+            Box::new(report.clone()),
+            Vec::new(),
+        ));
+        assert_eq!(manager.query_fill_recovery_pending(cid), !fresh_after_fee);
+        assert_eq!(manager.order_query_fill_reports[&cid].obligations.len(), 1);
+        report.ts_init = UnixNanos::from(50);
+        manager.observe_execution_report(&ExecutionReport::OrderQueryWithFills(
+            Box::new(report),
+            Vec::new(),
+        ));
+        assert!(!manager.query_fill_recovery_pending(cid));
+    }
+
+    #[rstest]
+    fn positive_query_bounds_survive_later_native_fills(
+        #[values(150, 200, 250)] second_time: u64,
+        #[values(false, true)] query_after_second: bool,
+        #[values(false, true)] newer_receipt: bool,
+    ) {
+        let cid = ClientOrderId::from("POSITIVE-BOUND");
+        let vid = VenueOrderId::from("POSITIVE-BOUND-VENUE");
+        let account = AccountId::from("TEST-001");
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let mut manager = ExecutionManager::new(
+            Rc::new(RefCell::new(VirtualClock::new())),
+            cache.clone(),
+            ExecutionManagerConfig::default(),
+        )
+        .unwrap();
+        insert_accepted_limit_order(&cache, cid, vid, instrument.id(), ClientId::from("TEST"));
+        let report = OrderStatusReport::new(
+            account,
+            instrument.id(),
+            Some(cid),
+            vid,
+            Some(OrderSide::Buy),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::PartiallyFilled,
+            Quantity::from("10.0"),
+            Quantity::from("1.0"),
+            UnixNanos::from(1),
+            UnixNanos::from(200),
+            UnixNanos::from(300),
+            None,
+        );
+        let mut evidence = ExecutionReport::OrderQueryWithFills(Box::new(report), Vec::new());
+
+        for (index, timestamp) in [100, second_time].into_iter().enumerate() {
+            let order = cache.borrow().order_owned(&cid).unwrap();
+            let mut event = TestOrderEventStubs::filled(
+                &order,
+                &instrument,
+                Some(TradeId::from(if index == 0 { "FIRST" } else { "SECOND" })),
+                None,
+                Some(Price::from("100.0")),
+                Some(Quantity::from("1.0")),
+                Some(LiquiditySide::Taker),
+                Some(Money::from("0.01 USDT")),
+                None,
+                Some(account),
+            );
+            let OrderEventAny::Filled(fill) = &mut event else {
+                unreachable!()
+            };
+            fill.ts_event = UnixNanos::from(timestamp);
+
+            if index == 0 {
+                let ExecutionReport::OrderQueryWithFills(report, fills) = &mut evidence else {
+                    unreachable!()
+                };
+                report.venue_position_id = fill.position_id;
+                fills.push(FillReport::new(
+                    fill.account_id,
+                    fill.instrument_id,
+                    fill.venue_order_id,
+                    fill.trade_id,
+                    fill.order_side,
+                    fill.last_qty,
+                    fill.last_px,
+                    fill.commission.unwrap(),
+                    fill.liquidity_side,
+                    Some(cid),
+                    fill.position_id,
+                    fill.ts_event,
+                    fill.ts_init,
+                    None,
+                ));
+            }
+            cache.borrow_mut().update_order(&event).unwrap();
+
+            if index == 0 && !query_after_second {
+                manager.observe_execution_report(&evidence);
+                assert!(!manager.query_fill_recovery_pending(cid));
+                // A repeated observation can mark cached completion; later fills still constrain it.
+                manager.observe_execution_report(&evidence);
+            }
+        }
+
+        if query_after_second {
+            manager.observe_execution_report(&evidence);
+        }
+
+        if newer_receipt {
+            let ExecutionReport::OrderQueryWithFills(report, _) = &mut evidence else {
+                unreachable!()
+            };
+            report.ts_init = UnixNanos::from(400);
+        }
+        manager.observe_execution_report(&evidence);
+        let contradicts =
+            second_time < 200 || (second_time == 200 && (query_after_second || newer_receipt));
+        assert_eq!(manager.query_fill_recovery_pending(cid), contradicts);
+        let order = cache.borrow().order_owned(&cid).unwrap();
+        assert_eq!(
+            manager.order_query_fill_reports[&cid].is_pending(Some(&order)),
+            contradicts
+        );
+        assert_eq!(order.filled_qty(), Quantity::from("2.0"));
+        assert_eq!(order.trade_ids().len(), 2);
     }
 
     #[rstest]

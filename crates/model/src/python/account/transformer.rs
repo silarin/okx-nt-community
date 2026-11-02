@@ -49,6 +49,7 @@ pub fn cash_account_from_account_events(
             .apply(event.clone())
             .map_err(to_pyruntime_err)?;
     }
+    cash_account.invalidate_event_history();
     Ok(cash_account)
 }
 
@@ -78,6 +79,7 @@ pub fn betting_account_from_account_events(
             .apply(event.clone())
             .map_err(to_pyruntime_err)?;
     }
+    betting_account.invalidate_event_history();
     Ok(betting_account)
 }
 
@@ -112,6 +114,7 @@ pub fn wallet_account_from_account_events(
             .map_err(to_pyruntime_err)?;
     }
 
+    wallet_account.invalidate_event_history();
     Ok(wallet_account)
 }
 
@@ -141,5 +144,50 @@ pub fn margin_account_from_account_events(
             .apply(event.clone())
             .map_err(to_pyruntime_err)?;
     }
+    margin_account.invalidate_event_history();
     Ok(margin_account)
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+    use crate::{
+        accounts::AccountAny, enums::AccountType, events::account::stubs::cash_account_state,
+    };
+
+    #[rstest]
+    #[case(AccountType::Cash)]
+    #[case(AccountType::Margin)]
+    #[case(AccountType::Betting)]
+    #[case(AccountType::Wallet)]
+    fn reconstructed_python_events_do_not_assert_history_continuity(#[case] kind: AccountType) {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut event = cash_account_state();
+            event.account_type = kind;
+            event.base_currency = None;
+            let object = event.py_to_dict(py).unwrap();
+            let events = vec![object.bind(py).cast::<PyDict>().unwrap().clone()];
+            let mut account = match kind {
+                AccountType::Cash => AccountAny::Cash(
+                    cash_account_from_account_events(events, false, false).unwrap(),
+                ),
+                AccountType::Margin => {
+                    AccountAny::Margin(margin_account_from_account_events(events, false).unwrap())
+                }
+                AccountType::Betting => {
+                    AccountAny::Betting(betting_account_from_account_events(events, false).unwrap())
+                }
+                AccountType::Wallet => {
+                    AccountAny::Wallet(wallet_account_from_account_events(events, false).unwrap())
+                }
+            };
+            assert_eq!(account.events().len(), 1);
+            assert!(account.contiguous_events().0.is_empty());
+            account.apply(event.clone()).unwrap();
+            assert_eq!(account.contiguous_events().0, &[event]);
+        });
+    }
 }

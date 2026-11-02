@@ -60,6 +60,7 @@ const ORDER_STATUS_REPORT_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::boolean("reduce_only", false),
     JsonFieldSpec::utf8("cancel_reason", true),
     JsonFieldSpec::timestamp("ts_triggered", true),
+    JsonFieldSpec::utf8("parent_venue_order_id", true),
 ];
 
 const FILL_REPORT_FIELDS: &[JsonFieldSpec] = &[
@@ -159,7 +160,14 @@ macro_rules! impl_report_arrow {
 impl_report_arrow!(
     OrderStatusReport,
     "OrderStatusReport",
-    ORDER_STATUS_REPORT_FIELDS
+    ORDER_STATUS_REPORT_FIELDS,
+    |batch: &RecordBatch| {
+        if batch.schema().index_of("parent_venue_order_id").is_ok() {
+            ORDER_STATUS_REPORT_FIELDS
+        } else {
+            &ORDER_STATUS_REPORT_FIELDS[..ORDER_STATUS_REPORT_FIELDS.len() - 1]
+        }
+    }
 );
 impl_report_arrow!(FillReport, "FillReport", FILL_REPORT_FIELDS);
 impl_report_arrow!(
@@ -265,6 +273,7 @@ mod tests {
         )
         .with_linked_order_ids([ClientOrderId::from("O-19700101-000000-001-001-2")]);
         let report = OrderStatusReport {
+            parent_venue_order_id: Some(VenueOrderId::from("PARENT")),
             activation_price: Some(Price::from("1.05000")),
             limit_offset: Some(Decimal::from_str("0.123456789123456789").unwrap()),
             trailing_offset: Some(Decimal::from_str("0.987654321987654321").unwrap()),
@@ -278,6 +287,37 @@ mod tests {
         let decoded =
             OrderStatusReport::decode_typed_batch(batch.schema().metadata(), batch).unwrap();
 
+        assert_eq!(decoded, vec![report]);
+    }
+
+    #[rstest]
+    fn test_legacy_order_status_report_defaults_parent_venue_proof() {
+        let report = OrderStatusReport::new(
+            AccountId::from("SIM-001"),
+            InstrumentId::from("AUDUSD.SIM"),
+            Some(ClientOrderId::from("C")),
+            VenueOrderId::from("V"),
+            Some(OrderSide::Buy),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            Quantity::from("100"),
+            Quantity::from("0"),
+            1.into(),
+            2.into(),
+            3.into(),
+            None,
+        );
+        let metadata = report.metadata();
+        let batch = encode_batch(
+            "OrderStatusReport",
+            &metadata,
+            [&report],
+            &ORDER_STATUS_REPORT_FIELDS[..ORDER_STATUS_REPORT_FIELDS.len() - 1],
+        )
+        .unwrap();
+        let decoded =
+            OrderStatusReport::decode_typed_batch(batch.schema().metadata(), batch).unwrap();
         assert_eq!(decoded, vec![report]);
     }
 

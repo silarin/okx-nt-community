@@ -285,6 +285,7 @@ pub fn parse_futures_ws_order_status_report(
         venue_position_id: None,
         linked_order_ids: None,
         parent_order_id: None,
+        parent_venue_order_id: None,
         contingency_type: None,
         expire_time: None,
         price: None,

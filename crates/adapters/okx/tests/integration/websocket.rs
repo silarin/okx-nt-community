@@ -2501,10 +2501,25 @@ async fn test_true_auto_reconnect_with_verification() {
     let stream = client.stream();
     pin_mut!(stream);
 
-    let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
-        .await
-        .expect("first message timeout")
-        .expect("stream closed too early");
+    let mut disconnected = false;
+    let first_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let first = loop {
+        let message = tokio::time::timeout_at(first_deadline, stream.next())
+            .await
+            .expect("first message timeout")
+            .expect("stream closed too early");
+
+        if let OKXWsMessage::Error(error) = message {
+            assert_eq!(
+                error.message,
+                "WebSocket transport disconnected unexpectedly"
+            );
+            assert!(!disconnected);
+            disconnected = true;
+        } else {
+            break message;
+        }
+    };
 
     match first {
         OKXWsMessage::ChannelData { data, .. } => {
@@ -2533,12 +2548,21 @@ async fn test_true_auto_reconnect_with_verification() {
                 break;
             }
             Ok(Some(OKXWsMessage::Reconnected | OKXWsMessage::Authenticated)) => {}
+            Ok(Some(OKXWsMessage::Error(error))) => {
+                assert_eq!(
+                    error.message,
+                    "WebSocket transport disconnected unexpectedly"
+                );
+                assert!(!disconnected);
+                disconnected = true;
+            }
             Ok(Some(other)) => panic!("unexpected message after reconnect: {other:?}"),
             Ok(None) => panic!("stream closed after reconnect"),
             Err(e) => panic!("timeout waiting for data after reconnect: {e}"),
         }
     }
     assert!(got_data, "never received data after reconnect");
+    assert!(disconnected, "transport loss must reach the consumer");
 
     client.close().await.expect("close failed");
 }

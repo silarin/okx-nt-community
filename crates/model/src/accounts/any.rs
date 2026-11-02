@@ -21,7 +21,10 @@
 
 use enum_dispatch::enum_dispatch;
 use indexmap::IndexMap;
-use nautilus_core::correctness::{CorrectnessResult, CorrectnessResultExt, FAILED};
+use nautilus_core::{
+    UnixNanos,
+    correctness::{CorrectnessResult, CorrectnessResultExt, FAILED},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -76,6 +79,39 @@ impl AccountAny {
         Account::events(self)
     }
 
+    /// Returns the retained arrival-ordered suffix with no known removal or restore gaps.
+    ///
+    /// Purging can retain older events outside this suffix. Deserialized accounts and
+    /// accounts reconstructed from event lists expose only subsequently applied events.
+    /// The second value bounds the initialization times of all excluded events. `None`
+    /// means this bound is unknown (legacy snapshots, event-list restores or zero times),
+    /// so an observation spanning earlier history cannot be proven for this account.
+    /// The bound survives serialization and event removal. This does not establish venue
+    /// completeness, chronology or balance freshness.
+    #[must_use]
+    pub fn contiguous_events(&self) -> (&[AccountState], Option<UnixNanos>) {
+        match self {
+            Self::Margin(account) => account.base.contiguous_events(),
+            Self::Cash(account) => account.base.contiguous_events(),
+            Self::Betting(account) => account.base.contiguous_events(),
+            Self::Wallet(account) => account.base.contiguous_events(),
+        }
+    }
+
+    /// Marks account history as restored without a bound on missing observations.
+    ///
+    /// Replay and event-list reconstruction must not assert live observation continuity.
+    /// This leaves all account state intact, but the historical observation bound remains
+    /// unknown for the lifetime of this account, including subsequently applied events.
+    pub fn invalidate_event_history(&mut self) {
+        match self {
+            Self::Margin(account) => account.base.invalidate_event_history(),
+            Self::Cash(account) => account.base.invalidate_event_history(),
+            Self::Betting(account) => account.base.invalidate_event_history(),
+            Self::Wallet(account) => account.base.invalidate_event_history(),
+        }
+    }
+
     /// Applies an account state event to update the account.
     ///
     /// # Errors
@@ -128,6 +164,8 @@ impl AccountAny {
         for event in remaining_events {
             account.apply(event.clone())?;
         }
+
+        account.invalidate_event_history();
 
         Ok(account)
     }
@@ -387,10 +425,18 @@ mod tests {
             }
             _ => panic!("cloned account variant changed"),
         }
-        assert_eq!(
-            serde_json::to_value(&cloned).unwrap(),
-            serde_json::to_value(&expected).unwrap()
-        );
+        let mut cloned_json = serde_json::to_value(&cloned).unwrap();
+        let mut expected_json = serde_json::to_value(&expected).unwrap();
+        // Event removal intentionally changes the history boundary, not the account state.
+        for value in [&mut cloned_json, &mut expected_json] {
+            for account in value.as_object_mut().unwrap().values_mut() {
+                account["base"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("event_history_cutoff");
+            }
+        }
+        assert_eq!(cloned_json, expected_json);
     }
 
     #[rstest]
