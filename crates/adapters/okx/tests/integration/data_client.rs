@@ -79,6 +79,7 @@ struct TestServerState {
     rpi_book_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     spread_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     fail_spreads: bool,
+    unconfirmed_candle: Option<i64>,
 }
 
 fn manifest_path() -> PathBuf {
@@ -108,6 +109,7 @@ fn create_router(state: TestServerState) -> Router {
     let instruments_state = state.clone();
     let option_summary_state = state.clone();
     let rpi_book_state = state.clone();
+    let unconfirmed_candle = state.unconfirmed_candle;
     let spreads_state = state;
 
     Router::new()
@@ -170,38 +172,47 @@ fn create_router(state: TestServerState) -> Router {
                 }
             }),
         )
-        .route("/api/v5/market/candles", candles_route())
-        .route("/api/v5/market/history-candles", candles_route())
+        .route("/api/v5/market/candles", candles_route(unconfirmed_candle))
+        .route(
+            "/api/v5/market/history-candles",
+            candles_route(unconfirmed_candle),
+        )
 }
 
-/// Closed minute candles for `CANDLES_FIRST` and the day after, answered as OKX does:
+/// Minute candles with an optional unconfirmed row, answered as OKX does:
 /// newest first, `before` and `after` as exclusive bounds on the open time.
-fn candles_route() -> axum::routing::MethodRouter {
-    get(|Query(params): Query<HashMap<String, String>>| async move {
-        let template = load_test_data("http_get_candlesticks.json")["data"][0].clone();
-        let first_ms = CANDLES_FIRST
-            .parse::<jiff::Timestamp>()
-            .unwrap()
-            .as_millisecond();
-        let after = params.get("after").map(|v| v.parse::<i64>().unwrap());
-        let before = params.get("before").map(|v| v.parse::<i64>().unwrap());
-        let limit = params
-            .get("limit")
-            .map_or(100, |v| v.parse::<usize>().unwrap());
-        let data: Vec<Value> = (0..1_440)
-            .rev()
-            .map(|index| first_ms + index * 60_000)
-            .filter(|ts| after.is_none_or(|a| *ts < a) && before.is_none_or(|b| *ts > b))
-            .take(limit)
-            .map(|ts| {
-                let mut candle = template.clone();
-                candle[0] = json!(ts.to_string());
-                candle[8] = json!("1");
-                candle
-            })
-            .collect();
-        Json(json!({"code": "0", "msg": "", "data": data}))
-    })
+fn candles_route(unconfirmed_candle: Option<i64>) -> axum::routing::MethodRouter {
+    get(
+        move |Query(params): Query<HashMap<String, String>>| async move {
+            let template = load_test_data("http_get_candlesticks.json")["data"][0].clone();
+            let first_ms = CANDLES_FIRST
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+                .as_millisecond();
+            let after = params.get("after").map(|v| v.parse::<i64>().unwrap());
+            let before = params.get("before").map(|v| v.parse::<i64>().unwrap());
+            let limit = params
+                .get("limit")
+                .map_or(100, |v| v.parse::<usize>().unwrap());
+            let data: Vec<Value> = (0..1_440)
+                .rev()
+                .map(|index| first_ms + index * 60_000)
+                .filter(|ts| after.is_none_or(|a| *ts < a) && before.is_none_or(|b| *ts > b))
+                .take(limit)
+                .map(|ts| {
+                    let mut candle = template.clone();
+                    candle[0] = json!(ts.to_string());
+                    candle[8] = json!(if unconfirmed_candle == Some((ts - first_ms) / 60_000) {
+                        "0"
+                    } else {
+                        "1"
+                    });
+                    candle
+                })
+                .collect();
+            Json(json!({"code": "0", "msg": "", "data": data}))
+        },
+    )
 }
 
 const CANDLES_FIRST: &str = "2026-09-01T00:00:00Z";
@@ -807,14 +818,25 @@ async fn test_request_trades_http_failure_completes_the_request() {
 }
 
 #[rstest]
-#[case::window_covered(30, true)]
-#[case::history_starts_after_the_start(-60, false)]
+#[case::window_covered(30, false, None, true, 91)]
+#[case::history_starts_after_the_start(-60, false, None, false, 120)]
+#[case::completed_window(30, true, None, true, 91)]
+#[case::unconfirmed_window(30, false, Some(119), false, 91)]
+#[case::completed_unconfirmed_window(30, true, Some(119), false, 90)]
+#[case::completed_unconfirmed_outside(30, true, Some(120), true, 91)]
 #[tokio::test]
 async fn test_request_bars_sends_a_completed_envelope_only_for_a_covered_window(
     #[case] start_minutes: i64,
+    #[case] completed_only: bool,
+    #[case] unconfirmed_candle: Option<i64>,
     #[case] covered: bool,
+    #[case] expected_len: usize,
 ) {
-    let addr = start_test_server(TestServerState::default()).await;
+    let addr = start_test_server(TestServerState {
+        unconfirmed_candle,
+        ..TestServerState::default()
+    })
+    .await;
     let (client, mut rx) = create_test_data_client(addr, false);
     let request = request_instruments();
     let instruments_request_id = request.request_id;
@@ -835,7 +857,13 @@ async fn test_request_bars_sends_a_completed_envelope_only_for_a_covered_window(
             Some(*OKX_CLIENT_ID),
             request_id,
             UnixNanos::default(),
-            None,
+            completed_only.then(|| {
+                Params::new(
+                    [("completed_only".into(), json!(true))]
+                        .into_iter()
+                        .collect(),
+                )
+            }),
         ))
         .expect("request_bars");
 
@@ -867,12 +895,12 @@ async fn test_request_bars_sends_a_completed_envelope_only_for_a_covered_window(
             assert!(envelope.failure_reason().is_none());
             assert!(matches!(
                 envelope.response(),
-                Some(DataResponse::Bars(bars)) if !bars.data.is_empty()
+                Some(DataResponse::Bars(bars)) if bars.data.len() == expected_len
             ));
         }
         DataEvent::Response(DataResponse::Bars(bars)) => {
             assert!(!covered, "a covered window was not marked completed");
-            assert!(!bars.data.is_empty());
+            assert_eq!(bars.data.len(), expected_len);
         }
         other => panic!("unexpected event {other:?}"),
     }
