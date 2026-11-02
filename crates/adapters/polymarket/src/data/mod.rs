@@ -66,7 +66,7 @@ use nautilus_model::{
     enums::BookType,
     events::PositionEvent,
     identifiers::{ClientId, InstrumentId, Venue},
-    instruments::InstrumentAny,
+    instruments::{Instrument, InstrumentAny},
 };
 use nautilus_network::websocket::proxy::ProxyUrl;
 use parking_lot::Mutex;
@@ -85,7 +85,11 @@ use self::{
 };
 use crate::{
     book::{BookSequenceOutcome, recovery::start_recovery},
-    common::{consts::POLYMARKET_VENUE, credential::Credential},
+    common::{
+        consts::{MARKET_VERSION_KEY, POLYMARKET_VENUE},
+        credential::Credential,
+        parse::validate_data_market_version,
+    },
     config::PolymarketDataClientConfig,
     filters::InstrumentFilter,
     http::{
@@ -94,7 +98,7 @@ use crate::{
     },
     polybolt::{PolymarketPolyBoltFeed, is_supported_polybolt_data_type},
     providers::PolymarketInstrumentProvider,
-    resolve::{PendingResolution, ResolveContext, ResolveWatchEntry, StrictResolvedMarket},
+    resolve::{PendingResolution, ResolveContext, ResolveWatchlist, StrictResolvedMarket},
     websocket::{POLYBOLT_STREAMS_ENDPOINT, pool::PolymarketMarketConnectionPool},
 };
 
@@ -125,7 +129,7 @@ pub struct PolymarketDataClient {
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     subscriptions: DataSubscriptions,
     instrument_update_state: Arc<Mutex<InstrumentUpdateState>>,
-    resolve_poll_watchlist: Arc<AtomicMap<String, ResolveWatchEntry>>,
+    resolve_poll_watchlist: Arc<ResolveWatchlist>,
     resolve_watch_apply_mutex: Arc<Mutex<()>>,
     pending_resolutions: Arc<DashMap<String, PendingResolution>>,
     deferred_resolutions: Arc<AtomicMap<InstrumentId, StrictResolvedMarket>>,
@@ -216,7 +220,7 @@ impl PolymarketDataClient {
         let cancellation_token = tasks.cancellation_token();
 
         let instruments = Arc::new(AtomicMap::new());
-        let resolve_poll_watchlist = Arc::new(AtomicMap::new());
+        let resolve_poll_watchlist = Arc::new(ResolveWatchlist::default());
         let resolve_watch_apply_mutex = Arc::new(Mutex::new(()));
         let deferred_resolutions = Arc::new(AtomicMap::new());
 
@@ -346,6 +350,12 @@ impl PolymarketDataClient {
             return Ok(());
         };
 
+        validate_data_market_version(
+            instrument
+                .info()
+                .and_then(|info| info.get_str(MARKET_VERSION_KEY)),
+        )?;
+
         if is_instrument_expired_and_not_reported_open(instrument, now_ns) {
             anyhow::bail!(
                 "Instrument {instrument_id} is expired and no longer available for live subscription"
@@ -365,6 +375,12 @@ impl PolymarketDataClient {
             .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?
             .clone();
 
+        validate_data_market_version(
+            instrument
+                .info()
+                .and_then(|info| info.get_str(MARKET_VERSION_KEY)),
+        )?;
+
         if is_instrument_expired_and_not_reported_open(&instrument, self.clock.get_time_ns()) {
             anyhow::bail!(
                 "Instrument {instrument_id} is expired and no longer available for market data requests"
@@ -380,7 +396,17 @@ impl PolymarketDataClient {
         kind: SubscriptionKind,
     ) -> anyhow::Result<()> {
         // Expiration bounds recovery; it does not disqualify metadata needed for settlement
-        let cached = self.instruments.load().contains_key(&instrument_id);
+        let loaded = self.instruments.load();
+        let cached = loaded.get(&instrument_id);
+        if let Some(instrument) = cached {
+            validate_data_market_version(
+                instrument
+                    .info()
+                    .and_then(|info| info.get_str(MARKET_VERSION_KEY)),
+            )?;
+        }
+
+        let cached = cached.is_some();
 
         if !cached && !self.config.auto_load_missing_instruments {
             anyhow::bail!(

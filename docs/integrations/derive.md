@@ -300,7 +300,7 @@ and prioritize ongoing maintenance.
 | ------------------------------ | --------- | ----------------------------------------------------------------------- |
 | Request instrument (REST)      | ✓         | `public/get_instrument`; loads one instrument into the local cache.     |
 | Request all instruments (REST) | ✓         | Paginated `public/get_all_instruments` for each currency.               |
-| Instrument subscription        | -         | *Not supported.* Use the configured REST refresh interval.              |
+| Instrument subscription        | -         | *Not supported.* Configure `currencies` for periodic REST refresh.      |
 | Order book deltas (L2_MBP)     | ✓         | Channel: `orderbook.{instrument}.{group}.{depth}`.                      |
 | Order book depth (L2_MBP)      | ✓         | Same order book channel with `depth=10`.                                |
 | Order book at interval         | -         | *Not supported.* Maintain interval books from deltas locally.           |
@@ -330,7 +330,7 @@ zero price or size, the adapter clears that instrument's internal quote state an
 prices and sizes.
 
 The last published quote remains in the Nautilus cache with its original timestamps. Suppressing
-quote output does not withdraw that cached quote. Other subscribed ticker fields, including mark
+quote output does not withdraw that cached quote. For decoded tickers, other subscribed fields, including mark
 and index prices, funding rates, and option greeks, continue to emit independently.
 
 #### Instrument loading
@@ -365,14 +365,20 @@ fields fail that currency's fetch. A fetch error during initial loading also fai
 | Bars          | `public/get_tradingview_chart_data` |
 | Funding rates | `public/get_funding_rate_history`   |
 
+Null or empty required candle values or historical funding rates fail the request with a logged
+error and no data response. A malformed candle page also discards previously fetched pages in that
+request. Subsequent valid requests continue normally.
+
 ##### Trade direction and deduplication
 
 Public REST history and WebSocket trades can return maker and taker rows under the same
 `trade_id`. Each row's `direction` is that participant's side. The adapter uses the taker's
-side as the aggressor direction and inverts a maker row's direction, independent of row order.
+side as the aggressor direction and inverts a maker row's direction. For maker/taker pairs,
+the result is independent of row order.
 Live v3 maker WebSocket row mapping remains unverified.
-For rows with an absent or unrecognized `liquidity_role`, the adapter treats `direction` as
-the taker's side.
+For rows with an absent `liquidity_role`, the adapter treats `direction` as the taker's side.
+It maps an unrecognized role to `AggressorSide::NoAggressor` and logs a warning
+with the trade and instrument identifiers.
 
 Historical trade requests emit one `TradeTick` per trade ID within the request. The live feed suppresses
 paired rows and reconnect replays while their IDs remain in a cache of the latest 4,096 trades. Automatic
@@ -705,8 +711,8 @@ locally with `OrderDenied` before submission.
 
 ##### Updating a trigger
 
-Derive error `11054` states that trigger orders cannot replace or be replaced. The adapter therefore rejects
-Nautilus modify requests for trigger orders with an `OrderModifyRejected` event. Cancel and resubmit for
+Derive error `11054` states that trigger orders cannot replace or be replaced. The adapter therefore denies
+Nautilus modify requests for trigger orders with an `OrderModifyDenied` event. Cancel and resubmit for
 trigger updates.
 
 ##### Trigger price offsets
@@ -823,6 +829,12 @@ responsible for observed order state.
 | ------------- | --------- | ------------- | ----------------------------------------------------------- |
 | `post_only`   | ✓         | `post_only`   | Requires `GTC`; rejects if the order would take liquidity.  |
 | `reduce_only` | ✓         | `reduce_only` | Perps and options, market or `IOC`/`FOK` only; spot denied. |
+| `display_qty` | -         | -             | *Not supported by Derive*.                                  |
+
+The adapter does not support iceberg instructions. Orders with `display_qty` set receive
+`OrderDenied` before submission, including conditional orders. If any leg sets `display_qty`,
+the adapter denies every leg before submitting any leg. Existing orders with `display_qty`
+can still be canceled; modifying them is rejected.
 
 #### Time in force
 
@@ -867,20 +879,26 @@ resting `GTC` or post-only limit with `reduce_only` is denied locally before sub
 Direct venue submissions fail with `11024 Reduce only not supported with this time in force`.
 
 :::warning
-If a bracket submitted as an order list contains a reduce-only `GTC` take-profit limit,
-the adapter denies the entire list locally before submitting any leg.
+If any leg fails local list prevalidation, the adapter denies every leg before submitting any leg.
+Lists containing an order with a contingency type (`OTO`, `OCO`, or `OUO`), a parent order ID, or
+nonempty linked order IDs are denied in full, even when each leg's order terms are valid.
+
+Removing `reduce_only` from a `GTC` take-profit does not avoid this denial. Use
+[local order emulation](../concepts/orders/emulated.md), or submit orders individually and manage
+their activation, sibling cancellation, and quantity updates in the strategy. Independent unlinked
+lists remain supported.
 :::
 
 #### Order rejection semantics
 
 State-changing writes (`submit_order`, `modify_order`, `cancel_order`) are sent once over the
 WebSocket and **are not replayed**. The WebSocket request outcome determines whether the
-adapter emits a terminal rejection or waits for reconciliation.
+adapter emits a rejection or waits for reconciliation.
 
 ##### Definitive failures
 
-The adapter emits a terminal rejection event (`OrderRejected`, `OrderModifyRejected`,
-`OrderCancelRejected`) for definitive venue failures:
+The adapter emits `OrderRejected`, `OrderModifyRejected`, or `OrderCancelRejected` for definitive venue
+failures. Only `OrderRejected` terminates the order; modify and cancel rejections preserve it:
 
 - Signed-action rejections such as invalid params, insufficient margin, or unknown orders.
 - Venue business codes such as `11009 Zero liquidity`.
@@ -1172,6 +1190,12 @@ feeds work on either:
 | `option_pricing`            | Optional; options only    | Supplies option greeks.                                                    |
 | Bid/ask                     | Present in both shapes    | Quote feed works with either shape.                                        |
 
+Null or empty required mark/index prices reject the whole WebSocket ticker frame, including its
+quote, funding rate, and greeks. The adapter logs a warning. On REST, one malformed ticker rejects
+the entire `public/get_tickers` response: quote requests emit no response, option-chain reference
+prices are unavailable, and market-order quote refreshes fail. Subsequent valid updates and requests
+continue normally. Zero (`0` or `"0"`) remains valid; null optional fields produce no corresponding event.
+
 #### Instrument class restrictions
 
 Funding rates are only meaningful for perpetuals, and option greeks only for options. The adapter accepts a
@@ -1196,11 +1220,15 @@ Class/struct: `DeriveDataClientConfig`.
 | `ws_timeout_secs`                  | `None`    | Per-operation WebSocket timeout (login, subscribe, read, write) in seconds. Unset uses 10s. |
 | `book_snapshot_timeout_secs`       | `10`      | Snapshot wait in seconds; `0` disables deadlines.                                           |
 | `book_stale_threshold_secs`        | `120`     | Seconds without an advancing snapshot before recovery; `0` disables this timer.             |
-| `update_instruments_interval_mins` | `60`      | Interval in minutes between instrument refreshes.                                           |
+| `update_instruments_interval_mins` | `60`      | Instrument refresh interval in minutes; `0` disables periodic refresh.                      |
 | `currencies`                       | `[]`      | Currencies to bulk-load on connect. Empty means lazy-load on demand.                        |
 | `include_expired`                  | `false`   | Merge live and expired option listings from `public/get_all_instruments`.                   |
 | `auto_load_missing_instruments`    | `true`    | Lazy-load an unknown instrument before sending a subscribe request.                         |
 | `transport_backend`                | `Sockudo` | WebSocket transport backend (`Sockudo` or `Tungstenite`).                                   |
+
+The data client refreshes instrument definitions for configured currencies after each refresh interval
+and publishes them, including new listings. A failed refresh leaves cached definitions available and
+retries at the next interval. Empty `currencies` disables periodic refresh.
 
 :::important
 **`auto_load_missing_instruments` covers subscribe commands only.** Before requesting quotes,

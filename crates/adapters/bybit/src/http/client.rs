@@ -26,6 +26,7 @@ use std::{
         Arc, LazyLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use ahash::{AHashMap, AHashSet};
@@ -72,6 +73,7 @@ use super::{
         BybitSubMembersResponse, BybitSwitchModeResponse, BybitTickerData, BybitTickerOption,
         BybitTickersOptionResponse, BybitTradeHistoryResponse, BybitTradesResponse,
         BybitUpdateMasterApiResponse, BybitUpdateSubApiResponse, BybitWalletBalanceResponse,
+        BybitWithdrawResponse, BybitWithdrawalRecord, BybitWithdrawalRecordsResponse,
     },
     query::{
         BybitAmendOrderParamsBuilder, BybitBatchAmendOrderEntryBuilder,
@@ -87,6 +89,7 @@ use super::{
         BybitSubApiKeysParams, BybitSubMembersPageParams, BybitSwitchModeParamsBuilder,
         BybitTickersParams, BybitTradeHistoryParams, BybitTradesParams, BybitTradesParamsBuilder,
         BybitUpdateMasterApiParams, BybitUpdateSubApiParams, BybitWalletBalanceParams,
+        BybitWithdrawParams, BybitWithdrawalRecordsParams,
     },
 };
 use crate::common::{
@@ -537,6 +540,31 @@ impl BybitRawHttpClient {
         body: Option<Vec<u8>>,
         authenticate: bool,
     ) -> Result<T, BybitHttpError> {
+        self.dispatch(method, endpoint, params, body, authenticate, true)
+            .await
+    }
+
+    async fn send_request_once<T: DeserializeOwned + BybitResponseCheck, P: Serialize>(
+        &self,
+        method: Method,
+        endpoint: &str,
+        params: Option<&P>,
+        body: Option<Vec<u8>>,
+        authenticate: bool,
+    ) -> Result<T, BybitHttpError> {
+        self.dispatch(method, endpoint, params, body, authenticate, false)
+            .await
+    }
+
+    async fn dispatch<T: DeserializeOwned + BybitResponseCheck, P: Serialize>(
+        &self,
+        method: Method,
+        endpoint: &str,
+        params: Option<&P>,
+        body: Option<Vec<u8>>,
+        authenticate: bool,
+        retry: bool,
+    ) -> Result<T, BybitHttpError> {
         let endpoint = endpoint.to_string();
         let url = format!("{}{endpoint}", self.base_url);
         let method_clone = method.clone();
@@ -652,6 +680,8 @@ impl BybitRawHttpClient {
             }
         };
 
+        let should_retry = |e: &BybitHttpError| retry && should_retry_http(e);
+
         let create_error = |error: RetryError| -> BybitHttpError {
             match error {
                 RetryError::Canceled => {
@@ -664,12 +694,7 @@ impl BybitRawHttpClient {
         let token = self.cancellation_token();
 
         self.retry_manager
-            .invocation(
-                endpoint.as_str(),
-                operation,
-                should_retry_http,
-                create_error,
-            )
+            .invocation(endpoint.as_str(), operation, should_retry, create_error)
             .cancellation_token(&token)
             .execute()
             .await
@@ -1551,6 +1576,97 @@ impl BybitRawHttpClient {
         }
 
         result
+    }
+
+    /// Withdraws coins from the account.
+    ///
+    /// Retries only when `request_id` is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Credentials are missing.
+    /// - The request fails.
+    /// - The API key lacks withdrawal permission or is not a master UID key.
+    /// - The address is not in the account's withdrawal address book.
+    ///
+    /// # References
+    ///
+    /// - <https://bybit-exchange.github.io/docs/v5/asset/withdraw>
+    pub async fn withdraw(
+        &self,
+        params: &BybitWithdrawParams,
+    ) -> Result<BybitWithdrawResponse, BybitHttpError> {
+        let body = serde_json::to_vec(params)?;
+        let endpoint = "/v5/asset/withdraw/create";
+
+        if params.request_id.is_some() {
+            self.send_request::<_, ()>(Method::POST, endpoint, None, Some(body), true)
+                .await
+        } else {
+            self.send_request_once::<_, ()>(Method::POST, endpoint, None, Some(body), true)
+                .await
+        }
+    }
+
+    /// Fetches withdrawal records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Credentials are missing.
+    /// - The request fails.
+    /// - The response cannot be parsed.
+    ///
+    /// # References
+    ///
+    /// - <https://bybit-exchange.github.io/docs/v5/asset/withdraw/withdraw-record>
+    pub async fn get_withdrawal_records(
+        &self,
+        params: &BybitWithdrawalRecordsParams,
+    ) -> Result<BybitWithdrawalRecordsResponse, BybitHttpError> {
+        self.send_request(
+            Method::GET,
+            "/v5/asset/withdraw/query-record",
+            Some(params),
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Fetches every page of withdrawal records matching `params` and returns
+    /// the flattened list. Walks the cursor until Bybit signals end-of-pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any page request fails or the response cannot be parsed.
+    pub async fn fetch_all_withdrawal_records(
+        &self,
+        params: &BybitWithdrawalRecordsParams,
+    ) -> Result<Vec<BybitWithdrawalRecord>, BybitHttpError> {
+        let mut params = params.clone();
+        let mut records = Vec::new();
+        let mut cursor_walk = CursorWalk::default();
+
+        loop {
+            let mut page = self.get_withdrawal_records(&params).await?;
+            records.append(&mut page.result.rows);
+
+            let next = cursor_walk
+                .advance(
+                    "/v5/asset/withdraw/query-record",
+                    page.result.next_page_cursor.take(),
+                )
+                .map_err(|e| BybitHttpError::ValidationError(e.to_string()))?;
+
+            match next {
+                Some(c) => params.cursor = Some(c),
+                None => break,
+            }
+        }
+
+        Ok(records)
     }
 
     /// Fetches tickers for market data.
@@ -2727,7 +2843,9 @@ impl BybitHttpClient {
         parse_order_status_report(&order, &instrument, account_id, ts_init)
     }
 
-    /// Cancel an order.
+    /// Cancels an order and returns its confirmed terminal status.
+    ///
+    /// Polls until the order closes, bounded by the configured HTTP timeout.
     ///
     /// # Errors
     ///
@@ -2736,6 +2854,7 @@ impl BybitHttpClient {
     /// - The request fails.
     /// - The order doesn't exist.
     /// - The API returns an error.
+    /// - Terminal status confirmation times out.
     pub async fn cancel_order(
         &self,
         account_id: AccountId,
@@ -2744,7 +2863,7 @@ impl BybitHttpClient {
         client_order_id: Option<ClientOrderId>,
         venue_order_id: Option<VenueOrderId>,
     ) -> anyhow::Result<OrderStatusReport> {
-        let instrument = self.instrument_from_cache(&instrument_id.symbol)?;
+        self.instrument_from_cache(&instrument_id.symbol)?;
         let bybit_symbol = BybitSymbol::new(instrument_id.symbol.as_str())?;
 
         let mut cancel_entry = BybitBatchCancelOrderEntryBuilder::default();
@@ -2777,19 +2896,33 @@ impl BybitHttpClient {
             .order_id
             .ok_or(BybitCancelOrderError::MissingOrderId)?;
 
-        let order = self
-            .query_order_by_id(
-                product_type,
-                order_id.as_str(),
-                BYBIT_ORDER_HISTORY,
-                "after cancellation",
-            )
+        let venue_order_id = VenueOrderId::from(order_id.as_str());
+
+        let confirmation = async {
+            loop {
+                if let Some(report) = self
+                    .query_order(
+                        account_id,
+                        product_type,
+                        instrument_id,
+                        client_order_id,
+                        Some(venue_order_id),
+                    )
+                    .await?
+                    && report.order_status.is_closed()
+                {
+                    return Ok(report);
+                }
+
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+
+        tokio::time::timeout(Duration::from_secs(self.inner.timeout_secs), confirmation)
             .await
-            .map_err(|source| BybitCancelOrderError::PostCancelLookup { source })?;
-
-        let ts_init = self.generate_ts_init();
-
-        parse_order_status_report(&order, &instrument, account_id, ts_init)
+            .context("timed out confirming Bybit order cancellation")
+            .and_then(|result| result)
+            .map_err(|source| BybitCancelOrderError::PostCancelLookup { source }.into())
     }
 
     /// Batch cancel multiple orders.
@@ -3004,6 +3137,7 @@ impl BybitHttpClient {
         venue_order_id: Option<VenueOrderId>,
         quantity: Option<Quantity>,
         price: Option<Price>,
+        trigger_price: Option<Price>,
     ) -> anyhow::Result<OrderStatusReport> {
         let instrument = self.instrument_from_cache(&instrument_id.symbol)?;
         let bybit_symbol = BybitSymbol::new(instrument_id.symbol.as_str())?;
@@ -3025,6 +3159,10 @@ impl BybitHttpClient {
 
         if let Some(price) = price {
             amend_entry.price(Some(price.to_string()));
+        }
+
+        if let Some(trigger_price) = trigger_price {
+            amend_entry.trigger_price(Some(trigger_price.to_string()));
         }
 
         let amend_entry = amend_entry.build().build_anyhow()?;
@@ -4472,11 +4610,15 @@ impl BybitHttpClient {
 
     /// Fetches execution history (fills) for the account and returns a list of [`FillReport`]s.
     ///
-    /// Executions for instruments not currently loaded in cache will be skipped.
+    /// Funding executions and executions for instruments not currently loaded in cache are skipped.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails.
+    /// Returns an error if:
+    /// - The request fails.
+    /// - The instrument ID is invalid.
+    /// - Pagination cannot advance.
+    /// - A fill for a cached instrument cannot be parsed.
     ///
     /// # References
     ///
@@ -4573,12 +4715,8 @@ impl BybitHttpClient {
                 continue;
             };
 
-            match parse_fill_report(&execution, account_id, &instrument, ts_init) {
-                Ok(report) => reports.push(report),
-                Err(e) => {
-                    log::error!("Failed to parse fill report: {e}");
-                }
-            }
+            let report = parse_fill_report(&execution, account_id, &instrument, ts_init)?;
+            reports.push(report);
         }
 
         Ok(reports)

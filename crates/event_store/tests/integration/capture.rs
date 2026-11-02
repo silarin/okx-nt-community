@@ -729,6 +729,59 @@ impl BusTap for HeadersAwareAdapterTap {
 }
 
 #[rstest]
+fn account_state_endpoint_and_topic_capture_once() {
+    let bus = MessageBus::new(TraderId::from("TRADER-001"), UUID4::new(), None, None);
+    let _bus_rc = bus.register_message_bus();
+    let (writer, backend) = writer_with_open_run("run-account-two-hops", noop_halt());
+    let registry = Arc::new(default_registry());
+    let adapter = Arc::new(BusCaptureAdapter::new(
+        Arc::clone(&writer),
+        Arc::clone(&registry),
+        noop_halt(),
+    ));
+    msgbus::set_bus_tap(Rc::new(HeadersAwareAdapterTap {
+        adapter: Arc::clone(&adapter),
+        registry,
+    }));
+    let endpoint = MessagingSwitchboard::portfolio_update_account();
+    msgbus::register_account_state_endpoint(endpoint, TypedHandler::from(|_: &AccountState| {}));
+    let state = AccountState::new(
+        AccountId::from("SIM-001"),
+        AccountType::Cash,
+        vec![AccountBalance::new(
+            Money::from("100 USD"),
+            Money::from("20 USD"),
+            Money::from("80 USD"),
+        )],
+        vec![],
+        true,
+        UUID4::new(),
+        UnixNanos::from(100),
+        UnixNanos::from(101),
+        Some(Currency::USD()),
+    );
+    msgbus::send_account_state(endpoint, &state);
+    msgbus::publish_account_state("events.account.SIM-001".into(), &state);
+
+    msgbus::clear_bus_tap();
+    drop(adapter);
+    let writer = Arc::try_unwrap(writer).expect("sole writer reference");
+    writer.close(run_ended_draft()).expect("close writer");
+    let backend = backend.lock();
+    assert_eq!(
+        backend.high_watermark().unwrap(),
+        2,
+        "one state and RunEnded"
+    );
+    let entry = backend.scan_seq(1).unwrap().unwrap();
+    assert_eq!(entry.payload_type.as_str(), "AccountState");
+    let decoded: AccountState = rmp_serde::from_slice(&entry.payload).unwrap();
+    assert_eq!(decoded.event_id, state.event_id);
+    assert_eq!(decoded.account_id, state.account_id);
+    assert_eq!(decoded.balances, state.balances);
+}
+
+#[rstest]
 fn tap_path_writes_headers_from_command_fields() {
     // End-to-end: a SubmitOrder published with populated correlation_id and
     // causation_id must reach the writer with both headers on the entry. This is the

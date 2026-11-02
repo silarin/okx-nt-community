@@ -93,8 +93,8 @@ are never republished.
 | REST reconciliation | `update_instruments_interval_mins` (default 60) | New or changed definitions only                        |
 
 Each update first writes the data client, HTTP, and WebSocket caches. Then it publishes new or changed
-definitions as `DataEvent::Instrument`. Thus, consumers never observe a definition absent from the caches. A
-material change is any serialized field other than `ts_event` and `ts_init`.
+definitions as `DataEvent::Data(Data::Instrument(_))`. Thus, consumers never observe a definition absent from
+the caches. A material change is any serialized field other than `ts_event` and `ts_init`.
 
 - The instruments channel is incremental rather than a snapshot feed. A subscription or reconnect can begin
   without an initial payload. Thus, reconnect replay alone does not reconcile the instrument cache.
@@ -575,6 +575,21 @@ aborts the connection before WebSockets open, even if another scope succeeds.
 Pre-open instruments and entries that cannot be parsed do not satisfy this
 requirement. Options without configured instrument families remain skipped.
 
+### WebSocket reconnects
+
+If reauthentication fails or times out, the adapter reconnects before attempting another login.
+It does not replay login requests onto replacement connections.
+
+During reconnects, the adapter retains order commands that have not started a transport write.
+It preserves their serialized payloads and request IDs, then sends them in FIFO order after any
+required reauthentication. Queued commands do not wait for subscription restoration.
+Order updates missed before private subscriptions are restored rely on execution reconciliation.
+
+The recovery FIFO holds up to 1,024 commands. Overflow or a transport timeout before a write produces
+a local send failure. The adapter does not automatically replay a command whose delivery is uncertain.
+Local reconciliation timeouts do not cancel queued commands; see
+[outbound commands during reconnect](../developer_guide/adapters.md#outbound-commands-during-reconnect).
+
 ### USD to USDC spot migration
 
 OKX is consolidating USD and USDC spot books. This is a breaking venue change. Affected
@@ -740,6 +755,9 @@ order expiration by canceling the order at the specified expiry time.
 | Batch Modify | ✓                     | Modify multiple orders in single request. |
 | Batch Cancel | ✓                     | Cancel multiple orders in single request. |
 
+Regular-order batch cancels split repeated targets into separate WebSocket requests so each reply
+identifies one command UUID. Batches with distinct targets use up to 20 orders per request.
+
 ### Cancel-all orders
 
 `Strategy.cancel_all_orders` supports `order_side` in both strategy-only and cross-strategy mode.
@@ -763,8 +781,8 @@ response without a message produces `OKX error <code>` alone, and one that also 
 `subCode` appends it as `(subCode=<code>)`. A conditional order that fails after acceptance
 reports only its code, such as `OKX error 51008`, because OKX sends only a `failCode`.
 
-Rejections the adapter raises before contacting OKX, such as local validation failures, carry
-the adapter's own message and no OKX error code.
+Local modify and cancel refusals proven not sent produce `OrderModifyDenied` or `OrderCancelDenied`.
+They carry the adapter's own message and no OKX error code.
 
 ### Position management
 
@@ -844,6 +862,27 @@ Spot orders funded by cash use these trade modes (`tdMode`):
 | Futures               | `2`      | `cash`        |
 | Multi-currency margin | `3`      | `cross`       |
 | Portfolio margin      | `4`      | `cross`       |
+
+Spot market buys and sells use `quote_quantity=False` for base units and `True` for quote units.
+Single and batch submissions map this intent to the same quantity units.
+Base-sized sells use OKX's default base units; other explicit sizing requests use `tgtCcy`.
+Select the trade mode for the account from the table above; selecting quantity units does not change
+the trade mode.
+
+Both units work for cash-funded spot in Spot and Futures account modes and for spot orders in
+Multi-currency margin mode (`acctLv=3`) with `tdMode=cross`.
+In Futures mode, spot orders with `tdMode=cross` or `isolated` are native `MARGIN` orders.
+Market buys use quote units and market sells use base units. OKX rejects the opposite units with `59110`.
+Portfolio margin, borrowing-enabled Spot mode, and `spot_isolated` sizing require separate venue
+validation before use.
+
+Low-level `OKXWebSocketClient::batch_submit_orders` calls that pass `OKXInstrumentType::Margin`
+require quote units for market buys and base units for market sells. Other explicit units are rejected
+locally. This rule applies to that low-level argument, not the execution config's `instrument_types`.
+See OKX's [market order quantity units](https://www.okx.com/docs-v5/en/#order-book-trading-trade-post-place-order).
+
+For native Futures-mode margin orders over HTTP, use `place_order` with `ccy` set to the margin
+currency. `place_order_with_domain_types` omits `ccy`; requests with native quantity units reject with `50014`.
 
 Keep auto-borrow off in modes 3 and 4 to prevent borrowing beyond the cash balance.
 
@@ -971,7 +1010,7 @@ take-profit leg.
 
 Derivative algo orders require contract quantity; quote quantity is denied locally.
 These algo rules do not restrict ordinary market orders.
-Spot market orders in `tdMode=cash` also support quote-sized sells.
+Ordinary spot market orders also support quote-sized sells.
 Neither size unit guarantees a full fill. OKX documents balance-based size reduction for `trigger` orders.
 For Futures-mode spot-margin `STOP_MARKET` and `MARKET_IF_TOUCHED` buys, use quote quantity:
 OKX rejects `base_ccy` with `59110`. Use `tdMode=cash` in Futures mode for base-sized buys.
@@ -1011,8 +1050,8 @@ The [limits on amendments after restart](#modifying-conditional-orders) also app
 
 :::warning
 Pending amendments require tracked session context. Orders recovered after a restart or without
-that context emit `OrderModifyRejected` locally. Trailing-stop algo amendments also emit
-`OrderModifyRejected` locally.
+that context emit `OrderModifyDenied` locally. Trailing-stop algo amendments also emit
+`OrderModifyDenied` locally.
 :::
 
 #### Trigger price types
@@ -1512,6 +1551,10 @@ history:
 Values above 7 days are clamped to the longest complete window across the regular order history
 and spread trade history endpoints used for reconciliation. This is not a limit on all archived data
 available from OKX.
+
+Periodic position checks treat an absent report as flat only for configured derivative instrument types.
+Spot, margin, and spread instruments do not have complete bulk position coverage, so an absent report
+does not close their cached positions. Spot-margin positions that OKX reports still reconcile normally.
 
 OKX reports no size for a live algo order placed with `close_fraction`, because the order closes
 the whole position when it triggers. REST order status reports use the size of the position that

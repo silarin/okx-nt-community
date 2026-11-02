@@ -34,7 +34,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hypersync-client = "1"
+hypersync-client = "2"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 ```
@@ -94,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-See the [examples directory](./examples) for more usage patterns including wallet transactions, block streaming, and decoded event output.
+See the [upstream examples directory](https://github.com/enviodev/hypersync-client-rust/tree/main/examples) for more usage patterns including wallet transactions, block streaming, and decoded event output.
 
 ## Main Types
 

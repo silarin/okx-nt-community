@@ -43,12 +43,13 @@ use futures_util::StreamExt;
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
+    clock::VirtualClock,
     live::runner::set_exec_event_sender,
     messages::{
         ExecutionEvent,
         execution::{
             BatchCancelOrders, CancelOrder, ExecutionReport as CommonExecutionReport, ModifyOrder,
-            OrderFeeOrigin, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+            OrderFeeOrigin, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
             report::{GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports},
         },
     },
@@ -56,7 +57,9 @@ use nautilus_common::{
 };
 use nautilus_core::{AtomicMap, DurationNanos, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_live::{
-    ExecutionClientCore, ExecutionEventEmitter, execution::context::OrderIdentity,
+    ExecutionClientCore, ExecutionEventEmitter,
+    execution::context::OrderIdentity,
+    manager::{ExecutionManager, ExecutionManagerConfig},
 };
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
@@ -65,10 +68,10 @@ use nautilus_model::{
         TimeInForce, TriggerType,
     },
     events::{
-        OrderEventAny, OrderInitialized, OrderUpdated,
+        AccountState, OrderEventAny, OrderInitialized, OrderUpdated,
         order::spec::{
-            OrderAcceptedSpec, OrderPendingUpdateSpec, OrderSubmittedSpec, OrderTriggeredSpec,
-            OrderUpdatedSpec,
+            OrderAcceptedSpec, OrderPendingCancelSpec, OrderPendingUpdateSpec, OrderSubmittedSpec,
+            OrderTriggeredSpec, OrderUpdatedSpec,
         },
     },
     identifiers::{
@@ -85,7 +88,7 @@ use nautilus_model::{
     orders::{Order, OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs},
     position::Position,
     reports::{FillReport, OrderStatusReport},
-    types::{Currency, Money, Price, Quantity},
+    types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use nautilus_network::http::HttpClient;
 use nautilus_okx::{
@@ -475,7 +478,7 @@ fn test_ambiguous_batch_submit_send_failure_emits_no_rejections() {
 }
 
 #[rstest]
-fn test_unsent_modify_send_failure_emits_order_modify_rejected() {
+fn test_unsent_modify_send_failure_emits_order_modify_denied() {
     let cid = ClientOrderId::new("O-modify-handler-unavailable");
     let (events, state) = dispatch_send_failed_response(
         OKXWsOperation::AmendOrder,
@@ -486,9 +489,9 @@ fn test_unsent_modify_send_failure_emits_order_modify_rejected() {
     assert!(
         contains_order_event(&events, |event| matches!(
             event,
-            OrderEventAny::ModifyRejected(rejected) if rejected.client_order_id == cid
+            OrderEventAny::ModifyDenied(rejected) if rejected.client_order_id == cid
         )),
-        "unsent modify failure should emit OrderModifyRejected: {events:?}"
+        "unsent modify failure should emit OrderModifyDenied: {events:?}"
     );
     assert!(state.order_identities.contains_key(&cid));
 }
@@ -644,7 +647,7 @@ async fn test_local_submit_validation_failure_emits_order_rejected() {
 
 #[rstest]
 #[tokio::test]
-async fn test_local_modify_validation_failure_emits_order_modify_rejected() {
+async fn test_local_modify_validation_failure_emits_order_modify_denied() {
     let addr = start_exec_test_server().await;
     let base_url = format!("http://{addr}");
     let (mut client, mut rx, cache) = create_test_execution_client(&base_url);
@@ -675,12 +678,12 @@ async fn test_local_modify_validation_failure_emits_order_modify_rejected() {
     match recv_order_event_matching(&mut rx, |event| {
         matches!(
             event,
-            OrderEventAny::ModifyRejected(rejected) if rejected.client_order_id == client_order_id
+            OrderEventAny::ModifyDenied(rejected) if rejected.client_order_id == client_order_id
         )
     })
     .await
     {
-        OrderEventAny::ModifyRejected(rejected) => {
+        OrderEventAny::ModifyDenied(rejected) => {
             assert_eq!(rejected.client_order_id, client_order_id);
             assert!(
                 rejected.reason.contains("No instIdCode cached"),
@@ -688,7 +691,7 @@ async fn test_local_modify_validation_failure_emits_order_modify_rejected() {
                 rejected.reason
             );
         }
-        other => panic!("expected OrderModifyRejected event, was {other:?}"),
+        other => panic!("expected OrderModifyDenied event, was {other:?}"),
     }
 }
 
@@ -2460,6 +2463,7 @@ fn make_algo_cancel_response(
 
 fn make_algo_cancel_context(cid: &str) -> AlgoCancelContext {
     AlgoCancelContext {
+        causation_id: None,
         client_order_id: ClientOrderId::new(cid),
         instrument_id: InstrumentId::from("ETH-USDT-SWAP.OKX"),
         strategy_id: StrategyId::from("STRATEGY-001"),
@@ -2583,6 +2587,128 @@ fn test_algo_cancel_rejection_emits_for_nonzero_scode() {
             assert_eq!(event.reason, Ustr::from("OKX error 51000: Order not found"));
         }
         other => panic!("Expected one OrderCancelRejected, was {other:?}"),
+    }
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+#[tokio::test(start_paused = true)]
+async fn test_algo_cancel_rejection_preserves_other_command(#[case] reverse: bool) {
+    let (emitter, mut rx) = test_emitter();
+    let clock = get_atomic_clock_realtime();
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let context = make_algo_cancel_context("O-OVERLAPPING-ALGO");
+    let account_id = AccountId::from("OKX-001");
+    let venue_order_id = context.venue_order_id.unwrap();
+    let order = OrderTestBuilder::new(OrderType::StopMarket)
+        .trader_id(TraderId::from("TESTER-001"))
+        .strategy_id(context.strategy_id)
+        .instrument_id(context.instrument_id)
+        .client_order_id(context.client_order_id)
+        .quantity(Quantity::from("2.500"))
+        .trigger_price(Price::from("2317.25"))
+        .build();
+    let accepted = TestOrderEventStubs::accepted(&order, account_id, venue_order_id);
+    cache
+        .borrow_mut()
+        .add_order(order, None, None, false)
+        .unwrap();
+    cache.borrow_mut().update_order(&accepted).unwrap();
+
+    let mut manager = ExecutionManager::new(
+        Rc::new(RefCell::new(VirtualClock::new())),
+        Rc::clone(&cache),
+        ExecutionManagerConfig {
+            inflight_threshold_ms: 100,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut causes = [UUID4::new(), UUID4::new()];
+
+    for cause in causes {
+        let mut pending = OrderPendingCancelSpec::builder()
+            .trader_id(TraderId::from("TESTER-001"))
+            .strategy_id(context.strategy_id)
+            .instrument_id(context.instrument_id)
+            .client_order_id(context.client_order_id)
+            .account_id(account_id)
+            .venue_order_id(venue_order_id)
+            .event_id(UUID4::new())
+            .build();
+        pending.causation_id = Some(cause);
+        cache
+            .borrow_mut()
+            .update_order(&OrderEventAny::PendingCancel(pending))
+            .unwrap();
+        manager.register_inflight(context.client_order_id, cause);
+    }
+
+    if reverse {
+        causes.reverse();
+    }
+
+    for (index, cause) in causes.into_iter().enumerate() {
+        let context = AlgoCancelContext {
+            causation_id: Some(cause),
+            ..context.clone()
+        };
+
+        emit_algo_cancel_rejections(
+            &[make_algo_cancel_response(
+                "algo-overlap",
+                "51000",
+                "Order not found",
+            )],
+            std::slice::from_ref(&context),
+            &emitter,
+            clock,
+        );
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 1);
+
+        let ExecutionEvent::Order(event @ OrderEventAny::CancelRejected(rejected)) = &events[0]
+        else {
+            panic!("Expected cancel rejection, was {:?}", events[0]);
+        };
+
+        assert_eq!(rejected.causation_id, Some(cause));
+        assert_eq!(rejected.client_order_id, context.client_order_id);
+        assert_eq!(rejected.venue_order_id, Some(venue_order_id));
+        assert_eq!(rejected.reason, "OKX error 51000: Order not found");
+        cache.borrow_mut().update_order(event).unwrap();
+        manager.observe_order_event(event);
+        tokio::time::advance(Duration::from_millis(101)).await;
+        let result = manager.check_inflight_orders();
+        let cached = cache
+            .borrow()
+            .try_order_owned(&context.client_order_id)
+            .unwrap();
+
+        assert_eq!(cached.quantity(), Quantity::from("2.500"));
+        assert_eq!(cached.trigger_price(), Some(Price::from("2317.25")));
+        assert_eq!(cached.has_pending_cancel_command(), index == 0);
+        assert_eq!(
+            cached.status(),
+            if index == 0 {
+                OrderStatus::PendingCancel
+            } else {
+                OrderStatus::Accepted
+            }
+        );
+        assert!(result.events.is_empty());
+        assert_eq!(result.queries.len(), usize::from(index == 0));
+
+        if index == 0 {
+            let TradingCommand::QueryOrder(query) = &result.queries[0] else {
+                panic!("Expected query for remaining cancel");
+            };
+
+            assert_eq!(query.client_order_id, context.client_order_id);
+            assert_eq!(query.venue_order_id, Some(venue_order_id));
+        }
     }
 }
 
@@ -3579,6 +3705,130 @@ fn create_test_execution_client_configured(
     let client = OKXExecutionClient::new(core, config).unwrap();
 
     (client, rx, cache)
+}
+
+#[rstest]
+#[case::default(vec![], "BTC-USDT.OKX", false)]
+#[case::spot(vec![OKXInstrumentType::Spot], "BTC-USDT.OKX", false)]
+#[case::margin(vec![OKXInstrumentType::Margin], "BTC-USDT.OKX", false)]
+#[case::mixed_spot(vec![OKXInstrumentType::Spot, OKXInstrumentType::Swap], "BTC-USDT.OKX", false)]
+#[case::swap(vec![OKXInstrumentType::Swap], "BTC-USDT-SWAP.OKX", true)]
+#[case::future(vec![OKXInstrumentType::Futures], "BTC-USDT-301220.OKX", true)]
+#[case::option(vec![OKXInstrumentType::Option], "BTC-USD-301220-50000-C.OKX", true)]
+#[case::unconfigured(vec![OKXInstrumentType::Spot], "BTC-USDT-SWAP.OKX", false)]
+#[case::other_derivative(vec![OKXInstrumentType::Swap], "BTC-USDT-301220.OKX", false)]
+#[case::any(vec![OKXInstrumentType::Any], "BTC-USDT-SWAP.OKX", false)]
+#[case::unknown(vec![OKXInstrumentType::Swap], "UNKNOWN.OKX", false)]
+#[case::spread(vec![OKXInstrumentType::Events], "BTC-USDT-SWAP_BTC-USDT-301220.OKX", false)]
+fn test_bulk_position_coverage(
+    #[case] instrument_types: Vec<OKXInstrumentType>,
+    #[case] instrument_id: &str,
+    #[case] expected: bool,
+) {
+    let (client, _rx, _cache) =
+        create_test_execution_client_configured("http://127.0.0.1:1", |config| {
+            config.instrument_types = instrument_types;
+        });
+
+    assert_eq!(
+        client.provides_bulk_position_coverage(InstrumentId::from(instrument_id)),
+        expected
+    );
+}
+
+#[rstest]
+#[case::default(vec![])]
+#[case::spot(vec![OKXInstrumentType::Spot])]
+#[case::margin(vec![OKXInstrumentType::Margin])]
+#[case::mixed(vec![OKXInstrumentType::Spot, OKXInstrumentType::Swap])]
+#[tokio::test]
+async fn test_position_check_preserves_spot_position_without_reports(
+    #[case] instrument_types: Vec<OKXInstrumentType>,
+) {
+    let state = Arc::new(ReportRouteState::default());
+    let addr = start_exec_report_test_server(state).await;
+
+    let (mut client, _rx, cache) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.instrument_types = instrument_types;
+        });
+
+    let instrument = make_margin_spot_report_instrument();
+    client.on_instrument(instrument.clone());
+
+    let account_state = AccountState::new(
+        client.account_id(),
+        AccountType::Margin,
+        vec![AccountBalance::new(
+            Money::from("100000 USDT"),
+            Money::from("0 USDT"),
+            Money::from("100000 USDT"),
+        )],
+        vec![],
+        true,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        None,
+    );
+    cache
+        .borrow_mut()
+        .add_account(AccountAny::Margin(MarginAccount::new(account_state, true)))
+        .unwrap();
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.000000"))
+        .build();
+    let position_id = PositionId::from("P-SPOT-RETAINED");
+    let fill = TestOrderEventStubs::filled(
+        &order,
+        &instrument,
+        Some(TradeId::from("T-SPOT-OPEN")),
+        Some(position_id),
+        Some(Price::from("50000.00")),
+        None,
+        None,
+        None,
+        None,
+        Some(client.account_id()),
+    );
+    let position = Position::new(&instrument, fill.into());
+    cache.borrow_mut().add_instrument(instrument).unwrap();
+    cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Hedging)
+        .unwrap();
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+
+    let mut manager = ExecutionManager::new(
+        clock,
+        cache.clone(),
+        ExecutionManagerConfig {
+            position_check_threshold_ns: DurationNanos::ZERO,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut events = Vec::new();
+    for _ in 0..2 {
+        events.extend(manager.check_positions_consistency(&[&client]).await);
+    }
+
+    assert!(
+        events.is_empty(),
+        "Unexpected reconciliation events: {events:?}"
+    );
+    let cache = cache.borrow();
+    assert!(cache.orders_refs(None, None, None, None, None).is_empty());
+    assert_eq!(cache.positions_open(None, None, None, None, None).len(), 1);
+    let retained = cache.position(&position_id).unwrap();
+    assert_eq!(retained.quantity, position.quantity);
+    assert_eq!(retained.signed_decimal_qty(), position.signed_decimal_qty());
+    assert_eq!(retained.side, position.side);
+    assert_eq!(retained.avg_px_open, position.avg_px_open);
+    assert_eq!(retained.event_count(), position.event_count());
 }
 
 fn make_margin_spot_report_instrument() -> InstrumentAny {
@@ -8958,7 +9208,6 @@ async fn start_history_page_test_server(state: Arc<HistoryPageState>) -> SocketA
 #[case::two_pages(Some(2), 2, 2, false)]
 #[case::exhausted(Some(3), 2, 3, true)]
 #[case::empty(Some(1), 0, 1, true)]
-#[case::safety_cap(Some(51), 50, 50, false)]
 #[tokio::test]
 async fn test_generate_mass_status_history_page_limits(
     #[case] max_pages: Option<u32>,

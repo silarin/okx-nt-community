@@ -18,6 +18,8 @@
 //! Concrete account types (`CashAccount`, `MarginAccount`, etc.) build on the abstractions defined
 //! in this file.
 
+use std::sync::Arc;
+
 use ahash::AHashMap;
 use indexmap::IndexMap;
 use nautilus_core::{
@@ -54,7 +56,9 @@ pub struct BaseAccount {
     /// (as opposed to taken from venue reports).
     pub calculate_account_state: bool,
     /// The account state events, oldest first.
-    pub events: Vec<AccountState>,
+    ///
+    /// Clones share this history until one of them is modified.
+    pub events: Arc<Vec<AccountState>>,
     // Restored event lists cannot establish which intervening events were purged
     #[serde(skip)]
     event_history_start: Option<usize>,
@@ -84,7 +88,7 @@ impl BaseAccount {
             account_type: event.account_type,
             base_currency: event.base_currency,
             calculate_account_state,
-            events: vec![event],
+            events: Arc::new(vec![event]),
             event_history_start: Some(0),
             event_history_cutoff: Some(UnixNanos::default()),
             commissions: AHashMap::new(),
@@ -100,7 +104,7 @@ impl BaseAccount {
             account_type: self.account_type,
             base_currency: self.base_currency,
             calculate_account_state: self.calculate_account_state,
-            events: Vec::new(),
+            events: Arc::default(),
             event_history_start: Some(0),
             event_history_cutoff: self.event_history_cutoff,
             commissions: self.commissions.clone(),
@@ -272,7 +276,7 @@ impl BaseAccount {
             self.events = events;
             self.event_history_start = Some(self.events.len());
         }
-        self.events.push(event);
+        Arc::make_mut(&mut self.events).push(event);
     }
 
     pub(crate) fn contiguous_events(&self) -> (&[AccountState], Option<UnixNanos>) {
@@ -335,7 +339,7 @@ impl BaseAccount {
         let old_events = std::mem::take(&mut self.events);
         let suffix_len = retained_events.len() - retained_start;
         self.exclude_event_history(&old_events[..old_events.len() - suffix_len]);
-        self.events = retained_events;
+        self.events = Arc::new(retained_events);
         self.event_history_start = Some(retained_start);
     }
 
@@ -765,6 +769,44 @@ mod tests {
         account.base_purge_account_events(UnixNanos::from(u64::MAX), 60);
 
         assert_eq!(account.events.len(), 1);
+    }
+
+    #[rstest]
+    fn test_base_clone_shares_events() {
+        let account = BaseAccount::new(cash_account_state(), true);
+
+        let cloned = account.clone();
+
+        assert!(Arc::ptr_eq(&account.events, &cloned.events));
+    }
+
+    #[rstest]
+    fn test_base_apply_after_clone() {
+        let initial = cash_account_state();
+        let mut later = cash_account_state();
+        later.ts_event = UnixNanos::from(200_000_000_000);
+        let mut account = BaseAccount::new(initial.clone(), true);
+        let cloned = account.clone();
+
+        account.base_apply(later.clone());
+
+        assert_eq!(*account.events, vec![initial.clone(), later]);
+        assert_eq!(*cloned.events, vec![initial]);
+    }
+
+    #[rstest]
+    fn test_base_purge_account_events_after_clone() {
+        let initial = cash_account_state();
+        let mut later = cash_account_state();
+        later.ts_event = UnixNanos::from(200_000_000_000);
+        let mut account = BaseAccount::new(initial.clone(), true);
+        account.base_apply(later.clone());
+        let cloned = account.clone();
+
+        account.base_purge_account_events(UnixNanos::from(300_000_000_000), 150);
+
+        assert_eq!(*account.events, vec![later.clone()]);
+        assert_eq!(*cloned.events, vec![initial, later]);
     }
 
     #[rstest]

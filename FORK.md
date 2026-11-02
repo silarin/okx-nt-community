@@ -8,10 +8,12 @@ for fork questions and [SECURITY.md](SECURITY.md) for private vulnerability repo
 ## Upstream baseline
 
 The recorded upstream integration is
-[`f5754f916e`](https://github.com/nautechsystems/nautilus_trader/commit/f5754f916e51955cd468ad26796a3fdd8bd8a75c),
-merged into this fork through [PR #1](https://github.com/silarin/okx-nt-community/pull/1)
-on 25 October 2026. This identifies the imported source snapshot, not a promise that the fork
-always tracks the newest upstream commit. Update this record with each upstream integration.
+[`d702a89ce4`](https://github.com/nautechsystems/nautilus_trader/commit/d702a89ce4e54980447de493a2bf02efbf3aae6b),
+imported on 2 November 2026. This identifies the imported source snapshot, not a promise that the
+fork always tracks the newest upstream commit. The previous integration was
+[`f5754f916e`](https://github.com/nautechsystems/nautilus_trader/commit/f5754f916e51955cd468ad26796a3fdd8bd8a75c)
+through [PR #1](https://github.com/silarin/okx-nt-community/pull/1). Update this record with each
+upstream integration.
 
 ## Maintained differences
 

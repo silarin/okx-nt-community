@@ -873,15 +873,15 @@ Keep their freshness semantics distinct:
 The shared [`DataEvent`](../../crates/common/src/messages/mod.rs) envelope determines how data
 enters the engine:
 
-| Variant                       | Use                                                                 | Contract to preserve                                                                |
-| ----------------------------- | ------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `DataEvent::Instrument`       | Instrument definitions from bootstrap, requests, or updates.        | Preserve complete identity, precision, and venue timestamps when available.         |
-| `DataEvent::InstrumentStatus` | Trading or availability status changes.                             | Emit meaningful transitions rather than unchanged polling snapshots.                |
-| `DataEvent::Data`             | Trades, quotes, order-book data, bars, and other typed market data. | Complete parsing and event boundary construction before emission.                   |
-| `DataEvent::Response`         | Results for current or historical data requests.                    | Preserve request correlation, parameters, filters, and freshness semantics.         |
-| `DataEvent::FundingRate`      | Funding rate updates for derivatives.                               | Preserve the venue's effective or event time and instrument identity.               |
-| `DataEvent::OptionGreeks`     | Venue-provided option greeks.                                       | Preserve the source instrument and distinguish venue values from local calculation. |
-| `DataEvent::DeFi`             | Feature-gated decentralized finance data.                           | Emit only when the adapter and build expose the shared `defi` feature.              |
+| Variant                                      | Use                                                            | Contract to preserve                                                                |
+| -------------------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `DataEvent::Data(Data::Instrument(_))`       | Instrument definitions from bootstrap, requests, or updates.   | Preserve complete identity, precision, and venue timestamps when available.         |
+| `DataEvent::Data(Data::InstrumentStatus(_))` | Trading or availability status changes.                        | Emit meaningful transitions rather than unchanged polling snapshots.                |
+| `DataEvent::Data`                            | All typed data, including the payloads listed above and below. | Complete parsing and event boundary construction before emission.                   |
+| `DataEvent::Response`                        | Results for current or historical data requests.               | Preserve request correlation, parameters, filters, and freshness semantics.         |
+| `DataEvent::Data(Data::FundingRate(_))`      | Funding rate updates for derivatives.                          | Preserve the venue's effective or event time and instrument identity.               |
+| `DataEvent::Data(Data::OptionGreeks(_))`     | Venue-provided option greeks.                                  | Preserve the source instrument and distinguish venue values from local calculation. |
+| `DataEvent::DeFi`                            | Feature-gated decentralized finance data.                      | Emit only when the adapter and build expose the shared `defi` feature.              |
 
 Add a regression test that changes the upstream instrument response between two requests. The
 second response must reflect the new venue state rather than a private cache entry.
@@ -1285,6 +1285,10 @@ or mark them permanently unreconcilable. A duplicate or reconnect replay can ret
 reconciliation stays the authoritative recovery path. The WebSocket handler does not start an immediate REST
 request.
 
+Polymarket instead quarantines invalid trades and immediately starts targeted REST resolution;
+repaired WebSocket replays remain quarantined. Apply its
+[TC-E89 exception](spec_exec_testing.md#tc-e89-websocket-commission-failure) for recovery and deduplication.
+
 #### Bounded mass-status reports
 
 When an execution client applies a lower time bound to historical reconciliation reports, record
@@ -1516,12 +1520,13 @@ Separate three evidence classes:
 
 - **Definitive local failure**: local evidence proves that the command was never transmitted. Deterministic
   validation before a submit is one example. Emit `OrderDenied` before `OrderSubmitted`. During cancel or
-  modify preparation, emit the matching rejection only when both conditions hold:
+  modify preparation, emit `OrderModifyDenied` or `OrderCancelDenied` with the command ID only when both
+  conditions hold:
 
   - The failure is attributable to that command.
   - The failure proves that the command was not sent.
 
-  Otherwise, log the failure without inventing a rejection.
+  Otherwise, log the failure without inventing a command outcome.
 - **Definitive venue result**: a structured venue response or status explicitly accepts, updates,
   or rejects one command. Emit the matching domain event.
 - **Unknown outcome**: the request may have reached the venue, but no definitive result is
@@ -1563,13 +1568,13 @@ Use consistent names so command failure classifications can be compared across a
 same wire condition is classified consistently. Classify every state-changing order command failure as one
 [`CommandFailure`](../../crates/live/src/execution/failure.rs) variant:
 
-| Evidence class             | `CommandFailure` variant | Terminal event from this evidence |
-| -------------------------- | ------------------------ | --------------------------------- |
-| Definitive local failure   | `NotSent`                | Valid                             |
-| Definitive venue rejection | `VenueRejected`          | Valid                             |
-| Unknown outcome            | `Ambiguous`              | Never                             |
+| Evidence class             | `CommandFailure` variant | Definitive event from this evidence |
+| -------------------------- | ------------------------ | ----------------------------------- |
+| Definitive local failure   | `NotSent`                | Valid                               |
+| Definitive venue rejection | `VenueRejected`          | Valid                               |
+| Unknown outcome            | `Ambiguous`              | Never                               |
 
-An `Ambiguous` classification never emits a terminal event by itself. Later definitive evidence
+An `Ambiguous` classification never emits a definitive event by itself. Later definitive evidence
 from a stream update, query, poll, or reconciliation still resolves the command either way.
 
 A definitive venue acceptance or update is not a failure and carries no variant. Apply the venue
@@ -2068,13 +2073,20 @@ response. Stream-mode clients own their reconnect loop, and their handles report
 
 :::note
 Never require the old socket to remain live until a replacement is ready. Use the existing reconnect
-path instead of adding parallel connection ownership, buffering, and epoch coordination to avoid a
+path instead of adding parallel connection ownership and epoch coordination to avoid a
 reconnect gap.
 
 Execution reconciliation can often recover missed order and fill state. Use venue-supported snapshots
 or replay for market-data gaps. Recovery depends on venue coverage and does not guarantee delivery of
 every missed message.
 :::
+
+#### Outbound commands during reconnect
+
+A handler may queue commands known not to have been written while the shared client reconnects. Resume
+sending after required session state is restored, preserving command identity. Do not replay commands
+whose write outcome is unknown. Queued commands can still reach the venue after local timeout resolution;
+see [terminal reconciliation provenance](../concepts/execution/policies.md#terminal-reconciliation-provenance).
 
 #### Shutdown
 

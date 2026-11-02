@@ -24,14 +24,17 @@ use nautilus_common::{
             CacheDatabaseAdapter, CacheDatabaseFactory, CacheMap, register_loaded_currencies,
         },
     },
-    live::get_runtime,
+    live::{block_on_nautilus_with, get_runtime},
     logging::{log_task_awaiting, log_task_started, log_task_stopped},
     signal::Signal,
 };
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     accounts::AccountAny,
-    data::{Bar, CustomData, DataType, FundingRateUpdate, InstrumentClose, QuoteTick, TradeTick},
+    data::{
+        Bar, CustomData, DataType, FundingRateUpdate, InstrumentClose, QuoteTick, TradeTick,
+        greeks::{GreeksData, YieldCurve},
+    },
     events::{
         AccountState, OrderEventAny, OrderFilled, OrderInitialized, OrderSnapshot,
         position::snapshot::PositionSnapshot,
@@ -53,7 +56,7 @@ use ustr::Ustr;
 
 use crate::sql::{
     pg::{connect_pg, get_postgres_connect_options},
-    queries::DatabaseQueries,
+    queries::{CACHE_DATABASE_KEY_PREFIX, DatabaseQueries, trader_key_prefix},
 };
 
 // Task and connection names
@@ -179,24 +182,12 @@ impl CacheDatabaseFactory for PostgresCacheConfig {
         _instance_id: UUID4,
         _config: CacheConfig,
     ) -> anyhow::Result<Box<dyn CacheDatabaseAdapter>> {
-        let database = PostgresCacheDatabase::connect(
-            self.host.clone(),
-            self.port,
-            self.username.clone(),
-            self.password.clone(),
-            self.database.clone(),
-            trader_id,
-        )
-        .await?;
+        let database = PostgresCacheDatabase::connect(self.clone(), trader_id).await?;
         Ok(Box::new(database))
     }
 }
 
 #[derive(Debug)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.infrastructure")
-)]
 pub struct PostgresCacheDatabase {
     pub pool: PgPool,
     trader_id: TraderId,
@@ -212,6 +203,9 @@ pub struct PostgresCacheDatabase {
 pub enum DatabaseQuery {
     Close,
     Add(String, Vec<u8>),
+    Delete(String),
+    DeleteOrder(ClientOrderId),
+    DeletePosition(PositionId),
     AddCurrency(Currency),
     AddInstrument(InstrumentAny),
     AddInstrumentClose(InstrumentClose),
@@ -225,6 +219,8 @@ pub enum DatabaseQuery {
     AddQuote(QuoteTick),
     AddTrade(TradeTick),
     AddBar(Bar),
+    AddGreeks(GreeksData),
+    AddYieldCurve(YieldCurve),
     UpdateOrder(OrderEventAny),
     UpdatePosition(OrderFilled),
     IndexOrderPosition(ClientOrderId, PositionId),
@@ -232,7 +228,7 @@ pub enum DatabaseQuery {
 }
 
 impl PostgresCacheDatabase {
-    /// Connects to the Postgres cache database using the provided connection parameters.
+    /// Connects to the Postgres cache database using the concrete backend configuration.
     ///
     /// Loads, trader-owned writes and flushes are scoped to `trader_id`, and account events are
     /// stamped with it.
@@ -247,15 +243,16 @@ impl PostgresCacheDatabase {
     ///
     /// Panics if the internal Postgres pool connection attempt (`connect_pg`) unwraps on error.
     pub async fn connect(
-        host: Option<String>,
-        port: Option<u16>,
-        username: Option<String>,
-        password: Option<String>,
-        database: Option<String>,
+        config: PostgresCacheConfig,
         trader_id: TraderId,
     ) -> Result<Self, sqlx::Error> {
-        let pg_connect_options =
-            get_postgres_connect_options(host, port, username, password, database);
+        let pg_connect_options = get_postgres_connect_options(
+            config.host,
+            config.port,
+            config.username,
+            config.password,
+            config.database,
+        );
         let pool = connect_pg(pg_connect_options.clone().into()).await.unwrap();
         check_schema_migrated(&pool).await?;
         check_account_ownership(&pool).await?;
@@ -340,6 +337,17 @@ impl PostgresCacheDatabase {
 
         log_task_stopped(CACHE_PROCESS);
     }
+
+    fn load_state(&self, key: String) -> anyhow::Result<AHashMap<String, Bytes>> {
+        let pool = self.pool.clone();
+        block_on_nautilus_with(move || async move {
+            let value = DatabaseQueries::load_value(&pool, &key).await?;
+            match value {
+                Some(value) => serde_json::from_slice(&value).map_err(Into::into),
+                None => Ok(AHashMap::new()),
+            }
+        })
+    }
 }
 
 // Fails fast when the connected database predates required cache schema.
@@ -404,6 +412,10 @@ async fn check_schema_migrated(pool: &PgPool) -> Result<(), sqlx::Error> {
     let missing: Vec<String> = sqlx::query_scalar(
         "SELECT required.table_name || '.' || required.column_name
         FROM (VALUES
+            ('greeks', 'instrument_id'),
+            ('greeks', 'value'),
+            ('yield_curve', 'curve_name'),
+            ('yield_curve', 'value'),
             ('instrument', 'info'),
             ('account_event', 'trader_id'),
             ('order_position_index', 'trader_id'),
@@ -554,16 +566,7 @@ async fn flush_buffer(
 ///
 /// Returns an error if connecting to the database or initializing the cache adapter fails.
 pub async fn get_pg_cache_database(trader_id: TraderId) -> anyhow::Result<PostgresCacheDatabase> {
-    let connect_options = get_postgres_connect_options(None, None, None, None, None);
-    Ok(PostgresCacheDatabase::connect(
-        Some(connect_options.host),
-        Some(connect_options.port),
-        Some(connect_options.username),
-        Some(connect_options.password),
-        Some(connect_options.database),
-        trader_id,
-    )
-    .await?)
+    Ok(PostgresCacheDatabase::connect(PostgresCacheConfig::default(), trader_id).await?)
 }
 
 #[async_trait::async_trait]
@@ -616,20 +619,26 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         let mut currencies = self.load_currencies().await?;
         register_loaded_currencies(&mut currencies)?;
 
-        let (instruments, instrument_closes, synthetics, accounts, orders, positions) = try_join!(
+        let (
+            instruments,
+            instrument_closes,
+            synthetics,
+            accounts,
+            orders,
+            positions,
+            greeks,
+            yield_curves,
+        ) = try_join!(
             self.load_instruments(),
             self.load_instrument_closes(),
             self.load_synthetics(),
             self.load_accounts(),
             self.load_orders(),
-            self.load_positions()
+            self.load_positions(),
+            self.load_greeks(),
+            self.load_yield_curves()
         )
         .map_err(|e| anyhow::anyhow!("Error loading cache data: {e}"))?;
-
-        // For now, we don't load greeks and yield curves from the database
-        // This will be implemented in the future
-        let greeks = AHashMap::new();
-        let yield_curves = AHashMap::new();
 
         Ok(CacheMap {
             currencies,
@@ -654,6 +663,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
                 Ok(items) => {
                     let mapping = items
                         .into_iter()
+                        .filter(|(key, _)| !key.starts_with(CACHE_DATABASE_KEY_PREFIX))
                         .map(|(k, v)| (k, Bytes::from(v)))
                         .collect();
 
@@ -739,7 +749,19 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
     }
 
     async fn load_synthetics(&self) -> anyhow::Result<AHashMap<InstrumentId, SyntheticInstrument>> {
-        Ok(AHashMap::new())
+        let prefix = format!("{CACHE_DATABASE_KEY_PREFIX}synthetic:");
+        let values: Vec<Vec<u8>> =
+            sqlx::query_scalar("SELECT value FROM general WHERE starts_with(id, $1)")
+                .bind(prefix)
+                .fetch_all(&self.pool)
+                .await?;
+        values
+            .into_iter()
+            .map(|value| {
+                let synthetic: SyntheticInstrument = serde_json::from_slice(&value)?;
+                Ok((synthetic.id, synthetic))
+            })
+            .collect()
     }
 
     async fn load_accounts(&self) -> anyhow::Result<AHashMap<AccountId, AccountAny>> {
@@ -822,6 +844,14 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         rx.recv()?
     }
 
+    async fn load_greeks(&self) -> anyhow::Result<AHashMap<InstrumentId, GreeksData>> {
+        DatabaseQueries::load_greeks(&self.pool).await
+    }
+
+    async fn load_yield_curves(&self) -> anyhow::Result<AHashMap<String, YieldCurve>> {
+        DatabaseQueries::load_yield_curves(&self.pool).await
+    }
+
     fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, PositionId>> {
         let pool = self.pool.clone();
         let trader_id = self.trader_id;
@@ -900,36 +930,34 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         &self,
         instrument_id: &InstrumentId,
     ) -> anyhow::Result<Option<InstrumentAny>> {
-        let pool = self.pool.clone();
-        let instrument_id = instrument_id.to_owned(); // Clone the instrument_id
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        tokio::spawn(async move {
-            let result = DatabaseQueries::load_instrument(&pool, &instrument_id).await;
-            match result {
-                Ok(instrument) => {
-                    if let Err(e) = tx.send(instrument) {
-                        log::error!("Failed to send instrument {instrument_id}: {e:?}");
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to load instrument {instrument_id}: {e:?}");
-                    if let Err(e) = tx.send(None) {
-                        log::error!("Failed to send None for instrument {instrument_id}: {e:?}");
-                    }
-                }
-            }
-        });
-        Ok(rx.recv()?)
+        load_instrument(&self.pool, instrument_id).await
     }
 
     async fn load_synthetic(
         &self,
         instrument_id: &InstrumentId,
     ) -> anyhow::Result<Option<SyntheticInstrument>> {
-        anyhow::bail!(
-            "load_synthetic not implemented for PostgreSQL cache adapter: {instrument_id}"
-        )
+        DatabaseQueries::load_synthetic(&self.pool, instrument_id).await
+    }
+
+    fn load_instrument_sync(
+        &self,
+        instrument_id: &InstrumentId,
+    ) -> anyhow::Result<Option<InstrumentAny>> {
+        let pool = self.pool.clone();
+        let instrument_id = *instrument_id;
+        block_on_nautilus_with(move || async move { load_instrument(&pool, &instrument_id).await })
+    }
+
+    fn load_synthetic_sync(
+        &self,
+        instrument_id: &InstrumentId,
+    ) -> anyhow::Result<Option<SyntheticInstrument>> {
+        let pool = self.pool.clone();
+        let instrument_id = *instrument_id;
+        block_on_nautilus_with(move || async move {
+            DatabaseQueries::load_synthetic(&pool, &instrument_id).await
+        })
     }
 
     async fn load_account(&self, account_id: &AccountId) -> anyhow::Result<Option<AccountAny>> {
@@ -999,35 +1027,56 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
     }
 
     fn load_actor(&self, actor_id: &ActorId) -> anyhow::Result<AHashMap<String, Bytes>> {
-        anyhow::bail!("load_actor not implemented for PostgreSQL cache adapter: {actor_id}")
+        self.load_state(format!(
+            "{}actor:{actor_id}",
+            trader_key_prefix(self.trader_id)
+        ))
     }
 
-    fn delete_actor(&self, _actor_id: &ActorId) -> anyhow::Result<()> {
-        todo!()
+    fn delete_actor(&self, actor_id: &ActorId) -> anyhow::Result<()> {
+        let query = DatabaseQuery::Delete(format!(
+            "{}actor:{actor_id}",
+            trader_key_prefix(self.trader_id)
+        ));
+        self.tx
+            .send(query)
+            .map_err(|e| anyhow::anyhow!("Failed to queue state deletion: {e}"))
     }
 
     fn load_strategy(&self, strategy_id: &StrategyId) -> anyhow::Result<AHashMap<String, Bytes>> {
-        anyhow::bail!("load_strategy not implemented for PostgreSQL cache adapter: {strategy_id}")
+        self.load_state(format!(
+            "{}strategy:{strategy_id}",
+            trader_key_prefix(self.trader_id)
+        ))
     }
 
-    fn delete_strategy(&self, _strategy_id: &StrategyId) -> anyhow::Result<()> {
-        todo!()
+    fn delete_strategy(&self, strategy_id: &StrategyId) -> anyhow::Result<()> {
+        let query = DatabaseQuery::Delete(format!(
+            "{}strategy:{strategy_id}",
+            trader_key_prefix(self.trader_id)
+        ));
+        self.tx
+            .send(query)
+            .map_err(|e| anyhow::anyhow!("Failed to queue state deletion: {e}"))
     }
 
     fn delete_order(&self, client_order_id: &ClientOrderId) -> anyhow::Result<()> {
-        anyhow::bail!(
-            "delete_order not implemented for PostgreSQL cache adapter: {client_order_id}"
-        )
+        self.tx
+            .send(DatabaseQuery::DeleteOrder(*client_order_id))
+            .map_err(|e| anyhow::anyhow!("Failed to queue order deletion: {e}"))
     }
 
     fn delete_position(&self, position_id: &PositionId) -> anyhow::Result<()> {
-        anyhow::bail!("delete_position not implemented for PostgreSQL cache adapter: {position_id}")
+        self.tx
+            .send(DatabaseQuery::DeletePosition(*position_id))
+            .map_err(|e| anyhow::anyhow!("Failed to queue position deletion: {e}"))
     }
 
     fn delete_account_event(&self, account_id: &AccountId, event_id: &str) -> anyhow::Result<()> {
-        anyhow::bail!(
-            "delete_account_event not implemented for PostgreSQL cache adapter: {account_id}, {event_id}"
-        )
+        log::warn!(
+            "Deleting account events is a no-op pending replay-safe compaction, {account_id}: {event_id}"
+        );
+        Ok(())
     }
 
     fn add(&self, key: String, value: Bytes) -> anyhow::Result<()> {
@@ -1061,8 +1110,11 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
             })
     }
 
-    fn add_synthetic(&self, _synthetic: &SyntheticInstrument) -> anyhow::Result<()> {
-        todo!()
+    fn add_synthetic(&self, synthetic: &SyntheticInstrument) -> anyhow::Result<()> {
+        self.add(
+            format!("{CACHE_DATABASE_KEY_PREFIX}synthetic:{}", synthetic.id),
+            Bytes::from(serde_json::to_vec(synthetic)?),
+        )
     }
 
     fn add_account(&self, account: &AccountAny) -> anyhow::Result<()> {
@@ -1223,6 +1275,48 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
             }
         });
         Ok(rx.recv()?)
+    }
+
+    fn add_greeks(&self, greeks: &GreeksData) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            [
+                greeks.strike,
+                greeks.expiry_in_years,
+                greeks.multiplier,
+                greeks.quantity,
+                greeks.underlying_price,
+                greeks.interest_rate,
+                greeks.cost_of_carry,
+                greeks.vol,
+                greeks.pnl,
+                greeks.price,
+                greeks.delta,
+                greeks.gamma,
+                greeks.vega,
+                greeks.theta,
+                greeks.rho,
+                greeks.itm_prob,
+            ]
+            .iter()
+            .all(|value| value.is_finite()),
+            "Cannot persist non-finite GreeksData"
+        );
+        self.tx
+            .send(DatabaseQuery::AddGreeks(greeks.clone()))
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to send query add_greeks to database message handler: {e}")
+            })
+    }
+
+    fn add_yield_curve(&self, curve: &YieldCurve) -> anyhow::Result<()> {
+        curve.validate()?;
+        self.tx
+            .send(DatabaseQuery::AddYieldCurve(curve.clone()))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to send query add_yield_curve to database message handler: {e}"
+                )
+            })
     }
 
     fn add_signal(&self, signal: &Signal) -> anyhow::Result<()> {
@@ -1388,17 +1482,26 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
     fn update_actor(
         &self,
         actor_id: &ActorId,
-        _state: &AHashMap<String, Bytes>,
+        state: &AHashMap<String, Bytes>,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("update_actor not implemented for PostgreSQL cache adapter: {actor_id}")
+        self.add(
+            format!("{}actor:{actor_id}", trader_key_prefix(self.trader_id)),
+            Bytes::from(serde_json::to_vec(state)?),
+        )
     }
 
     fn update_strategy(
         &self,
         strategy_id: &StrategyId,
-        _state: &AHashMap<String, Bytes>,
+        state: &AHashMap<String, Bytes>,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("update_strategy not implemented for PostgreSQL cache adapter: {strategy_id}")
+        self.add(
+            format!(
+                "{}strategy:{strategy_id}",
+                trader_key_prefix(self.trader_id)
+            ),
+            Bytes::from(serde_json::to_vec(state)?),
+        )
     }
 
     fn update_account(&self, account: &AccountAny) -> anyhow::Result<()> {
@@ -1446,9 +1549,25 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         self.add_position_snapshot(&snapshot)
     }
 
-    fn heartbeat(&self, _timestamp: UnixNanos) -> anyhow::Result<()> {
-        todo!()
+    fn heartbeat(&self, timestamp: UnixNanos) -> anyhow::Result<()> {
+        self.add(
+            format!("{}health:heartbeat", trader_key_prefix(self.trader_id)),
+            Bytes::from(serde_json::to_vec(&timestamp)?),
+        )
     }
+}
+
+async fn load_instrument(
+    pool: &PgPool,
+    instrument_id: &InstrumentId,
+) -> anyhow::Result<Option<InstrumentAny>> {
+    let mut currencies = DatabaseQueries::load_currencies(pool)
+        .await?
+        .into_iter()
+        .map(|currency| (currency.code, currency))
+        .collect();
+    register_loaded_currencies(&mut currencies)?;
+    DatabaseQueries::load_instrument(pool, instrument_id).await
 }
 
 fn account_last_event(account: &AccountAny) -> anyhow::Result<AccountState> {
@@ -1476,6 +1595,13 @@ async fn drain_buffer(pool: &PgPool, trader_id: &TraderId, buffer: &mut VecDeque
         let result: anyhow::Result<()> = match cmd {
             DatabaseQuery::Close => Ok(()),
             DatabaseQuery::Add(key, value) => DatabaseQueries::add(pool, key, value).await,
+            DatabaseQuery::Delete(key) => DatabaseQueries::delete(pool, &key).await,
+            DatabaseQuery::DeleteOrder(id) => {
+                DatabaseQueries::delete_order(pool, *trader_id, id).await
+            }
+            DatabaseQuery::DeletePosition(id) => {
+                DatabaseQueries::delete_position(pool, *trader_id, id).await
+            }
             DatabaseQuery::AddCurrency(currency) => {
                 DatabaseQueries::add_currency(pool, currency).await
             }
@@ -1584,6 +1710,10 @@ async fn drain_buffer(pool: &PgPool, trader_id: &TraderId, buffer: &mut VecDeque
             DatabaseQuery::AddQuote(quote) => DatabaseQueries::add_quote(pool, &quote).await,
             DatabaseQuery::AddTrade(trade) => DatabaseQueries::add_trade(pool, &trade).await,
             DatabaseQuery::AddBar(bar) => DatabaseQueries::add_bar(pool, &bar).await,
+            DatabaseQuery::AddGreeks(greeks) => DatabaseQueries::add_greeks(pool, &greeks).await,
+            DatabaseQuery::AddYieldCurve(curve) => {
+                DatabaseQueries::add_yield_curve(pool, &curve).await
+            }
             DatabaseQuery::UpdateOrder(event) => {
                 DatabaseQueries::add_order_event(pool, event.into_boxed(), None).await
             }

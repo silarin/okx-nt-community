@@ -1898,6 +1898,7 @@ fn test_external_client_subscribe_registers_streamable_payload_types(
         data_engine.execute(DataCommand::Subscribe(cmd));
 
         assert_only_streaming_type(&stub_msgbus.borrow(), expected, name);
+        data_engine.reset();
     }
 }
 
@@ -5265,7 +5266,8 @@ fn test_external_instrument_lists_filter_overlap_and_keep_release_acquisitions(
     let mut fields = serde_json::json!({"instrument_ids": [first, second], "client_id": client_id,
         "venue": venue, "command_id": UUID4::new(), "ts_init": 41, "correlation_id": UUID4::new(), "params": {"owner": 59}});
 
-    if family.starts_with("Book") {
+    let book = family.starts_with("Book");
+    if book {
         fields["book_type"] = serde_json::json!(BookType::L2_MBP);
         fields["depth"] = serde_json::json!(7);
         if family == "BookSnapshots" {
@@ -5282,8 +5284,24 @@ fn test_external_instrument_lists_filter_overlap_and_keep_release_acquisitions(
     fields["params"] = serde_json::json!({"owner": 61});
     let overlapping: SubscribeCommand =
         serde_json::from_value(serde_json::json!({family: fields})).unwrap();
+    assert_eq!(
+        [
+            engine.has_book_subscription(&first),
+            engine.has_book_subscription(&second),
+            engine.has_book_subscription(&third)
+        ],
+        [false; 3]
+    );
     engine.execute_subscribe(original.clone()).unwrap();
     engine.execute_subscribe(overlapping.clone()).unwrap();
+    assert_eq!(
+        [
+            engine.has_book_subscription(&first),
+            engine.has_book_subscription(&second),
+            engine.has_book_subscription(&third)
+        ],
+        [book; 3]
+    );
     let first_release_id = UUID4::new();
     engine
         .execute_unsubscribe(&original.clone().into_unsubscribe(
@@ -5292,6 +5310,14 @@ fn test_external_instrument_lists_filter_overlap_and_keep_release_acquisitions(
             None,
         ))
         .unwrap();
+    assert_eq!(
+        [
+            engine.has_book_subscription(&first),
+            engine.has_book_subscription(&second),
+            engine.has_book_subscription(&third)
+        ],
+        [false, book, book]
+    );
     let after_first_release = releases.get_messages();
     let final_release_id = UUID4::new();
     engine
@@ -5301,6 +5327,14 @@ fn test_external_instrument_lists_filter_overlap_and_keep_release_acquisitions(
             None,
         ))
         .unwrap();
+    assert_eq!(
+        [
+            engine.has_book_subscription(&first),
+            engine.has_book_subscription(&second),
+            engine.has_book_subscription(&third)
+        ],
+        [false; 3]
+    );
     let expected_first = original
         .with_instrument_ids(first)
         .unwrap()
@@ -5327,6 +5361,24 @@ fn test_external_instrument_lists_filter_overlap_and_keep_release_acquisitions(
     assert_eq!(
         serde_json::to_value(releases.get_messages()).unwrap(),
         serde_json::to_value(expected_final).unwrap()
+    );
+    engine.execute_subscribe(overlapping).unwrap();
+    assert_eq!(
+        [
+            engine.has_book_subscription(&first),
+            engine.has_book_subscription(&second),
+            engine.has_book_subscription(&third)
+        ],
+        [false, book, book]
+    );
+    engine.reset();
+    assert_eq!(
+        [
+            engine.has_book_subscription(&first),
+            engine.has_book_subscription(&second),
+            engine.has_book_subscription(&third)
+        ],
+        [false; 3]
     );
 }
 
