@@ -52,10 +52,13 @@ use nautilus_execution::{
 use nautilus_model::{
     accounts::{Account, AccountAny, margin_model::MarginModelHandle},
     data::{
-        Bar, Data, FundingRateUpdate, InstrumentClose, InstrumentStatus, OrderBookDelta,
-        OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
+        Bar, Data, FundingRateUpdate, InstrumentClose, InstrumentStatus, MarkPriceUpdate,
+        OrderBookDelta, OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
     },
-    enums::{AccountType, AggressorSide, BookType, OmsType, OrderStatus, PositionAdjustmentType},
+    enums::{
+        AccountType, AggressorSide, BookType, OmsType, OrderStatus, PositionAdjustmentType,
+        PriceType,
+    },
     events::{FundingSettlement, OrderEventAny, OrderUpdated, PositionAdjusted, PositionEvent},
     identifiers::{AccountId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
@@ -159,16 +162,17 @@ pub struct SimulatedExchange {
     /// panic. Outside it (market data, iteration, expiration, liquidation, open-order
     /// loading) events dispatch directly, so immediate mode keeps its synchronous timing.
     deferring_events: Rc<Cell<bool>>,
-    fee_model: FeeModelHandle,
     fill_model: FillModelHandle,
+    fee_model: FeeModelHandle,
+    margin_model: Option<MarginModelHandle>,
     latency_model: Option<LatencyModelHandle>,
     instruments: AHashMap<InstrumentId, InstrumentAny>,
+    initial_instruments: AHashMap<InstrumentId, InstrumentAny>,
     matching_engines: IndexMap<InstrumentId, OrderMatchingEngine>,
     last_raw_id: u32,
     pending_funding_rates: BTreeMap<(UnixNanos, InstrumentId), FundingRateUpdate>,
     funding_settlements: BTreeSet<(UnixNanos, InstrumentId)>,
     leverages: AHashMap<InstrumentId, Decimal>,
-    margin_model: Option<MarginModelHandle>,
     modules: Vec<SimulationModuleHandle>,
     callback_error: Option<String>,
     clock: Rc<RefCell<dyn Clock>>,
@@ -250,16 +254,17 @@ impl SimulatedExchange {
             exec_client: None,
             event_handler: None,
             deferring_events: Rc::new(Cell::new(false)),
-            fee_model: config.fee_model,
             fill_model: config.fill_model,
+            fee_model: config.fee_model,
+            margin_model: config.margin_model,
             latency_model: config.latency_model,
             instruments: AHashMap::new(),
+            initial_instruments: AHashMap::new(),
             matching_engines: IndexMap::new(),
             last_raw_id: 0,
             pending_funding_rates: BTreeMap::new(),
             funding_settlements: BTreeSet::new(),
             leverages: config.leverages,
-            margin_model: config.margin_model,
             modules: config.modules,
             callback_error: None,
             clock,
@@ -537,6 +542,38 @@ impl SimulatedExchange {
         self.matching_engines.insert(instrument_id, matching_engine);
 
         log::info!("Added instrument {instrument_id} and created matching engine");
+        Ok(())
+    }
+
+    /// Applies replay definitions using the existing matching engine lifecycle.
+    pub(crate) fn update_instrument(&mut self, instrument: &InstrumentAny) -> anyhow::Result<()> {
+        let instrument_id = instrument.id();
+        if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+            anyhow::ensure!(
+                instrument.expiration_ns() == engine.instrument.expiration_ns()
+                    || matches!(
+                        (&engine.instrument, instrument),
+                        (
+                            InstrumentAny::BinaryOption(_),
+                            InstrumentAny::BinaryOption(_)
+                        )
+                    ),
+                "Cannot change expiration for instrument {instrument_id} during replay"
+            );
+            self.cache.borrow_mut().add_instrument(instrument.clone())?;
+            self.initial_instruments
+                .entry(instrument_id)
+                .or_insert_with(|| engine.instrument.clone());
+            engine.update_instrument(instrument.clone())?;
+            self.instruments.insert(instrument_id, instrument.clone());
+            let ts_now = self.clock.borrow().timestamp_ns();
+
+            if instrument.expiration_ns().is_some_and(|ns| ns < ts_now) {
+                engine.process_instrument_expiration(ts_now);
+            }
+        }
+
+        self.drain_oto_commands();
         Ok(())
     }
 
@@ -1064,6 +1101,40 @@ impl SimulatedExchange {
         Ok(())
     }
 
+    /// Processes a mark price update and updates the matching engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if module pre-processing or matching engine initialization fails.
+    pub fn process_mark_price(&mut self, mark: &MarkPriceUpdate) -> anyhow::Result<()> {
+        self.pre_process_modules(&Data::MarkPrice(*mark))?;
+
+        if !self.matching_engines.contains_key(&mark.instrument_id) {
+            let instrument = {
+                let cache = self.cache.as_ref().borrow();
+                cache.instrument(&mark.instrument_id).cloned()
+            };
+
+            if let Some(instrument) = instrument {
+                self.add_instrument(instrument)?;
+            } else {
+                anyhow::bail!(
+                    "No matching engine found for instrument {}",
+                    mark.instrument_id
+                );
+            }
+        }
+
+        if let Some(matching_engine) = self.matching_engines.get_mut(&mark.instrument_id) {
+            matching_engine.process_mark_price(mark);
+        } else {
+            anyhow::bail!("Matching engine should be initialized");
+        }
+
+        self.drain_oto_commands();
+        Ok(())
+    }
+
     /// Processes a quote tick and updates the matching engine.
     ///
     /// # Errors
@@ -1136,8 +1207,21 @@ impl SimulatedExchange {
     ///
     /// # Errors
     ///
-    /// Returns an error if module pre-processing or matching engine processing fails.
+    /// Returns an error if L1 bar execution receives a non-time external bar other
+    /// than a mark-price bar, or if module pre-processing or matching engine processing fails.
     pub fn process_bar(&mut self, bar: Bar) -> anyhow::Result<()> {
+        if self.bar_execution
+            && self.book_type == BookType::L1_MBP
+            && bar.bar_type.is_externally_aggregated()
+            && bar.bar_type.spec().price_type != PriceType::Mark
+        {
+            anyhow::ensure!(
+                bar.bar_type.spec().is_time_aggregated(),
+                "Bar execution requires time-aggregated bars, received {}",
+                bar.bar_type,
+            );
+        }
+
         self.pre_process_modules(&Data::Bar(bar))?;
 
         if !self.matching_engines.contains_key(&bar.instrument_id()) {
@@ -1804,8 +1888,18 @@ impl SimulatedExchange {
             }
         }
 
-        for matching_engine in self.matching_engines.values_mut() {
+        for (instrument_id, matching_engine) in &mut self.matching_engines {
             matching_engine.reset();
+
+            if let Some(instrument) = self.initial_instruments.get(instrument_id) {
+                if let Err(e) = self.cache.borrow_mut().add_instrument(instrument.clone()) {
+                    callback_error.get_or_insert_with(|| e.to_string());
+                    continue;
+                }
+
+                matching_engine.update_instrument(instrument.clone())?;
+                self.instruments.insert(*instrument_id, instrument.clone());
+            }
         }
 
         self.pending_funding_rates.clear();
@@ -2313,6 +2407,31 @@ mod tests {
         }
 
         SimulatedExchange::new(config, cache, clock).unwrap()
+    }
+
+    #[rstest]
+    fn test_replay_instrument_expiration_change_is_rejected() {
+        let mut exchange = setup_exchange(Dispatch::Queued);
+        let mut option = nautilus_model::instruments::stubs::option_contract_appl();
+        option.id = InstrumentId::from("TEST.SIM");
+        let original = InstrumentAny::OptionContract(option.clone());
+        exchange.add_instrument(original.clone()).unwrap();
+        exchange.update_instrument(&original).unwrap();
+        option.expiration_ns = UnixNanos::from(10);
+
+        let error = exchange
+            .update_instrument(&InstrumentAny::OptionContract(option))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("Cannot change expiration"));
+        let cache = exchange.cache.borrow();
+        for instrument in [
+            &exchange.instruments[&original.id()],
+            &exchange.matching_engines[&original.id()].instrument,
+            cache.instrument(&original.id()).unwrap(),
+        ] {
+            assert_eq!(instrument.expiration_ns(), original.expiration_ns());
+        }
     }
 
     #[rstest]

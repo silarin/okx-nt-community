@@ -66,7 +66,7 @@ Branch from this fork's current `develop`. Follow the
 Rust, Python, and the pinned development tools. Use `python/.venv`, never a root `.venv`.
 
 ```bash
-cargo install cargo-binstall --locked  # one-off prerequisite
+cargo install cargo-binstall --version "$(bash scripts/cargo-tool-version.sh cargo-binstall)" --locked
 make install-tools
 make sync
 prek install

@@ -38,10 +38,11 @@ use super::{
     subscriptions::resolve_token_id_from,
 };
 use crate::{
-    common::consts::GAMMA_CONDITION_IDS_BATCH_SIZE,
+    common::{consts::GAMMA_CONDITION_IDS_BATCH_SIZE, parse::validate_data_market_version},
     filters::market_closed,
     http::{
-        gamma::parse_markets_with_transient, models::GammaMarket, query::GetGammaMarketsParams,
+        gamma::parse_markets_with_transient, models::GammaMarket, parse::is_market_closed,
+        query::GetGammaMarketsParams,
     },
     providers::extract_condition_id,
     resolve::{
@@ -52,6 +53,7 @@ use crate::{
 
 #[derive(Debug)]
 enum AutoLoadOutcome {
+    Unsupported,
     Open(Vec<InstrumentAny>),
     Closed {
         instruments: Vec<InstrumentAny>,
@@ -101,12 +103,15 @@ impl Drop for AutoLoadScheduledGuard {
 
 impl PolymarketDataClient {
     pub(super) fn resume_resolution_subscriptions(&self) {
-        let status_ids = self.subscriptions.active_instrument_status_subs.load();
-        let close_ids = self.subscriptions.active_instrument_close_subs.load();
-        let mut instrument_ids = status_ids.union(&close_ids).copied().collect::<Vec<_>>();
+        let mut instrument_ids = self
+            .subscriptions
+            .active_instrument_status_subs
+            .iter()
+            .chain(self.subscriptions.active_instrument_close_subs.iter())
+            .map(|id| *id)
+            .collect::<Vec<_>>();
         instrument_ids.sort_unstable();
-        drop(status_ids);
-        drop(close_ids);
+        instrument_ids.dedup();
 
         for instrument_id in instrument_ids {
             let needs_load = {
@@ -306,6 +311,15 @@ impl PolymarketDataClient {
                                 .filter_map(|instrument| {
                                     extract_condition_id(&instrument.id()).ok()
                                 })
+                                .chain(
+                                    markets
+                                        .iter()
+                                        .filter(|market| {
+                                            validate_data_market_version(market.version.as_deref())
+                                                .is_err()
+                                        })
+                                        .map(|market| market.condition_id.clone()),
+                                )
                                 .collect();
                             let probe_condition_ids: Vec<String> = chunk
                                 .iter()
@@ -399,6 +413,7 @@ impl PolymarketDataClient {
                     }
 
                     match outcome {
+                        AutoLoadOutcome::Unsupported => {}
                         AutoLoadOutcome::Open(loaded) => {
                             if cancellation.is_cancelled() {
                                 continue;
@@ -430,7 +445,7 @@ impl PolymarketDataClient {
                                     instrument,
                                     |instrument| {
                                         if let Err(e) = data_sender
-                                            .send(DataEvent::Instrument(instrument.clone()))
+                                            .send(DataEvent::Data(instrument.clone().into()))
                                         {
                                             log::error!(
                                                 "Failed to emit auto-loaded instrument {instrument_id}: {e}"
@@ -478,7 +493,7 @@ impl PolymarketDataClient {
                                     instrument,
                                     |instrument| {
                                         if let Err(e) = data_sender
-                                            .send(DataEvent::Instrument(instrument.clone()))
+                                            .send(DataEvent::Data(instrument.clone().into()))
                                         {
                                             log::error!(
                                                 "Failed to emit auto-loaded instrument {instrument_id}: {e}"
@@ -581,7 +596,7 @@ impl PolymarketDataClient {
                         {
                             next_batch.insert(*id);
                         }
-                        Some(AutoLoadOutcome::Closed { .. }) => {
+                        Some(AutoLoadOutcome::Unsupported | AutoLoadOutcome::Closed { .. }) => {
                             // Terminal for live data; settlement metadata is
                             // retained by `retire_instrument`.
                         }
@@ -660,7 +675,16 @@ fn record_auto_load_outcomes(
     markets: &[GammaMarket],
     instruments: Vec<InstrumentAny>,
 ) {
-    for market in markets.iter().filter(|market| market.closed == Some(true)) {
+    for market in markets
+        .iter()
+        .filter(|market| validate_data_market_version(market.version.as_deref()).is_err())
+    {
+        outcomes.insert(market.condition_id.clone(), AutoLoadOutcome::Unsupported);
+    }
+
+    for market in markets.iter().filter(|market| {
+        is_market_closed(market) && validate_data_market_version(market.version.as_deref()).is_ok()
+    }) {
         let incoming = build_strict_resolved_market(market);
         match outcomes
             .entry(market.condition_id.clone())
@@ -689,6 +713,7 @@ fn record_auto_load_outcomes(
             .entry(condition_id)
             .or_insert(AutoLoadOutcome::Unknown)
         {
+            AutoLoadOutcome::Unsupported => {}
             AutoLoadOutcome::Closed { instruments, .. } => {
                 if market_closed(&instrument) == Some(true) {
                     instruments.push(instrument);

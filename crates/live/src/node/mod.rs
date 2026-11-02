@@ -143,13 +143,13 @@ use crate::{
 pub mod builder;
 pub mod config;
 
-#[cfg(feature = "plugin")]
-pub mod plugin;
-
 mod metrics;
 mod queue;
 mod reconciliation;
 mod state;
+
+#[cfg(feature = "plugin")]
+pub mod plugin;
 
 use builder::ExternalMessageBusIngress;
 pub use builder::LiveNodeBuilder;
@@ -1748,7 +1748,6 @@ impl LiveNode {
                                 position_result,
                                 reports: result.reports,
                                 sources: Box::new(result.sources),
-                                successful_keys: result.successful_keys,
                             });
                         }
                         ReportTaskOutcome::TimedOut => {
@@ -3388,6 +3387,28 @@ impl LiveNode {
     }
 
     fn observe_exec_command_before_dispatch(&mut self, cmd: &TradingCommand) {
+        if matches!(
+            cmd,
+            TradingCommand::ModifyOrder(_)
+                | TradingCommand::ModifyOrders(_)
+                | TradingCommand::CancelOrder(_)
+                | TradingCommand::CancelOrders(_)
+        ) {
+            let engine = self.kernel.exec_engine.borrow();
+            let no_route = engine.find_client_for_command(cmd).is_none()
+                && cmd.client_id().is_none_or(|client_id| {
+                    engine
+                        .config()
+                        .external_clients
+                        .as_ref()
+                        .is_none_or(|clients| !clients.contains(&client_id))
+                });
+
+            if no_route {
+                return;
+            }
+        }
+
         let submission_client_id = if matches!(
             cmd,
             TradingCommand::SubmitOrder(_) | TradingCommand::SubmitOrderList(_)
@@ -3415,19 +3436,23 @@ impl LiveNode {
                 }
             }
             TradingCommand::ModifyOrder(modify) => {
-                self.exec_manager.register_inflight(modify.client_order_id);
+                self.exec_manager
+                    .register_inflight(modify.client_order_id, modify.command_id);
             }
             TradingCommand::ModifyOrders(modify) => {
                 for child in &modify.modifies {
-                    self.exec_manager.register_inflight(child.client_order_id);
+                    self.exec_manager
+                        .register_inflight(child.client_order_id, child.command_id);
                 }
             }
             TradingCommand::CancelOrder(cancel) => {
-                self.exec_manager.register_inflight(cancel.client_order_id);
+                self.exec_manager
+                    .register_inflight(cancel.client_order_id, cancel.command_id);
             }
             TradingCommand::CancelOrders(cancel) => {
                 for child in &cancel.cancels {
-                    self.exec_manager.register_inflight(child.client_order_id);
+                    self.exec_manager
+                        .register_inflight(child.client_order_id, child.command_id);
                 }
             }
             _ => {}
@@ -4233,6 +4258,7 @@ mod tests {
             Order, OrderAny, OrderList, OrderTestBuilder,
             stubs::{OrderFilledTestBuilder, TestOrderEventStubs},
         },
+        position::PositionReplayEvent,
         reports::{ExecutionMassStatus, FillReport, PositionStatusReport},
         types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
     };
@@ -5826,7 +5852,6 @@ mod tests {
         .finish();
 
         assert_eq!(*commands.borrow(), vec![command]);
-        assert!(result.successful_keys.is_empty());
         assert!(result.reports.is_empty());
     }
 
@@ -5889,7 +5914,10 @@ mod tests {
         .await
         .finish();
 
-        assert_eq!(result.successful_keys, IndexSet::from([key]));
+        assert_eq!(
+            result.reports.keys().copied().collect::<IndexSet<_>>(),
+            IndexSet::from([key])
+        );
         assert_eq!(
             result.sources,
             IndexMap::from([
@@ -5967,7 +5995,6 @@ mod tests {
         .await
         .finish();
 
-        assert!(result.successful_keys.is_empty());
         assert!(result.reports.is_empty());
     }
 
@@ -6037,7 +6064,10 @@ mod tests {
         .await
         .finish();
 
-        assert_eq!(result.successful_keys, IndexSet::from([key]));
+        assert_eq!(
+            result.reports.keys().copied().collect::<IndexSet<_>>(),
+            IndexSet::from([key])
+        );
         assert_eq!(
             result.reports,
             IndexMap::from([(
@@ -6066,6 +6096,8 @@ mod tests {
         let mut healthy_report = report.clone();
         healthy_report.account_id = healthy_key.1;
         let healthy_client_id = ClientId::from("HEALTHY-FILLS");
+        let empty_key = (report.instrument_id, AccountId::from("EMPTY-001"));
+        let empty_client_id = ClientId::from("EMPTY-FILLS");
         let mut clients = vec![
             LiveExecutionClient::new(Box::new(FillReportClient {
                 client_id: query.client_id,
@@ -6079,6 +6111,13 @@ mod tests {
                 account_id: healthy_key.1,
                 venue: healthy_key.0.venue,
                 outcome: FillReportClientOutcome::Reports(vec![healthy_report.clone()]),
+                commands: Rc::new(RefCell::new(Vec::new())),
+            })),
+            LiveExecutionClient::new(Box::new(FillReportClient {
+                client_id: empty_client_id,
+                account_id: empty_key.1,
+                venue: empty_key.0.venue,
+                outcome: FillReportClientOutcome::Reports(Vec::new()),
                 commands: Rc::new(RefCell::new(Vec::new())),
             })),
         ];
@@ -6105,22 +6144,32 @@ mod tests {
             command: query.command.clone(),
         };
 
+        let empty_query = PositionFillReportQuery {
+            key: empty_key,
+            client_id: empty_client_id,
+            command: query.command.clone(),
+        };
+
         let mut queries = vec![query, failed_query];
 
         if failure_first {
             queries.reverse();
         }
 
+        queries.insert(0, empty_query);
         queries.push(healthy_query);
 
         let result = request_position_fill_reports(clients, queries)
             .await
             .finish();
 
-        assert_eq!(result.successful_keys, IndexSet::from([healthy_key]));
+        assert_eq!(
+            result.reports.keys().copied().collect::<Vec<_>>(),
+            vec![empty_key, healthy_key]
+        );
         assert_eq!(
             result.reports,
-            IndexMap::from([(healthy_key, vec![healthy_report])])
+            IndexMap::from([(empty_key, Vec::new()), (healthy_key, vec![healthy_report])])
         );
     }
 
@@ -6149,7 +6198,6 @@ mod tests {
         let result = request_position_fill_reports(clients, queries)
             .await
             .finish();
-        assert!(result.successful_keys.is_empty());
         assert!(result.reports.is_empty());
     }
 
@@ -6207,10 +6255,12 @@ mod tests {
             .finish();
 
         if accepted {
-            assert_eq!(result.successful_keys, IndexSet::from([key]));
+            assert_eq!(
+                result.reports.keys().copied().collect::<Vec<_>>(),
+                vec![key]
+            );
             assert_eq!(result.reports, IndexMap::from([(key, vec![report])]));
         } else {
-            assert!(result.successful_keys.is_empty());
             assert!(result.reports.is_empty());
         }
     }
@@ -6316,10 +6366,9 @@ mod tests {
         position_result
             .queried_clients
             .insert(ClientId::from("SECOND"));
-        let mut successful_keys = IndexSet::from([active_key]);
-
+        let mut reports = IndexMap::from([(active_key, Vec::new())]);
         if local_activity {
-            successful_keys.insert(deferred_key);
+            reports.insert(deferred_key, Vec::new());
             node.exec_manager
                 .record_position_activity(deferred_key.0, deferred_key.1);
         }
@@ -6327,8 +6376,7 @@ mod tests {
         node.handle_position_fill_report_result(PositionFillReportResult {
             sources: Box::default(),
             position_result,
-            reports: IndexMap::from([(active_key, Vec::new())]),
-            successful_keys,
+            reports,
         });
 
         assert_eq!(
@@ -6389,7 +6437,6 @@ mod tests {
             sources: Box::default(),
             position_result,
             reports: IndexMap::from([(key, vec![fill_report.clone()])]),
-            successful_keys: IndexSet::from([key]),
         });
 
         let cache = node.kernel.cache.borrow();
@@ -6418,6 +6465,114 @@ mod tests {
     }
 
     #[rstest]
+    fn test_position_fill_prefix_rechecks_history_after_dispatch_callback() {
+        let (mut node, venue_report, mut first) =
+            position_fill_test_fixture("PositionPrefixCallbackNode", Quantity::from("0.5"));
+        first.commission = Money::from("0.13 USDT");
+        let key = (first.instrument_id, first.account_id);
+        let client_order_id = first.client_order_id.unwrap();
+        let position_result = position_report_result(&node, venue_report.clone());
+        node.handle_position_fill_report_result(PositionFillReportResult {
+            sources: Box::default(),
+            position_result,
+            reports: IndexMap::from([(key, vec![first.clone()])]),
+        });
+
+        let mut second = first.clone();
+        second.trade_id = TradeId::from("T-PREFIX-SECOND");
+        second.last_qty = Quantity::from("0.75");
+        second.commission = Money::from("0.29 USDT");
+        let mut third = first.clone();
+        third.trade_id = TradeId::from("T-PREFIX-THIRD");
+        third.last_qty = Quantity::from("0.25");
+        third.commission = Money::from("0.07 USDT");
+        let revision = node.exec_manager.position_activity_revision(&key);
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let cache = node.kernel.cache.clone();
+        let callback_received = received.clone();
+        let second_trade_id = second.trade_id;
+
+        let handler = TypedHandler::from(move |event: &OrderEventAny| {
+            let OrderEventAny::Filled(fill) = event else {
+                return;
+            };
+
+            callback_received.borrow_mut().push(fill.trade_id);
+            if fill.trade_id == second_trade_id {
+                let mut cache = cache.borrow_mut();
+                let position_id = *cache.position_id(&fill.client_order_id).unwrap();
+                let mut position = cache.position_mut(&position_id).unwrap();
+                position.replay_events.retain(|event| !matches!(event, PositionReplayEvent::Filled(fill) if fill.trade_id == second_trade_id));
+            }
+        });
+
+        let strategy_id = node
+            .kernel
+            .cache
+            .borrow()
+            .order(&client_order_id)
+            .unwrap()
+            .strategy_id();
+        let topic = nautilus_common::msgbus::switchboard::get_event_order_topic(strategy_id);
+        msgbus::subscribe_order_events(topic.into(), handler.clone(), None);
+        let position_result = position_report_result(&node, venue_report);
+        node.handle_position_fill_report_result(PositionFillReportResult {
+            sources: Box::default(),
+            position_result,
+            reports: IndexMap::from([(
+                key,
+                vec![first.clone(), first.clone(), second.clone(), third.clone()],
+            )]),
+        });
+
+        msgbus::unsubscribe_order_events(topic.into(), &handler);
+        let cache = node.kernel.cache.borrow();
+        let order = cache.order(&client_order_id).unwrap();
+        let position_id = cache.position_id(&client_order_id).unwrap();
+        let position = cache.position_ref(position_id).unwrap();
+
+        assert_eq!(*received.borrow(), vec![second.trade_id]);
+        assert_eq!(order.filled_qty(), Quantity::from("2.25"));
+        assert_eq!(order.events().len(), 6);
+        assert_eq!(
+            order.trade_ids(),
+            vec![
+                &TradeId::from("T-POSITION-INITIAL"),
+                &first.trade_id,
+                &second.trade_id
+            ]
+        );
+        assert_eq!(
+            order.commissions().values().copied().collect::<Vec<_>>(),
+            vec![Money::from("0.42 USDT")]
+        );
+        assert_eq!(position.quantity, Quantity::from("2.25"));
+        assert_eq!(position.commissions(), vec![Money::from("0.42 USDT")]);
+        assert_eq!(position.replay_events.len(), 2);
+        assert_eq!(
+            cache.orders_total_count(None, Some(&key.0), None, Some(&key.1), None),
+            1
+        );
+        assert_eq!(
+            node.exec_manager.position_activity_revision(&key),
+            revision + 1
+        );
+        assert!(node.exec_manager.position_contains_fill_report(&first));
+        assert!(!node.exec_manager.position_contains_fill_report(&second));
+        assert!(!node.exec_manager.position_contains_fill_report(&third));
+        assert!(
+            !node
+                .exec_manager
+                .is_fill_recently_processed(key.1, key.0, second.trade_id)
+        );
+        assert!(
+            !node
+                .exec_manager
+                .is_fill_recently_processed(key.1, key.0, third.trade_id)
+        );
+    }
+
+    #[rstest]
     fn test_position_fill_report_match_ignores_adapter_timestamp_source() {
         let (mut node, venue_report, fill_report) =
             position_fill_test_fixture("PositionFillTimestampNode", Quantity::from("1.0"));
@@ -6428,7 +6583,6 @@ mod tests {
             sources: Box::default(),
             position_result,
             reports: IndexMap::from([(key, vec![fill_report.clone()])]),
-            successful_keys: IndexSet::from([key]),
         });
 
         let mut rest_report = fill_report;
@@ -6468,7 +6622,6 @@ mod tests {
             sources: Box::default(),
             position_result,
             reports: IndexMap::from([(key, vec![fill_report.clone(), later_fill_report.clone()])]),
-            successful_keys: IndexSet::from([key]),
         });
 
         let cache = node.kernel.cache.borrow();
@@ -6648,7 +6801,6 @@ mod tests {
             )])),
             position_result,
             reports: IndexMap::from([(key, vec![held_fill_report.clone()])]),
-            successful_keys: IndexSet::from([key]),
         });
 
         if mode != "legacy" {
@@ -6847,7 +6999,6 @@ mod tests {
             sources: Box::default(),
             position_result: first_result,
             reports: IndexMap::from([(key, vec![fill_report])]),
-            successful_keys: IndexSet::from([key]),
         });
 
         let fresh_result = position_report_result(&node, venue_report);
@@ -6855,7 +7006,6 @@ mod tests {
             sources: Box::default(),
             position_result: fresh_result,
             reports: IndexMap::from([(key, Vec::new())]),
-            successful_keys: IndexSet::from([key]),
         });
 
         let cache = node.kernel.cache.borrow();
@@ -6911,7 +7061,6 @@ mod tests {
             sources: Box::default(),
             position_result,
             reports: IndexMap::from([(key, reports.clone())]),
-            successful_keys: IndexSet::from([key]),
         });
 
         {
@@ -6943,7 +7092,6 @@ mod tests {
             sources: Box::default(),
             position_result,
             reports: IndexMap::from([(key, reports)]),
-            successful_keys: IndexSet::from([key]),
         });
 
         let cache = node.kernel.cache.borrow();
@@ -6987,7 +7135,6 @@ mod tests {
             sources: Box::default(),
             position_result,
             reports: IndexMap::from([(key, vec![conflicting_report, valid_report])]),
-            successful_keys: IndexSet::from([key]),
         });
 
         let cache = node.kernel.cache.borrow();
@@ -7018,7 +7165,6 @@ mod tests {
             sources: Box::default(),
             position_result,
             reports: IndexMap::new(),
-            successful_keys: IndexSet::new(),
         });
 
         let cache = node.kernel.cache.borrow();
@@ -7057,7 +7203,6 @@ mod tests {
             sources: Box::default(),
             position_result,
             reports: IndexMap::from([(key, vec![fill_report.clone()])]),
-            successful_keys: IndexSet::from([key]),
         });
 
         let cache = node.kernel.cache.borrow();
@@ -7127,7 +7272,6 @@ mod tests {
             sources: Box::default(),
             position_result,
             reports: IndexMap::from([(key, vec![fill_report.clone()])]),
-            successful_keys: IndexSet::from([key]),
         });
 
         let cache = node.kernel.cache.borrow();
@@ -7156,7 +7300,6 @@ mod tests {
             sources: Box::default(),
             position_result,
             reports: IndexMap::from([(key, vec![fill_report.clone()])]),
-            successful_keys: IndexSet::from([key]),
         });
 
         let cache = node.kernel.cache.borrow();
@@ -7234,7 +7377,9 @@ mod tests {
     #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_batch_cancel_command_registers_each_child_for_inflight_timeout() {
         use nautilus_common::messages::execution::{BatchCancelOrders, CancelOrder};
-        use nautilus_model::{events::OrderPendingCancel, identifiers::ClientOrderId};
+        use nautilus_model::{
+            events::order::spec::OrderPendingCancelSpec, identifiers::ClientOrderId,
+        };
 
         let config = LiveNodeConfig {
             exec_engine: crate::config::LiveExecutionEngineConfig {
@@ -7252,6 +7397,22 @@ mod tests {
         let account_id = AccountId::from("TEST-001");
         let instrument = crypto_perpetual_ethusdt();
         let instrument_id = instrument.id();
+        node.kernel
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(StubExecutionClient::new(
+                ClientId::from("STUB"),
+                account_id,
+                instrument_id.venue,
+                OmsType::Netting,
+                None,
+            )))
+            .unwrap();
+        node.kernel
+            .exec_engine
+            .borrow_mut()
+            .set_default_client(ClientId::from("STUB"))
+            .unwrap();
         let child_ids = [
             ClientOrderId::from("O-BATCH-CANCEL-1"),
             ClientOrderId::from("O-BATCH-CANCEL-2"),
@@ -7277,18 +7438,16 @@ mod tests {
             // event (not a Submitted-order rejection).
             let submitted = TestOrderEventStubs::submitted(&order, account_id);
             let accepted = TestOrderEventStubs::accepted(&order, account_id, venue_order_id);
-            let pending_cancel = OrderEventAny::PendingCancel(OrderPendingCancel::new(
-                trader_id,
-                strategy_id,
-                instrument_id,
-                client_order_id,
-                Some(account_id),
-                UUID4::new(),
-                UnixNanos::default(),
-                UnixNanos::default(),
-                false,
-                Some(venue_order_id),
-            ));
+            let pending_cancel = OrderEventAny::PendingCancel(
+                OrderPendingCancelSpec::builder()
+                    .trader_id(trader_id)
+                    .strategy_id(strategy_id)
+                    .instrument_id(instrument_id)
+                    .client_order_id(client_order_id)
+                    .account_id(account_id)
+                    .venue_order_id(venue_order_id)
+                    .build(),
+            );
             let mut cache = node.kernel.cache.borrow_mut();
             cache.add_order(order, None, None, false).unwrap();
             cache.update_order(&submitted).unwrap();
@@ -7427,6 +7586,265 @@ mod tests {
         );
         assert!(result.events.is_empty());
         assert!(result.queries.is_empty());
+    }
+
+    #[rstest]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn test_external_cancel_command_still_registers_inflight() {
+        use nautilus_common::messages::execution::CancelOrder;
+        let external = ClientId::from("EXTERNAL");
+
+        let config = LiveNodeConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
+                reconciliation: true,
+                inflight_check_threshold_ms: 100,
+                inflight_check_retries: 2,
+                external_clients: Some(vec![external]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut node = LiveNode::build("ExternalCancelNode".to_string(), Some(config)).unwrap();
+        let instrument = crypto_perpetual_ethusdt();
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(node.trader_id())
+            .strategy_id(StrategyId::from("S-EXTERNAL"))
+            .instrument_id(instrument.id())
+            .quantity(Quantity::from("9.003"))
+            .price(Price::from("113.47"))
+            .build();
+        let venue = VenueOrderId::from("V-EXTERNAL");
+        order
+            .apply(TestOrderEventStubs::accepted(
+                &order,
+                AccountId::from("SIM-001"),
+                venue,
+            ))
+            .unwrap();
+        let id = order.client_order_id();
+        let command = TradingCommand::CancelOrder(CancelOrder::new(
+            order.trader_id(),
+            Some(external),
+            order.strategy_id(),
+            order.instrument_id(),
+            id,
+            Some(venue),
+            UUID4::new(),
+            17.into(),
+            None,
+            None,
+        ));
+        {
+            let mut cache = node.kernel.cache.borrow_mut();
+            cache.add_instrument(instrument.into()).unwrap();
+            cache
+                .add_order(order.clone(), None, Some(external), false)
+                .unwrap();
+        }
+
+        node.process_exec_command(
+            TradingCommandMessage::new(MessagingSwitchboard::exec_engine_execute(), command).into(),
+        );
+        advance_clock(Duration::from_millis(101)).await;
+        let result = node.exec_manager.check_inflight_orders();
+
+        let [TradingCommand::QueryOrder(query)] = result.queries.as_slice() else {
+            panic!("expected external query");
+        };
+
+        assert_eq!(
+            (query.client_order_id, query.venue_order_id, query.client_id),
+            (id, Some(venue), Some(external))
+        );
+        assert!(result.events.is_empty());
+        assert_eq!(
+            serde_json::to_value(node.kernel.cache.borrow().order(&id).unwrap().clone()).unwrap(),
+            serde_json::to_value(&order).unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case::modify(false, false)]
+    #[case::batch_modify(false, true)]
+    #[case::cancel(true, false)]
+    #[case::batch_cancel(true, true)]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn test_native_command_denial_does_not_leave_inflight_tracking(
+        #[case] cancel: bool,
+        #[case] batch: bool,
+        #[values(false, true)] old_pending: bool,
+    ) {
+        use nautilus_common::messages::execution::{
+            BatchCancelOrders, BatchModifyOrders, CancelOrder, ModifyOrder,
+        };
+        use nautilus_model::events::order::spec::{OrderModifyDeniedSpec, OrderPendingUpdateSpec};
+
+        let config = LiveNodeConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
+                reconciliation: true,
+                inflight_check_threshold_ms: 100,
+                inflight_check_retries: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut node = LiveNode::build("LocalDenialNode".to_string(), Some(config)).unwrap();
+        let instrument = crypto_perpetual_ethusdt();
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(node.trader_id())
+            .strategy_id(StrategyId::from("S-LOCAL-DENIED"))
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("9.003"))
+            .price(Price::from("113.47"))
+            .build();
+        let account_id = AccountId::from("SIM-001");
+        let venue_id = VenueOrderId::from("V-LOCAL-DENIED");
+        order
+            .apply(TestOrderEventStubs::accepted(&order, account_id, venue_id))
+            .unwrap();
+        let id = order.client_order_id();
+        let old_cause = UUID4::new();
+
+        if old_pending {
+            let mut marker = OrderPendingUpdateSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(id)
+                .venue_order_id(venue_id)
+                .account_id(account_id)
+                .build();
+            marker.causation_id = Some(old_cause);
+            order.apply(OrderEventAny::PendingUpdate(marker)).unwrap();
+            node.exec_manager.register_inflight(id, old_cause);
+        }
+
+        let expected_status = order.status();
+        let events_before = order.event_count();
+        {
+            let mut cache = node.kernel.cache.borrow_mut();
+            cache.add_instrument(instrument.into()).unwrap();
+            cache.add_order(order.clone(), None, None, false).unwrap();
+        }
+
+        let cause = UUID4::new();
+
+        let command = if cancel {
+            let command = CancelOrder::new(
+                order.trader_id(),
+                None,
+                order.strategy_id(),
+                order.instrument_id(),
+                id,
+                Some(venue_id),
+                cause,
+                17.into(),
+                None,
+                None,
+            );
+
+            if batch {
+                TradingCommand::CancelOrders(BatchCancelOrders::new(
+                    order.trader_id(),
+                    None,
+                    order.strategy_id(),
+                    order.instrument_id(),
+                    vec![command],
+                    UUID4::new(),
+                    19.into(),
+                    None,
+                    None,
+                ))
+            } else {
+                TradingCommand::CancelOrder(command)
+            }
+        } else {
+            let command = ModifyOrder::new(
+                order.trader_id(),
+                None,
+                order.strategy_id(),
+                order.instrument_id(),
+                id,
+                Some(venue_id),
+                Some(Quantity::from("8.001")),
+                None,
+                None,
+                cause,
+                17.into(),
+                None,
+                None,
+            );
+
+            if batch {
+                TradingCommand::ModifyOrders(BatchModifyOrders::new(
+                    order.trader_id(),
+                    None,
+                    order.strategy_id(),
+                    order.instrument_id(),
+                    vec![command],
+                    UUID4::new(),
+                    19.into(),
+                    None,
+                    None,
+                ))
+            } else {
+                TradingCommand::ModifyOrder(command)
+            }
+        };
+
+        node.process_exec_command(
+            TradingCommandMessage::new(MessagingSwitchboard::exec_engine_execute(), command).into(),
+        );
+        {
+            let cache = node.kernel.cache.borrow();
+            let cached = cache.order(&id).unwrap();
+            match cached.last_event() {
+                OrderEventAny::ModifyDenied(event) if !cancel => {
+                    assert_eq!(event.causation_id, Some(cause));
+                }
+                OrderEventAny::CancelDenied(event) if cancel => {
+                    assert_eq!(event.causation_id, Some(cause));
+                }
+                other => panic!("expected native command denial, was {other:?}"),
+            }
+
+            assert_eq!(cached.status(), expected_status);
+            assert_eq!(cached.quantity(), order.quantity());
+            assert_eq!(cached.price(), order.price());
+            assert_eq!(cached.filled_qty(), order.filled_qty());
+            assert_eq!(cached.event_count(), events_before + 1);
+        }
+
+        advance_clock(Duration::from_millis(101)).await;
+        let result = node.exec_manager.check_inflight_orders();
+        assert_eq!(result.queries.len(), usize::from(old_pending));
+        assert!(result.events.is_empty());
+
+        if old_pending {
+            let refusal = OrderModifyDeniedSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(id)
+                .venue_order_id(venue_id)
+                .account_id(account_id)
+                .causation_id(old_cause)
+                .build();
+            node.process_exec_event(ExecutionEvent::Order(OrderEventAny::ModifyDenied(refusal)));
+        }
+
+        assert_eq!(node.exec_manager.recon_check_retry_count(&id), 0);
     }
 
     #[rstest]
@@ -8303,7 +8721,9 @@ mod tests {
                         )
                     };
                     node.process_exec_event(ExecutionEvent::Order(pending));
-                    node.exec_manager.register_inflight(order.client_order_id());
+                    node.exec_manager
+                        .register_inflight(order.client_order_id(), UUID4::new());
+
                     if first_fill {
                         let cached = node
                             .kernel
@@ -9128,7 +9548,6 @@ mod tests {
             sources: Box::default(),
             position_result,
             reports: IndexMap::from([(key, vec![fill_report.clone()])]),
-            successful_keys: IndexSet::from([key]),
         });
 
         let order = node
@@ -9179,7 +9598,6 @@ mod tests {
             sources: Box::default(),
             position_result: replay_report,
             reports: IndexMap::from([(key, vec![fill_report])]),
-            successful_keys: IndexSet::from([key]),
         });
 
         let order = node
@@ -9222,7 +9640,6 @@ mod tests {
             sources: Box::default(),
             position_result,
             reports: IndexMap::from([(key, vec![fitting, overfill])]),
-            successful_keys: IndexSet::from([key]),
         });
 
         let order = node
@@ -9274,7 +9691,6 @@ mod tests {
             sources: Box::default(),
             position_result,
             reports: IndexMap::from([(key, vec![first, second])]),
-            successful_keys: IndexSet::from([key]),
         });
 
         let order = node
@@ -9759,7 +10175,6 @@ mod tests {
                     sources: Box::default(),
                     position_result,
                     reports: IndexMap::from([(key, fills.clone())]),
-                    successful_keys: IndexSet::from([key]),
                 });
             }
             "standalone" => {
@@ -10094,7 +10509,6 @@ mod tests {
                         sources: Box::default(),
                         position_result,
                         reports: IndexMap::from([(key, vec![fill])]),
-                        successful_keys: IndexSet::from([key]),
                     });
                 } else if matches!(source, "report" | "standalone") {
                     node.process_exec_event(ExecutionEvent::Report(ExecutionReport::Fill(
@@ -10147,7 +10561,6 @@ mod tests {
                 sources: Box::default(),
                 position_result,
                 reports: IndexMap::from([(key, Vec::new())]),
-                successful_keys: IndexSet::from([key]),
             });
             assert_eq!(
                 node.kernel
@@ -10592,7 +11005,6 @@ mod tests {
             sources: Box::default(),
             position_result,
             reports: IndexMap::from([(key, reports.to_vec())]),
-            successful_keys: IndexSet::from([key]),
         });
 
         node.kernel
@@ -12224,7 +12636,7 @@ mod tests {
 
         let mut pending = PendingEvents::default();
         pending.data_evts.push(
-            DataEvent::Instrument(InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt()))
+            DataEvent::Data(InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt()).into())
                 .into(),
         );
 
@@ -12235,7 +12647,7 @@ mod tests {
     fn stub_data_event() -> DataEvent {
         use nautilus_model::instruments::{InstrumentAny, stubs::crypto_perpetual_ethusdt};
 
-        DataEvent::Instrument(InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt()))
+        DataEvent::Data(InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt()).into())
     }
 
     fn stub_data_command() -> DataCommand {
@@ -13036,7 +13448,8 @@ mod tests {
                 .account_id(account_id)
                 .build(),
         )));
-        node.exec_manager.register_inflight(client_order_id);
+        node.exec_manager
+            .register_inflight(client_order_id, UUID4::new());
         advance_clock(Duration::from_millis(101)).await;
         assert_eq!(node.exec_manager.check_inflight_orders().queries.len(), 1);
         let report = ExecutionReport::Order(Box::new(
@@ -13097,7 +13510,8 @@ mod tests {
             )
         };
         node.process_exec_event(ExecutionEvent::Order(pending));
-        node.exec_manager.register_inflight(client_order_id);
+        node.exec_manager
+            .register_inflight(client_order_id, UUID4::new());
 
         if repeated_report {
             node.process_exec_event(ExecutionEvent::Report(report));
@@ -14321,14 +14735,7 @@ mod tests {
             .borrow()
             .order_owned(&client_order_id)
             .unwrap();
-        assert_eq!(
-            cached.status(),
-            if invalid == "local_update" {
-                OrderStatus::Submitted
-            } else {
-                OrderStatus::PendingCancel
-            }
-        );
+        assert_eq!(cached.status(), OrderStatus::PendingCancel);
         let diagnostics = node.exec_manager.take_submission_recovery_exhaustions();
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].client_order_id, client_order_id);
@@ -14588,7 +14995,8 @@ mod tests {
         node.kernel
             .cache
             .borrow_mut()
-            .purge_closed_orders(UnixNanos::from(u64::MAX), 0);
+            .purge_closed_orders(UnixNanos::from(u64::MAX), 0, false)
+            .unwrap();
         assert!(node.kernel.cache.borrow().order(&id).is_none());
         assert!(node.exec_manager.unresolved_query_fill_ids().is_empty());
 
@@ -14792,7 +15200,8 @@ mod tests {
         node.kernel
             .cache
             .borrow_mut()
-            .purge_closed_orders(1_000_000_000.into(), 0);
+            .purge_closed_orders(1_000_000_000.into(), 0, false)
+            .unwrap();
         assert!(node.kernel.cache.borrow().order_exists(&id));
     }
 
@@ -15319,7 +15728,8 @@ mod tests {
             })
         };
         node.process_exec_event(event);
-        let expected_status = if evidence == "updated" {
+
+        let expected_status = if evidence == "updated" && status != OrderStatus::PendingCancel {
             OrderStatus::Submitted
         } else if status == OrderStatus::Submitted {
             OrderStatus::Accepted

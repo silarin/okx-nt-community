@@ -6,14 +6,6 @@ specific upstream version but needs a small compatibility fix.
 **These patches are temporary. Remove each patch when the upstream crate supports the required
 dependency and API versions.**
 
-## Arrow and Parquet
-
-`hypersync-client` 1.4.0 requires `arrow` and `parquet` 57.x. The matching Parquet release depends
-on the external `thrift` crate. The local compatibility crates satisfy those version constraints
-and re-export the Arrow and Parquet 59.2.0 APIs without copying upstream source.
-
-Remove both compatibility crates when `hypersync-client` supports Arrow and Parquet 59 or later.
-
 ## pyo3-stub-gen
 
 `pyo3-stub-gen` stays pinned to `0.20.0` because later versions reject module paths outside the
@@ -41,3 +33,13 @@ pinned `pyo3-stub-gen 0.20.0` code.
 
 Do not update `pyo3-stub-gen` or remove this patch until stub generation no longer depends on the
 package module paths outside the `pymodule` root.
+
+## HyperSync Cap'n Proto compatibility
+
+The local `hypersync-client` 2.0.0 and `hypersync-net-types` 0.12.3 copies retain
+Cap'n Proto 0.24.1 to address RUSTSEC-2025-0143. The published HyperSync 2.0.0
+release still depends on Cap'n Proto 0.23. The client uses the local net-types
+crate, whose bindings were regenerated with the matching compiler.
+
+Remove these copies only when the published dependency graph uses a patched
+Cap'n Proto release. Preserve the included MPL-2.0 licenses.

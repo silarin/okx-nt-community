@@ -38,7 +38,7 @@ use dashmap::DashMap;
 use futures_util::Stream;
 use nautilus_common::live::dst::time;
 use nautilus_core::{
-    AtomicMap, AtomicTime, UnixNanos,
+    AtomicMap, AtomicTime, UUID4, UnixNanos,
     env::{get_env_var, get_or_env_var},
     string::secret::{REDACTED, SecretString},
     time::get_atomic_clock_realtime,
@@ -56,6 +56,7 @@ use nautilus_model::{
 };
 use nautilus_network::{
     SocketState, SocketStateSink,
+    error::SendError,
     http::create_standard_nautilus_headers,
     mode::ConnectionMode,
     ratelimiter::quota::Quota,
@@ -84,13 +85,13 @@ use super::{
 use crate::common::{
     consts::{
         OKX_NAUTILUS_BROKER_ID, OKX_SUPPORTED_ORDER_TYPES, OKX_SUPPORTED_TIME_IN_FORCE,
-        OKX_WS_PUBLIC_URL, OKX_WS_TOPIC_DELIMITER, okx_reduce_only_wire_value, select_book_channel,
-        spot_trade_quote_ccy_wire_value,
+        OKX_WS_PUBLIC_URL, OKX_WS_TOPIC_DELIMITER, okx_market_target_currency,
+        okx_reduce_only_wire_value, select_book_channel, spot_trade_quote_ccy_wire_value,
     },
     credential::Credential,
     enums::{
         OKXBookChannel, OKXGreeksType, OKXInstrumentType, OKXOrderType, OKXPositionSide,
-        OKXTargetCurrency, OKXTradeMode, OKXVipLevel,
+        OKXTradeMode, OKXVipLevel,
     },
     parse::{
         bar_spec_as_okx_channel, okx_instrument_type, okx_instrument_type_from_symbol,
@@ -139,9 +140,6 @@ pub static OKX_WS_ALGO_CANCEL_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
 
 /// Maximum subscription args per subscribe/unsubscribe websocket message.
 const OKX_WS_SUBSCRIPTION_ARGS_MAX_PER_MESSAGE: usize = 256;
-
-const RECONNECT_AUTH_RETRY_INITIAL: Duration = Duration::from_secs(1);
-const RECONNECT_AUTH_RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// Pre-interned rate limit key for subscription operations (subscribe/unsubscribe/login).
 ///
@@ -247,6 +245,7 @@ pub struct OKXWebSocketClient {
     pub(crate) pending_orders: Arc<DashMap<String, PendingOrderInfo>>,
     pub(crate) pending_cancels: Arc<DashMap<String, PendingOrderInfo>>,
     pub(crate) pending_amends: Arc<DashMap<String, PendingOrderInfo>>,
+    pub(crate) pending_command_ids: Arc<DashMap<String, Vec<(ClientOrderId, UUID4)>>>,
     option_greeks_subs: Arc<AtomicMap<InstrumentId, AHashSet<OKXGreeksType>>>,
     /// Per-base-pair refcount for the `index-tickers` channel. Multiple
     /// instruments commonly share one base pair (e.g. `BTC-USDT-SWAP` and
@@ -395,6 +394,7 @@ impl OKXWebSocketClient {
             pending_orders: Arc::new(DashMap::new()),
             pending_cancels: Arc::new(DashMap::new()),
             pending_amends: Arc::new(DashMap::new()),
+            pending_command_ids: Arc::new(DashMap::new()),
             option_greeks_subs: Arc::new(AtomicMap::new()),
             index_pair_subscribers: Arc::new(DashMap::new()),
             index_pair_transition: Arc::new(tokio::sync::Mutex::new(())),
@@ -776,42 +776,41 @@ impl OKXWebSocketClient {
             .connect()
             .await?;
 
-        let connection_mode = client.connection_mode_atomic();
-        let reconnect_handle = client.reconnect_handle();
+        client.set_auth_tracker(self.auth_tracker.clone(), false);
+        let ws_client = Arc::new(client);
+        let connection_epoch = ws_client.connection_epoch();
+
+        let connection_mode = ws_client.connection_mode_atomic();
+        let reconnect_handle = ws_client.reconnect_handle();
 
         self.out_rx = Some(Arc::new(rx));
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
 
         // Queue initialization before clones can subscribe through the new sender
-        if let Err(e) = cmd_tx.send(HandlerCommand::SetClient(client)) {
-            anyhow::bail!("Failed to send WebSocket client to handler: {e}");
-        }
+        cmd_tx
+            .send(HandlerCommand::SetClient(Arc::clone(&ws_client)))
+            .map_err(|e| anyhow::anyhow!("Failed to send WebSocket client to handler: {e}"))?;
 
         *self.cmd_tx.write().await = cmd_tx.clone();
 
         // Clones observing active must already see the initialized sender
         self.connection_mode.store(connection_mode);
 
-        let signal = self.signal.clone();
-        let auth_tracker = self.auth_tracker.clone();
-        let subscriptions_state = self.subscriptions_state.clone();
-        let clock = self.clock;
-
         let handler_task = {
-            let auth_tracker = auth_tracker.clone();
-            let signal = signal.clone();
+            let auth_tracker = self.auth_tracker.clone();
+            let signal = self.signal.clone();
+            let subscriptions_state = self.subscriptions_state.clone();
+            let clock = self.clock;
             let credential = self.credential.clone();
             let cmd_tx_for_reconnect = cmd_tx.clone();
             let subscriptions_bare = self.subscriptions_bare.clone();
             let subscriptions_inst_type = self.subscriptions_inst_type.clone();
             let subscriptions_inst_family = self.subscriptions_inst_family.clone();
             let subscriptions_inst_id = self.subscriptions_inst_id.clone();
-            let cmd_tx_for_auth = Arc::clone(&self.cmd_tx);
-            let auth_tracker_for_auth = self.auth_tracker.clone();
-            let clock_for_auth = self.clock;
+            let ws_client = Arc::clone(&ws_client);
             let auth_timeout_secs = self.auth_timeout_secs;
-            let reconnect_auth_generation = Arc::new(AtomicU64::new(0));
+            let mut reconnect_epoch = connection_epoch;
             let handler_spawner_for_auth = handler_spawner.clone();
             let mut has_reconnected = false;
 
@@ -822,6 +821,7 @@ impl OKXWebSocketClient {
                     raw_rx,
                     msg_tx,
                     auth_tracker.clone(),
+                    credential.is_some(),
                     subscriptions_state.clone(),
                     clock,
                 );
@@ -855,40 +855,44 @@ impl OKXWebSocketClient {
 
                     match message {
                         Some(OKXWsMessage::Reconnected) => {
-                            if signal.load(Ordering::Acquire) {
+                            let epoch = ws_client.connection_epoch();
+
+                            if !advance_reconnect_epoch(
+                                &mut reconnect_epoch,
+                                epoch,
+                                signal.load(Ordering::Acquire),
+                                ws_client.is_active(),
+                            ) {
                                 continue;
                             }
 
+                            auth_tracker.invalidate();
                             has_reconnected = true;
 
                             subscriptions_state.reset_after_reconnect();
 
                             if let Some(credential) = credential.clone() {
                                 log::debug!("Re-authenticating after reconnection");
-                                let generation =
-                                    reconnect_auth_generation.fetch_add(1, Ordering::AcqRel) + 1;
                                 let signal = signal.clone();
                                 let abort = handler_abort.clone();
-                                let generation_flag = Arc::clone(&reconnect_auth_generation);
-                                let cmd_tx = Arc::clone(&cmd_tx_for_auth);
-                                let auth_tracker = auth_tracker_for_auth.clone();
+                                let ws_client = Arc::clone(&ws_client);
+                                let auth_tracker = auth_tracker.clone();
 
                                 if let Err(e) = handler_spawner_for_auth.spawn(async move {
-                                    retry_reconnect_authentication(
+                                    reauthenticate_session(
                                         credential,
                                         auth_tracker,
-                                        cmd_tx,
-                                        clock_for_auth,
+                                        ws_client,
+                                        epoch,
+                                        clock,
                                         auth_timeout_secs,
                                         signal,
                                         abort,
-                                        generation_flag,
-                                        generation,
                                     )
                                     .await;
                                 }) {
                                     log::error!(
-                                        "Failed to spawn re-authentication retry task: error={e}"
+                                        "Failed to spawn re-authentication task: error={e}"
                                     );
                                 }
                             }
@@ -945,7 +949,7 @@ impl OKXWebSocketClient {
         log::debug!("Sent WebSocket client to handler");
 
         if self.credential.is_some()
-            && let Err(e) = self.authenticate().await
+            && let Err(e) = self.authenticate(&ws_client, connection_epoch).await
         {
             self.handler_tasks.begin_shutdown();
             self.request_close().await;
@@ -969,7 +973,11 @@ impl OKXWebSocketClient {
     }
 
     /// Authenticates the WebSocket session with OKX.
-    async fn authenticate(&self) -> Result<(), Error> {
+    async fn authenticate(
+        &self,
+        ws_client: &WebSocketClient,
+        connection_epoch: u64,
+    ) -> Result<(), Error> {
         let credential = self.credential.as_ref().ok_or_else(|| {
             Error::Io(std::io::Error::other(
                 "API credentials not available to authenticate",
@@ -979,7 +987,8 @@ impl OKXWebSocketClient {
         match authenticate_session(
             credential,
             &self.auth_tracker,
-            &self.cmd_tx,
+            ws_client,
+            connection_epoch,
             self.clock,
             self.auth_timeout_secs,
         )
@@ -2415,6 +2424,7 @@ impl OKXWebSocketClient {
         &self,
         args: Vec<Value>,
         client_order_ids: Vec<ClientOrderId>,
+        causation_ids: Vec<(ClientOrderId, UUID4)>,
     ) -> Result<(), OKXWsError> {
         let request_id = self.generate_unique_request_id();
         let request = OKXWsRequest::<Value> {
@@ -2427,15 +2437,25 @@ impl OKXWebSocketClient {
         let payload = serde_json::to_string(&request)
             .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize batch cancel: {e}")))?;
 
+        if !causation_ids.is_empty() {
+            self.pending_command_ids
+                .insert(request_id.clone(), causation_ids);
+        }
+
         let cmd = HandlerCommand::Send {
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_BATCH_CANCEL.to_vec()),
-            request_id: Some(request_id),
+            request_id: Some(request_id.clone()),
             client_order_ids,
             op: Some(super::enums::OKXWsOperation::BatchCancelOrders),
         };
 
-        self.send_cmd(cmd).await
+        let result = self.send_cmd(cmd).await;
+        if result.is_err() {
+            self.pending_command_ids.remove(&request_id);
+        }
+
+        result
     }
 
     /// Amend multiple orders in a single batch via WebSocket.
@@ -2607,27 +2627,11 @@ impl OKXWebSocketClient {
             builder.attach_algo_ords(attach_algo_ords);
         }
 
-        // For SPOT market orders in Cash mode, handle tgtCcy parameter
-        // https://www.okx.com/docs-v5/en/#order-book-trading-trade-post-place-order
-        // OKX API default behavior for SPOT market orders:
-        // - BUY orders default to tgtCcy=quote_ccy (sz represents quote currency amount)
-        // - SELL orders default to tgtCcy=base_ccy (sz represents base currency amount)
-        // Note: tgtCcy is ONLY supported for Cash trading mode, not for margin modes (Cross/Isolated)
-        if instrument_type == OKXInstrumentType::Spot
-            && order_type == OrderType::Market
-            && td_mode == OKXTradeMode::Cash
+        if let Some(tgt_ccy) =
+            okx_market_target_currency(instrument_type, order_side, order_type, quote_quantity)
+                .map_err(|e| OKXWsError::ClientError(e.to_string()))?
         {
-            match quote_quantity {
-                Some(true) => {
-                    builder.tgt_ccy(OKXTargetCurrency::QuoteCcy);
-                }
-                // For BUY orders, must explicitly set to base_ccy to override OKX default
-                Some(false) if order_side == OrderSide::Buy => {
-                    builder.tgt_ccy(OKXTargetCurrency::BaseCcy);
-                }
-                // For SELL orders with quote_quantity=false, omit tgtCcy (OKX defaults to base_ccy correctly)
-                Some(false) | None => {}
-            }
+            builder.tgt_ccy(tgt_ccy);
         }
 
         builder.side(order_side);
@@ -2802,6 +2806,39 @@ impl OKXWebSocketClient {
         rpi_taker_access: Option<bool>,
         rpi_px_round: Option<bool>,
     ) -> Result<(), OKXWsError> {
+        self.modify_order_with_causation(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            price,
+            quantity,
+            venue_order_id,
+            new_px_usd,
+            new_px_vol,
+            rpi_taker_access,
+            rpi_px_round,
+            None,
+        )
+        .await
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn modify_order_with_causation(
+        &self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+        price: Option<Price>,
+        quantity: Option<Quantity>,
+        venue_order_id: Option<VenueOrderId>,
+        new_px_usd: Option<String>,
+        new_px_vol: Option<String>,
+        rpi_taker_access: Option<bool>,
+        rpi_px_round: Option<bool>,
+        causation_id: Option<UUID4>,
+    ) -> Result<(), OKXWsError> {
         let mut builder = WsAmendOrderParamsBuilder::default();
 
         let inst_id_code = self
@@ -2867,15 +2904,24 @@ impl OKXWebSocketClient {
         let payload = serde_json::to_string(&request)
             .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize amend: {e}")))?;
 
+        if let (Some(client_order_id), Some(causation_id)) = (client_order_id, causation_id) {
+            self.pending_command_ids
+                .insert(request_id.clone(), vec![(client_order_id, causation_id)]);
+        }
+
         let cmd = HandlerCommand::Send {
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_AMEND.to_vec()),
-            request_id: Some(request_id),
+            request_id: Some(request_id.clone()),
             client_order_ids: client_order_id.into_iter().collect(),
             op: Some(super::enums::OKXWsOperation::AmendOrder),
         };
 
         let result = self.send_cmd(cmd).await;
+
+        if result.is_err() {
+            self.pending_command_ids.remove(&request_id);
+        }
 
         if let (Err(_), Some(key)) = (&result, &cl_ord_key) {
             self.pending_amends.remove(key);
@@ -2901,6 +2947,26 @@ impl OKXWebSocketClient {
         instrument_id: InstrumentId,
         client_order_id: Option<ClientOrderId>,
         venue_order_id: Option<VenueOrderId>,
+    ) -> Result<(), OKXWsError> {
+        self.cancel_order_with_causation(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            venue_order_id,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn cancel_order_with_causation(
+        &self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+        venue_order_id: Option<VenueOrderId>,
+        causation_id: Option<UUID4>,
     ) -> Result<(), OKXWsError> {
         let mut builder = WsCancelOrderParamsBuilder::default();
 
@@ -2946,15 +3012,24 @@ impl OKXWebSocketClient {
         let payload = serde_json::to_string(&request)
             .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize cancel: {e}")))?;
 
+        if let (Some(client_order_id), Some(causation_id)) = (client_order_id, causation_id) {
+            self.pending_command_ids
+                .insert(request_id.clone(), vec![(client_order_id, causation_id)]);
+        }
+
         let cmd = HandlerCommand::Send {
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_CANCEL.to_vec()),
-            request_id: Some(request_id),
+            request_id: Some(request_id.clone()),
             client_order_ids: client_order_id.into_iter().collect(),
             op: Some(super::enums::OKXWsOperation::CancelOrder),
         };
 
         let result = self.send_cmd(cmd).await;
+
+        if result.is_err() {
+            self.pending_command_ids.remove(&request_id);
+        }
 
         if let (Err(_), Some(key)) = (&result, &cl_ord_key) {
             self.pending_cancels.remove(key);
@@ -3041,6 +3116,10 @@ impl OKXWebSocketClient {
 
     /// Submits multiple orders.
     ///
+    /// The quantity-unit flag follows `reduce_only` in each tuple. `Some(true)` requests quote
+    /// units and `Some(false)` requests base units for spot market orders.
+    /// `None` uses venue defaults.
+    ///
     /// # Errors
     ///
     /// Returns an error if any batch order parameters are invalid or if the
@@ -3059,6 +3138,7 @@ impl OKXWebSocketClient {
             Quantity,
             Option<Price>,
             Option<Price>,
+            Option<bool>,
             Option<bool>,
             Option<bool>,
             Option<String>,
@@ -3086,6 +3166,7 @@ impl OKXWebSocketClient {
                 tp,
                 post_only,
                 reduce_only,
+                quote_quantity,
                 outcome,
                 rpi,
                 rpi_taker_access,
@@ -3148,6 +3229,9 @@ impl OKXWebSocketClient {
 
                 builder.ord_type(okx_ord_type);
                 builder.sz(qty.to_string());
+                let tgt_ccy =
+                    okx_market_target_currency(inst_type, ord_side, ord_type, quote_quantity)
+                        .map_err(|e| OKXWsError::ClientError(e.to_string()))?;
 
                 if let Some(p) = pr {
                     builder.px(p.to_string());
@@ -3188,9 +3272,11 @@ impl OKXWebSocketClient {
 
                 builder.tag(OKX_NAUTILUS_BROKER_ID);
 
-                let params = builder.build().map_err(|e| {
+                let mut params = builder.build().map_err(|e| {
                     OKXWsError::ClientError(format!("Build order params error: {e}"))
                 })?;
+
+                params.tgt_ccy = tgt_ccy;
                 let val = serde_json::to_value(params)
                     .map_err(|e| OKXWsError::JsonError(e.to_string()))?;
                 args.push(val);
@@ -3294,6 +3380,15 @@ impl OKXWebSocketClient {
         &self,
         orders: Vec<(InstrumentId, Option<ClientOrderId>, Option<VenueOrderId>)>,
     ) -> Result<(), OKXWsError> {
+        self.batch_cancel_orders_with_causation(orders, Vec::new())
+            .await
+    }
+
+    pub(crate) async fn batch_cancel_orders_with_causation(
+        &self,
+        orders: Vec<(InstrumentId, Option<ClientOrderId>, Option<VenueOrderId>)>,
+        causation_ids: Vec<(ClientOrderId, UUID4)>,
+    ) -> Result<(), OKXWsError> {
         let client_order_ids: Vec<ClientOrderId> = orders
             .iter()
             .filter_map(|(_, cl_ord_id, _)| *cl_ord_id)
@@ -3330,7 +3425,8 @@ impl OKXWebSocketClient {
             args
         };
 
-        self.ws_batch_cancel_orders(args, client_order_ids).await
+        self.ws_batch_cancel_orders(args, client_order_ids, causation_ids)
+            .await
     }
 
     /// Rejects algo placement on the WebSocket transport; use the HTTP client instead.
@@ -3508,26 +3604,42 @@ fn subscription_arg_batches(
     args.chunks(OKX_WS_SUBSCRIPTION_ARGS_MAX_PER_MESSAGE)
 }
 
-fn auth_attempt_superseded(error: &Error) -> bool {
-    error.to_string().contains("superseded")
+fn advance_reconnect_epoch(
+    reconnect_epoch: &mut u64,
+    epoch: u64,
+    stopping: bool,
+    active: bool,
+) -> bool {
+    if stopping || !active || epoch == *reconnect_epoch {
+        return false;
+    }
+
+    *reconnect_epoch = epoch;
+    true
 }
 
-fn reconnect_auth_retry_delay(attempt: u32) -> Duration {
-    let shift = attempt.saturating_sub(1).min(31);
-    let factor = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
-
-    RECONNECT_AUTH_RETRY_INITIAL
-        .saturating_mul(factor)
-        .min(RECONNECT_AUTH_RETRY_MAX)
+fn auth_attempt_superseded(error: &Error) -> bool {
+    error.to_string().contains("superseded")
+        || matches!(error, Error::Io(e) if matches!(
+            e.get_ref().and_then(|e| e.downcast_ref::<SendError>()),
+            Some(SendError::ConnectionChanged),
+        ))
 }
 
 async fn authenticate_session(
     credential: &Credential,
     auth_tracker: &AuthTracker,
-    cmd_tx: &tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>,
+    ws_client: &WebSocketClient,
+    connection_epoch: u64,
     clock: &'static AtomicTime,
     auth_timeout_secs: u64,
 ) -> Result<(), Error> {
+    if !ws_client.is_active() || ws_client.connection_epoch() != connection_epoch {
+        return Err(Error::Io(std::io::Error::other(
+            SendError::ConnectionChanged,
+        )));
+    }
+
     let rx = auth_tracker.begin();
     let timestamp = authentication_timestamp(clock.get_time_ns());
     let signature = credential.sign(&timestamp, "GET", "/users/self/verify", "");
@@ -3550,15 +3662,14 @@ async fn authenticate_session(
             )))
         })?;
 
-    cmd_tx
-        .read()
+    ws_client
+        .send_text_on_connection(
+            payload.expose_secret().to_owned(),
+            Some(OKX_RATE_LIMIT_KEY_SUBSCRIPTION.as_slice()),
+            connection_epoch,
+        )
         .await
-        .send(HandlerCommand::Authenticate { payload })
-        .map_err(|e| {
-            Error::Io(std::io::Error::other(format!(
-                "Failed to send authenticate command: {e}"
-            )))
-        })?;
+        .map_err(|e| Error::Io(std::io::Error::other(e)))?;
 
     match auth_tracker
         .wait_for_result::<OKXWsError>(Duration::from_secs(auth_timeout_secs), rx)
@@ -3581,74 +3692,52 @@ async fn authenticate_session(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "retry loop needs the session pieces without cloning the websocket client"
+    reason = "reconnect authentication uses the existing session and shutdown state"
 )]
-async fn retry_reconnect_authentication(
+async fn reauthenticate_session(
     credential: Credential,
     auth_tracker: AuthTracker,
-    cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
+    ws_client: Arc<WebSocketClient>,
+    connection_epoch: u64,
     clock: &'static AtomicTime,
     auth_timeout_secs: u64,
     signal: Arc<AtomicBool>,
     abort: CancellationToken,
-    generation_flag: Arc<AtomicU64>,
-    generation: u64,
 ) {
-    let mut attempt = 0u32;
+    if signal.load(Ordering::Acquire) || abort.is_cancelled() {
+        return;
+    }
 
-    loop {
-        if signal.load(Ordering::Acquire) || abort.is_cancelled() {
-            break;
-        }
+    if ws_client.connection_epoch() != connection_epoch || !ws_client.is_active() {
+        return;
+    }
 
-        if generation_flag.load(Ordering::Acquire) != generation {
-            break;
-        }
-
-        if cmd_tx.read().await.is_closed() {
-            break;
-        }
-
-        if auth_tracker.is_authenticated() {
-            break;
-        }
-
-        attempt = attempt.saturating_add(1);
-
-        match authenticate_session(
+    let result = tokio::select! {
+        biased;
+        () = abort.cancelled() => return,
+        result = authenticate_session(
             &credential,
             &auth_tracker,
-            &cmd_tx,
+            &ws_client,
+            connection_epoch,
             clock,
             auth_timeout_secs,
-        )
-        .await
-        {
-            Ok(()) => {
-                log::debug!("Re-authenticated after reconnection");
-                break;
+        ) => result,
+    };
+
+    match result {
+        Ok(()) => log::debug!("Re-authenticated after reconnection"),
+        Err(e) => {
+            if signal.load(Ordering::Acquire)
+                || abort.is_cancelled()
+                || ws_client.connection_epoch() != connection_epoch
+                || auth_tracker.is_authenticated()
+            {
+                return;
             }
-            Err(e) => {
-                if generation_flag.load(Ordering::Acquire) != generation {
-                    break;
-                }
 
-                if auth_tracker.is_authenticated() {
-                    break;
-                }
-
-                let delay = reconnect_auth_retry_delay(attempt);
-
-                log::warn!(
-                    "Re-authentication after reconnection failed, retrying in {delay:?}: {e}"
-                );
-
-                tokio::select! {
-                    biased;
-                    () = abort.cancelled() => break,
-                    () = time::sleep(delay) => {}
-                }
-            }
+            log::warn!("Re-authentication failed, reconnecting: {e}");
+            let _ = ws_client.reconnect_handle().request_reconnect();
         }
     }
 }
@@ -4333,18 +4422,6 @@ mod tests {
     }
 
     #[rstest]
-    fn reconnect_auth_retry_delay_grows_and_caps() {
-        assert_eq!(reconnect_auth_retry_delay(1), Duration::from_secs(1));
-        assert_eq!(reconnect_auth_retry_delay(2), Duration::from_secs(2));
-        assert_eq!(reconnect_auth_retry_delay(3), Duration::from_secs(4));
-        assert_eq!(reconnect_auth_retry_delay(6), Duration::from_secs(30));
-        assert_eq!(
-            reconnect_auth_retry_delay(u32::MAX),
-            Duration::from_secs(30)
-        );
-    }
-
-    #[rstest]
     fn resubscribe_batches_subscription_args_into_venue_message_size() {
         let args: Vec<_> = (0..300)
             .map(|i| OKXSubscriptionArg {
@@ -4364,92 +4441,229 @@ mod tests {
     }
 
     #[rstest]
-    #[tokio::test]
-    async fn authenticate_session_sends_login_and_completes_on_success() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let cmd_tx = tokio::sync::RwLock::new(tx);
-        let auth_tracker = AuthTracker::new();
-        let credential = Credential::new("key".into(), "secret".into(), "pass".into());
-        let clock = get_atomic_clock_realtime();
-        let tracker = auth_tracker.clone();
-
-        let task = tokio::spawn(async move {
-            authenticate_session(&credential, &auth_tracker, &cmd_tx, clock, 5).await
-        });
-
-        match rx.recv().await.expect("authenticate command") {
-            HandlerCommand::Authenticate { .. } => {}
-            other => panic!("Expected HandlerCommand::Authenticate, was {other:?}"),
+    #[case::buffered_notifications(false)]
+    #[case::notification_during_install(true)]
+    fn buffered_reconnects_advance_only_the_active_epoch(#[case] install_window: bool) {
+        let mut reconnect_epoch = 0;
+        if install_window {
+            let advanced = advance_reconnect_epoch(&mut reconnect_epoch, 2, false, false);
+            assert!(!advanced);
+            assert_eq!(reconnect_epoch, 0);
         }
 
+        let first = advance_reconnect_epoch(&mut reconnect_epoch, 2, false, true);
+        let duplicate = advance_reconnect_epoch(&mut reconnect_epoch, 2, false, true);
+        let next = advance_reconnect_epoch(&mut reconnect_epoch, 3, false, true);
+
+        assert!(first);
+        assert!(!duplicate);
+        assert!(next);
+        assert_eq!(reconnect_epoch, 3);
+    }
+
+    #[rstest]
+    fn stopped_reconnect_does_not_advance_the_epoch() {
+        let mut reconnect_epoch = 1;
+        let advanced = advance_reconnect_epoch(&mut reconnect_epoch, 2, true, true);
+
+        assert!(!advanced);
+        assert_eq!(reconnect_epoch, 1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn authenticate_session_sends_login_and_completes_on_success() {
+        let (ws_client, mut received, server) = connect_auth_socket().await;
+        let auth_tracker = AuthTracker::new();
+        let credential = Credential::new("key".into(), "secret".into(), "pass".into());
+        let clock = Box::leak(Box::new(AtomicTime::new(
+            false,
+            UnixNanos::new(1_700_000_000_999_999_999),
+        )));
+        let timestamp = authentication_timestamp(clock.get_time_ns());
+        let signature = credential.sign(&timestamp, "GET", "/users/self/verify", "");
+        let tracker = auth_tracker.clone();
+
+        let task = {
+            let ws_client = Arc::clone(&ws_client);
+
+            tokio::spawn(async move {
+                authenticate_session(
+                    &credential,
+                    &auth_tracker,
+                    &ws_client,
+                    ws_client.connection_epoch(),
+                    clock,
+                    5,
+                )
+                .await
+            })
+        };
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
         tracker.succeed();
-        task.await
-            .expect("authenticate task")
-            .expect("authentication should succeed");
+        task.await.unwrap().unwrap();
+        ws_client.disconnect().await;
+        server.abort();
+
+        assert_eq!(payload.as_object().unwrap().len(), 2);
+        assert_eq!(payload["op"], "login");
+        assert_eq!(payload["args"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["args"][0].as_object().unwrap().len(), 4);
+        assert_eq!(payload["args"][0]["apiKey"], "key");
+        assert_eq!(payload["args"][0]["passphrase"], "pass");
+        assert_eq!(payload["args"][0]["timestamp"], timestamp);
+        assert_eq!(payload["args"][0]["sign"], signature);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn authenticate_session_rejects_mismatched_epoch_without_resetting_tracker() {
+        let (ws_client, mut received, server) = connect_auth_socket().await;
+        let auth_tracker = AuthTracker::new();
+        auth_tracker.succeed();
+        let credential = Credential::new("key".into(), "secret".into(), "pass".into());
+
+        let error = authenticate_session(
+            &credential,
+            &auth_tracker,
+            &ws_client,
+            ws_client.connection_epoch() + 1,
+            get_atomic_clock_realtime(),
+            5,
+        )
+        .await
+        .unwrap_err();
+        let authenticated = auth_tracker.is_authenticated();
+        let frame = received.try_recv();
+        ws_client.disconnect().await;
+        server.abort();
+
+        assert!(matches!(error, Error::Io(e) if matches!(
+            e.get_ref().and_then(|e| e.downcast_ref::<SendError>()),
+            Some(SendError::ConnectionChanged),
+        )));
+        assert!(authenticated);
+        assert!(matches!(
+            frame,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[rstest]
     fn auth_attempt_superseded_matches_tracker_message() {
         let error = Error::Io(std::io::Error::other("Authentication attempt superseded"));
         assert!(auth_attempt_superseded(&error));
+        let changed = Error::Io(std::io::Error::other(SendError::ConnectionChanged));
+        assert!(auth_attempt_superseded(&changed));
         let other = Error::Io(std::io::Error::other("Authentication timed out"));
         assert!(!auth_attempt_superseded(&other));
     }
 
     #[rstest]
     #[tokio::test]
-    async fn retry_reconnect_authentication_stops_when_already_authenticated() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let cmd_tx = Arc::new(tokio::sync::RwLock::new(tx));
+    async fn reauthenticate_session_starts_fresh_attempt_when_tracker_is_authenticated() {
+        let (ws_client, mut rx, server) = connect_auth_socket().await;
         let auth_tracker = AuthTracker::new();
         auth_tracker.succeed();
+        let tracker = auth_tracker.clone();
 
-        tokio::time::timeout(
-            Duration::from_millis(200),
-            retry_reconnect_authentication(
+        let task = {
+            let ws_client = Arc::clone(&ws_client);
+
+            tokio::spawn(reauthenticate_session(
                 Credential::new("key".into(), "secret".into(), "pass".into()),
                 auth_tracker,
-                cmd_tx,
+                Arc::clone(&ws_client),
+                ws_client.connection_epoch(),
                 get_atomic_clock_realtime(),
                 5,
                 Arc::new(AtomicBool::new(false)),
                 CancellationToken::new(),
-                Arc::new(AtomicU64::new(1)),
-                1,
-            ),
-        )
-        .await
-        .expect("authenticated retry must return without sending login");
-        assert!(
-            rx.try_recv().is_err(),
-            "already-authenticated retry must not send a login command"
-        );
+            ))
+        };
+
+        let received = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let authenticated_before_ack = tracker.is_authenticated();
+        tracker.succeed();
+        task.await.unwrap();
+        ws_client.disconnect().await;
+        server.abort();
+
+        let payload: Value = serde_json::from_str(received.to_text().unwrap()).unwrap();
+        assert_eq!(payload["op"], "login");
+        assert!(!authenticated_before_ack);
+        assert!(tracker.is_authenticated());
     }
 
     #[rstest]
     #[tokio::test]
-    async fn retry_reconnect_authentication_stops_when_aborted() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let cmd_tx = Arc::new(tokio::sync::RwLock::new(tx));
+    async fn reauthenticate_session_stops_when_aborted() {
+        let (ws_client, mut rx, server) = connect_auth_socket().await;
         let abort = CancellationToken::new();
         abort.cancel();
 
         tokio::time::timeout(
             Duration::from_millis(200),
-            retry_reconnect_authentication(
+            reauthenticate_session(
                 Credential::new("key".into(), "secret".into(), "pass".into()),
                 AuthTracker::new(),
-                cmd_tx,
+                Arc::clone(&ws_client),
+                ws_client.connection_epoch(),
                 get_atomic_clock_realtime(),
                 5,
                 Arc::new(AtomicBool::new(false)),
                 abort,
-                Arc::new(AtomicU64::new(1)),
-                1,
             ),
         )
         .await
-        .expect("aborted retry must return without waiting for authentication");
+        .expect("aborted authentication must return without waiting");
+        let received = rx.try_recv();
+        ws_client.disconnect().await;
+        server.abort();
+        assert!(matches!(
+            received,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    async fn connect_auth_socket() -> (
+        Arc<WebSocketClient>,
+        tokio::sync::mpsc::UnboundedReceiver<Message>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while let Some(Ok(frame)) = socket.next().await {
+                if tx.send(frame).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let config = WebSocketConfig::builder()
+            .url(format!("ws://{addr}"))
+            .build()
+            .unwrap();
+        let ws_client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(Arc::new(|_| {}))
+            .connect()
+            .await
+            .unwrap();
+        (Arc::new(ws_client), rx, server)
     }
 
     #[rstest]
