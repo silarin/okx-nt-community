@@ -685,6 +685,103 @@ mod tests {
     }
 
     #[rstest]
+    #[case::confirmed(None, 1800, 7200, 91, OKXHistoryCoverage::Complete)]
+    #[case::before_start(Some(29), 1830, 7200, 90, OKXHistoryCoverage::Complete)]
+    #[case::at_start(Some(29), 1800, 7200, 90, OKXHistoryCoverage::Unverified)]
+    #[case::inside(Some(60), 1800, 7200, 90, OKXHistoryCoverage::Unverified)]
+    #[case::at_end(Some(119), 1800, 7200, 90, OKXHistoryCoverage::Unverified)]
+    #[case::after_end(Some(119), 1800, 7170, 90, OKXHistoryCoverage::Complete)]
+    #[tokio::test]
+    async fn test_completed_bars_coverage_tracks_unconfirmed_closes(
+        #[case] unconfirmed_index: Option<i64>,
+        #[case] start_secs: i64,
+        #[case] end_secs: i64,
+        #[case] expected_len: usize,
+        #[case] expected_coverage: OKXHistoryCoverage,
+        #[values(false, true)] rescue: bool,
+    ) {
+        let first: Timestamp = "2026-09-01T00:00:00Z".parse().unwrap();
+        let candles: Vec<serde_json::Value> = (0..180i64)
+            .rev()
+            .map(|index| {
+                serde_json::json!([
+                    (first.as_millisecond() + index * 60_000).to_string(),
+                    "33528.6",
+                    "33870.0",
+                    "33500.1",
+                    "33783.9",
+                    "778.838",
+                    "26291398.9",
+                    "26291398.9",
+                    if Some(index) == unconfirmed_index {
+                        "0"
+                    } else {
+                        "1"
+                    }
+                ])
+            })
+            .collect();
+        let route = axum::routing::get(
+            move |axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>| {
+                let candles = candles.clone();
+                async move {
+                    let after = params.get("after").map(|v| v.parse::<i64>().unwrap());
+                    let before = params.get("before").map(|v| v.parse::<i64>().unwrap());
+                    let limit = params
+                        .get("limit")
+                        .map_or(100, |v| v.parse::<usize>().unwrap());
+                    // Empty the initial range to exercise the final rescue response independently
+                    let data: Vec<_> = if rescue {
+                        if after.is_some() { Vec::new() } else { candles }
+                    } else {
+                        candles
+                            .into_iter()
+                            .filter(|c| {
+                                let ts = c[0].as_str().unwrap().parse::<i64>().unwrap();
+                                after.is_none_or(|a| ts < a) && before.is_none_or(|b| ts > b)
+                            })
+                            .take(limit)
+                            .collect()
+                    };
+                    axum::Json(serde_json::json!({"code": "0", "msg": "", "data": data}))
+                }
+            },
+        );
+        let router = axum::Router::new()
+            .route("/api/v5/market/candles", route.clone())
+            .route("/api/v5/market/history-candles", route);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = OKXHttpClient::new(
+            Some(format!("http://{addr}")),
+            5,
+            0,
+            1,
+            1,
+            OKXEnvironment::Demo,
+            None,
+        )
+        .unwrap();
+
+        for instrument in spot_instruments() {
+            client.cache_instrument(instrument);
+        }
+        let (bars, coverage) = client
+            .request_completed_bars_with_coverage(
+                BarType::from("BTC-USD.OKX-1-MINUTE-LAST-EXTERNAL"),
+                Some(first + jiff::SignedDuration::from_secs(start_secs)),
+                Some(first + jiff::SignedDuration::from_secs(end_secs)),
+                None,
+            )
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(bars.len(), expected_len);
+        assert_eq!(coverage, expected_coverage);
+    }
+
+    #[rstest]
     #[tokio::test]
     async fn test_request_bars_paged_is_truncated_at_the_page_cap() {
         // A day of minute candles, a window ten days long: two history pages of 100 cannot reach the start
@@ -4384,8 +4481,8 @@ impl OKXHttpClient {
         let mut have_latest_first_page = false;
         let mut progressless_loops = 0u8;
         let mut truncated = false;
-        // Open times of candles OKX has not confirmed yet; they rule out a covered window
-        let mut unconfirmed: Vec<UnixNanos> = Vec::new();
+        // Keep unconfirmed close times even when completed-only filtering removes their bars
+        let mut unconfirmed_closes: Vec<UnixNanos> = Vec::new();
 
         loop {
             if let Some(lim) = limit
@@ -4543,7 +4640,7 @@ impl OKXHttpClient {
                 )?;
 
                 if r.8 != "1" {
-                    unconfirmed.push(bar.ts_event);
+                    unconfirmed_closes.push(bar.ts_init);
                 }
                 page.push(bar);
             }
@@ -4721,8 +4818,8 @@ impl OKXHttpClient {
             if !raw.is_empty() {
                 let mut page: Vec<Bar> = Vec::with_capacity(raw.len());
                 for r in &raw {
-                    if completed_only && !r.is_confirmed()? {
-                        continue;
+                    if completed_only {
+                        r.is_confirmed()?;
                     }
                     let bar = parse_historical_candlestick(
                         r,
@@ -4732,9 +4829,12 @@ impl OKXHttpClient {
                     )?;
 
                     if r.8 != "1" {
-                        unconfirmed.push(bar.ts_event);
+                        unconfirmed_closes.push(bar.ts_init);
                     }
-                    page.push(bar);
+
+                    if !completed_only || r.8 == "1" {
+                        page.push(bar);
+                    }
                 }
                 page.reverse();
                 out = page
@@ -4781,7 +4881,10 @@ impl OKXHttpClient {
             OKXHistoryCoverage::Truncated
         } else if !limited
             && !is_month
-            && !out.iter().any(|bar| unconfirmed.contains(&bar.ts_event))
+            && !unconfirmed_closes.iter().any(|close| {
+                let ts = close.as_i64();
+                start_ns.is_none_or(|sns| ts >= sns) && end_ns.is_none_or(|ens| ts <= ens)
+            })
             && let (Some(sns), Some(first)) = (start_ns, out.first())
             && first.ts_init.as_i64() < sns.saturating_add(slot_ns)
         {
