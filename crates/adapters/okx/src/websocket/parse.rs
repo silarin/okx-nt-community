@@ -1698,6 +1698,10 @@ pub fn parse_algo_order_status_report(
         None,
     );
 
+    report.parent_venue_order_id = (!msg.algo_id.is_empty()
+        && msg.algo_id != venue_order_id.as_str())
+    .then(|| VenueOrderId::from(msg.algo_id.as_str()));
+
     if !algo_fields.trigger_px.is_empty() {
         report.trigger_price = Some(parse_price(
             algo_fields.trigger_px,
@@ -2003,6 +2007,13 @@ pub fn parse_order_status_report(
         ts_init,
         None, // Generate UUID4 automatically
     );
+
+    // Linked SL and attached TP/SL IDs are separate orders, not creating parents.
+    report.parent_venue_order_id = msg
+        .algo_id
+        .as_deref()
+        .filter(|id| !id.is_empty() && *id != venue_order_id.as_str())
+        .map(VenueOrderId::from);
 
     let price_precision = instrument.price_precision();
 

@@ -353,7 +353,7 @@ impl OKXExecutionClient {
                 let observation_emitter = &self.emitter;
                 let history = async {
                     if query.is_none() {
-                        let detail = self
+                        let mut detail = self
                             .http_client
                             .request_order_status_report_with_type(
                                 report.account_id,
@@ -368,6 +368,19 @@ impl OKXExecutionClient {
                             .ok_or_else(|| {
                                 anyhow::anyhow!("Missing startup order product scope")
                             })?;
+                        anyhow::ensure!(
+                            detail.report.parent_venue_order_id.is_none()
+                                || report.parent_venue_order_id.is_none()
+                                || detail.report.parent_venue_order_id
+                                    == report.parent_venue_order_id,
+                            ConflictingFillEvidence(
+                                "Startup parent venue identity conflicts with child detail"
+                            )
+                        );
+                        detail.report.parent_venue_order_id = detail
+                            .report
+                            .parent_venue_order_id
+                            .or(report.parent_venue_order_id);
                         self.emitter
                             .send_execution_report(ExecutionReport::OrderQueryWithFills(
                                 Box::new(detail.report.clone()),
@@ -449,12 +462,25 @@ impl OKXExecutionClient {
         let account_id = self.core.account_id;
         let account_type = self.core.account_type;
         let emitter = self.emitter.clone();
+        let dispatch = self.ws_dispatch_state.clone();
+        let clock = self.clock;
 
         self.spawn_task("query_account", async move {
-            let account_state = http_client
+            let account_state = match http_client
                 .request_account_state(account_id, account_type)
                 .await
-                .context("failed to request OKX account state")?;
+            {
+                Ok(state) => state,
+                Err(e) => {
+                    dispatch.invalidate_account_observation(
+                        &emitter,
+                        account_id,
+                        account_type,
+                        clock.get_time_ns(),
+                    );
+                    return Err(e).context("failed to request OKX account state");
+                }
+            };
             emitter.send_account_state(account_state);
             Ok(())
         });
@@ -1552,11 +1578,22 @@ impl OKXExecutionClient {
             }
         }
 
-        let account_state = self
+        let account_state = match self
             .http_client
             .request_account_state(self.core.account_id, self.core.account_type)
             .await
-            .context("failed to request OKX account state")?;
+        {
+            Ok(state) => state,
+            Err(e) => {
+                self.ws_dispatch_state.invalidate_account_observation(
+                    &self.emitter,
+                    self.core.account_id,
+                    self.core.account_type,
+                    self.clock.get_time_ns(),
+                );
+                return Err(e).context("failed to request OKX account state");
+            }
+        };
 
         if !account_state.balances.is_empty() {
             log::debug!(
@@ -1989,7 +2026,23 @@ impl ExecutionClient for OKXExecutionClient {
                         )
                         .await
                     {
-                        Ok(Some(query)) => {
+                        Ok(Some(mut query)) => {
+                            if let Some(parent) = reports.iter().find(|report| {
+                                report.venue_order_id == child_venue_order_id && report.parent_venue_order_id.is_some()
+                            }) {
+                                if query.report.account_id != parent.account_id
+                                    || query.report.instrument_id != parent.instrument_id
+                                    || query.report.order_side != parent.order_side
+                                    || query.report.venue_position_id != parent.venue_position_id
+                                    || query.algo_client_order_id.is_some_and(|id| Some(id) != parent.client_order_id)
+                                    || query.report.parent_venue_order_id.is_some_and(|id| Some(id) != parent.parent_venue_order_id)
+                                {
+                                    emitter.send_execution_report(ExecutionReport::OrderFillConflict(Box::new(parent.clone())));
+                                    return Ok(());
+                                }
+                                query.report.parent_venue_order_id = parent.parent_venue_order_id;
+                                query.report.client_order_id = parent.client_order_id;
+                            }
                             merge_order_status_reports(&mut reports, vec![query.report.clone()]);
                             fill_queries.insert(query.report.venue_order_id, query);
                         }
@@ -3876,6 +3929,9 @@ impl OKXReportClient {
                     if query
                         .algo_client_order_id
                         .is_some_and(|id| Some(id) != parent_report.client_order_id)
+                        || child_report
+                            .parent_venue_order_id
+                            .is_some_and(|id| Some(id) != parent_report.parent_venue_order_id)
                         || child_report.account_id != parent_report.account_id
                         || child_report.instrument_id != parent_report.instrument_id
                         || child_report.venue_order_id != parent_report.venue_order_id
@@ -3894,6 +3950,8 @@ impl OKXReportClient {
                         complete = false;
                         continue;
                     }
+
+                    child_report.parent_venue_order_id = parent_report.parent_venue_order_id;
 
                     if child_report.order_status == OrderStatus::Accepted {
                         parent_report.quantity = child_report.quantity;

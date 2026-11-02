@@ -3470,7 +3470,9 @@ impl Cache {
     /// Returns an error if applying or persisting the account state fails.
     pub fn update_account_state(&mut self, event: &AccountState) -> anyhow::Result<()> {
         let Some(cell) = self.accounts.get(&event.account_id) else {
-            return self.add_account(AccountAny::from_events(std::slice::from_ref(event))?);
+            return self.add_account(
+                AccountAny::try_from_state(event.clone()).map_err(anyhow::Error::msg)?,
+            );
         };
 
         // The event is applied before anything can fail, so a database failure while saving its

@@ -15,7 +15,7 @@
 
 //! Parsing utilities that convert OKX payloads into Nautilus domain models.
 
-use std::str::FromStr;
+use std::{collections::BTreeSet, str::FromStr};
 
 use anyhow::Context;
 use indexmap::IndexMap;
@@ -1229,6 +1229,11 @@ pub fn parse_order_status_report(
     report.venue_position_id = venue_position_id(instrument_id, order.pos_side);
 
     // Optional fields
+    report.parent_venue_order_id = order
+        .algo_id
+        .filter(|id| !id.is_empty() && id.as_str() != venue_order_id.as_str())
+        .map(|id| VenueOrderId::from(id.as_str()));
+
     if !is_market_price(&order.px)
         && let Ok(decimal) = Decimal::from_str(&order.px)
         && let Ok(price) = Price::from_decimal_dp(decimal, price_precision)
@@ -3074,6 +3079,7 @@ pub(crate) fn parse_account_state_with_source(
     rest_request_started: Option<UnixNanos>,
 ) -> anyhow::Result<AccountState> {
     let mut balances = Vec::new();
+    let mut seen_currencies = BTreeSet::new();
     let mut info = super::account::OKXAccountStateInfo {
         update,
         rest_request_started,
@@ -3087,6 +3093,10 @@ pub(crate) fn parse_account_state_with_source(
             log::debug!("Skipping balance detail with empty currency code | raw_data={b:?}");
             continue;
         }
+        anyhow::ensure!(
+            seen_currencies.insert(ccy_str),
+            "OKX account reports duplicate currency balances"
+        );
 
         // Get or create currency (consistent with instrument parsing)
         let currency = Currency::get_or_create_crypto_with_context(ccy_str, Some("balance detail"));
@@ -3102,6 +3112,21 @@ pub(crate) fn parse_account_state_with_source(
 
         match AccountBalance::from_total_and_free(total, free, currency) {
             Ok(balance) => {
+                anyhow::ensure!(
+                    account_type != AccountType::Cash || !balance.total.is_negative(),
+                    "OKX cash account reports a negative balance"
+                );
+
+                if Decimal::from_str_exact(&b.cash_bal)
+                    .is_ok_and(|value| balance.total.as_decimal() == value)
+                    && Decimal::from_str_exact(&b.avail_bal)
+                        .is_ok_and(|value| balance.free.as_decimal() == value)
+                    && total
+                        .checked_sub(free)
+                        .is_some_and(|locked| balance.locked.as_decimal() == locked)
+                {
+                    info.exact_balance_currencies.insert(ccy_str.to_string());
+                }
                 let ns = b.u_time.checked_mul(1_000_000).ok_or_else(|| {
                     anyhow::anyhow!("OKX currency update time overflows nanoseconds")
                 })?;
@@ -3174,7 +3199,12 @@ pub(crate) fn parse_account_state_with_source(
 
     let is_reported = true;
     let event_id = UUID4::new();
-    let ts_event = parse_millisecond_timestamp(okx_account.u_time);
+    let ts_event = UnixNanos::from(
+        okx_account
+            .u_time
+            .checked_mul(1_000_000)
+            .ok_or_else(|| anyhow::anyhow!("Account timestamp overflows nanoseconds"))?,
+    );
 
     Ok(AccountState::new(
         account_id,

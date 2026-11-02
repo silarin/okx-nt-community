@@ -1852,9 +1852,24 @@ impl ExecutionEngine {
                     .and_then(|cid| cache.order(cid).map(|o| o.clone()))
             });
         let instrument = cache.instrument(&report.instrument_id).cloned();
+        let canonical = order
+            .as_ref()
+            .map(Order::client_order_id)
+            .or(report.client_order_id);
+        let identity_conflict = order
+            .as_ref()
+            .is_some_and(|order| !report.matches_order_identity(order))
+            || std::iter::once(report.venue_order_id)
+                .chain(report.parent_venue_order_id)
+                .any(|venue| {
+                    cache
+                        .client_order_id(&venue)
+                        .is_some_and(|owner| Some(*owner) != canonical)
+                });
         drop(cache);
 
-        if defer_terminal && fills.is_empty() && order.is_some() {
+        if !is_snapshot && identity_conflict {
+            log::warn!("Order query conflicts with a proven venue identity");
             return;
         }
 
@@ -1877,7 +1892,21 @@ impl ExecutionEngine {
                     .borrow()
                     .client_order_id(&report.venue_order_id)
                     .is_none_or(|id| *id == order.client_order_id());
-            if unfilled_submission || order_fill_evidence_matches(order, report, fills) {
+
+            let unfilled_child = order.filled_qty().is_zero()
+                && report.filled_qty.is_zero()
+                && report.parent_venue_order_id.is_some()
+                && report.parent_venue_order_id == order.venue_order_id()
+                && Some(report.venue_order_id) != order.venue_order_id();
+
+            if defer_terminal && !unfilled_submission && !unfilled_child {
+                return;
+            }
+
+            if unfilled_submission
+                || unfilled_child
+                || order_fill_evidence_matches(order, report, fills)
+            {
                 let events = generate_reconciliation_order_events(
                     order,
                     report,
@@ -1886,6 +1915,14 @@ impl ExecutionEngine {
                 );
 
                 for mut event in events {
+                    // Identity recovery must not release a held terminal observation.
+                    if defer_terminal
+                        && !matches!(event, OrderEventAny::Accepted(_))
+                        && !(report.parent_venue_order_id.is_some()
+                            && matches!(event, OrderEventAny::Updated(_)))
+                    {
+                        continue;
+                    }
                     // Only terminal callbacks inherit stream provenance after native
                     // quantity and identity admission for natively submitted orders.
                     // Reconstructed external orders and inferred acceptance stay reconciliation.
@@ -1972,18 +2009,7 @@ impl ExecutionEngine {
         // Bootstrap the external order with only OrderAccepted; defer fill events to
         // the per-fill loop so real fill metadata is preserved.
         let mut order = match order {
-            Some(order) => {
-                let ts_now = self.clock.borrow().timestamp_ns();
-                let events = generate_reconciliation_order_pre_fill_events(&order, report, ts_now);
-                for event in &events {
-                    self.handle_event(event);
-                }
-                self.cache
-                    .borrow()
-                    .order(&order.client_order_id())
-                    .map(|o| o.clone())
-                    .unwrap_or(order)
-            }
+            Some(order) => order,
             None => {
                 let Some(order) = self.materialize_external_order_from_status(report) else {
                     return;
@@ -1994,7 +2020,9 @@ impl ExecutionEngine {
                     order.strategy_id(),
                     order.instrument_id(),
                     order.client_order_id(),
-                    report.venue_order_id,
+                    report
+                        .parent_venue_order_id
+                        .unwrap_or(report.venue_order_id),
                     report.account_id,
                     UUID4::new(),
                     report.ts_accepted,
@@ -2009,6 +2037,16 @@ impl ExecutionEngine {
                     .unwrap_or(order)
             }
         };
+
+        let ts_now = self.clock.borrow().timestamp_ns();
+        for event in generate_reconciliation_order_pre_fill_events(&order, report, ts_now) {
+            self.handle_event(&event);
+        }
+        order = self
+            .cache
+            .borrow()
+            .order_owned(&order.client_order_id())
+            .unwrap_or(order);
 
         if !is_snapshot
             && inferred_reconciliation_trade_ids(&order).map_or(true, |ids| !ids.is_empty())

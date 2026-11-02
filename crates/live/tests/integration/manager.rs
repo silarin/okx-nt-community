@@ -2716,6 +2716,271 @@ async fn test_reconcile_mass_status_processes_fills_for_cached_order() {
     assert!(matches!(result.events[0], OrderEventAny::Filled(_)));
 }
 
+#[rstest]
+#[case::older_partial(OrderStatus::PartiallyFilled, "1.0", 100_000_000, false)]
+#[case::older_zero_accepted(OrderStatus::Accepted, "0.0", 50_000_000, false)]
+#[case::older_zero_canceled(OrderStatus::Canceled, "0.0", 50_000_000, false)]
+#[case::older_zero_expired(OrderStatus::Expired, "0.0", 50_000_000, false)]
+#[case::newer_zero_accepted(OrderStatus::Accepted, "0.0", 300_000_000, true)]
+#[case::newer_zero_canceled(OrderStatus::Canceled, "0.0", 300_000_000, true)]
+#[case::newer_zero_expired(OrderStatus::Expired, "0.0", 300_000_000, true)]
+#[tokio::test]
+async fn test_authoritative_startup_snapshot_preserves_newer_committed_fills(
+    #[case] status: OrderStatus,
+    #[case] filled_qty: Quantity,
+    #[case] snapshot_time: u64,
+    #[case] incomplete: bool,
+) {
+    let mut ctx = TestContext::new();
+    ctx.advance_time(1_000_000_000);
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let client_order_id = ClientOrderId::from("O-STALE-STARTUP");
+    let venue_order_id = VenueOrderId::from("V-STALE-STARTUP");
+    ctx.add_instrument(instrument.clone());
+    let mut client = MockExecutionClient::new(Vec::new());
+    client.require_query_fills = true;
+    ctx.exec_engine
+        .borrow_mut()
+        .deregister_client(test_client_id())
+        .unwrap();
+    ctx.exec_engine
+        .borrow_mut()
+        .register_client(Box::new(client))
+        .unwrap();
+    let order = create_accepted_order(
+        "O-STALE-STARTUP",
+        instrument_id,
+        OrderSide::Buy,
+        "10.0",
+        "3000.00",
+        venue_order_id,
+    );
+    ctx.add_order(order);
+    for (trade, timestamp) in [("T1", 100_000_000), ("T2", 200_000_000)] {
+        let order = ctx.get_order(&client_order_id).unwrap();
+        let fill = TestOrderEventStubs::filled(
+            &order,
+            &instrument,
+            Some(TradeId::from(trade)),
+            None,
+            Some(Price::from("3000.00")),
+            Some(Quantity::from("1.0")),
+            Some(LiquiditySide::Maker),
+            Some(Money::from("0.50 USDT")),
+            None,
+            Some(test_account_id()),
+        );
+        let OrderEventAny::Filled(mut fill) = fill else {
+            unreachable!();
+        };
+        fill.ts_event = UnixNanos::from(timestamp);
+        fill.ts_init = fill.ts_event;
+        ctx.exec_engine
+            .borrow_mut()
+            .process(&OrderEventAny::Filled(fill));
+    }
+    let before = ctx.get_order(&client_order_id).unwrap();
+    assert_eq!(before.filled_qty(), Quantity::from("2.0"));
+    let positions_before: Vec<_> = ctx
+        .cache
+        .borrow()
+        .positions_open(None, Some(&instrument_id), None, None, None)
+        .into_iter()
+        .map(|position| (*position).clone())
+        .collect();
+    assert_eq!(positions_before.len(), 1);
+    let mut report = create_order_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument_id,
+        status,
+        Quantity::from("10.0"),
+        filled_qty,
+    )
+    .with_avg_px(dec!(3000.00));
+    report.ts_last = UnixNanos::from(snapshot_time);
+    if filled_qty.is_zero() {
+        report.avg_px = None;
+    }
+    report.ts_init = UnixNanos::from(300_000_000);
+    let mut fill = create_fill_report(
+        client_order_id,
+        venue_order_id,
+        instrument_id,
+        TradeId::from("T1"),
+        "1.0",
+    );
+    fill.ts_event = report.ts_last;
+    fill.ts_init = report.ts_init;
+    let fills = if filled_qty.is_zero() {
+        Vec::new()
+    } else {
+        vec![fill]
+    };
+    assert_eq!(
+        nautilus_execution::reconciliation::query_fills_match_cached_history(
+            &before, &report, &fills
+        ),
+        !incomplete
+    );
+    let result = ctx.manager.reconcile_execution_mass_status(
+        &create_mass_status(vec![report], fills),
+        &ctx.exec_engine,
+    );
+    assert_eq!(result.order_fill_history_incomplete, incomplete);
+    let after = ctx.get_order(&client_order_id).unwrap();
+
+    if !incomplete
+        && matches!(
+            status,
+            OrderStatus::Accepted | OrderStatus::Canceled | OrderStatus::Expired
+        )
+    {
+        assert_eq!(result.events.len(), 1);
+        assert!(matches!(
+            result.events[0],
+            OrderEventAny::Accepted(_) | OrderEventAny::Canceled(_) | OrderEventAny::Expired(_)
+        ));
+        assert_eq!(after.status(), status);
+        assert_eq!(after.events()[..before.events().len()], before.events());
+    } else {
+        assert!(result.events.is_empty());
+        assert_eq!(after.events(), before.events());
+    }
+    assert_eq!(after.filled_qty(), before.filled_qty());
+    assert_eq!(after.commissions(), before.commissions());
+    let cache = ctx.cache.borrow();
+    let positions_after: Vec<_> = cache
+        .positions_open(None, Some(&instrument_id), None, None, None)
+        .into_iter()
+        .map(|position| (*position).clone())
+        .collect();
+    assert_eq!(positions_after, positions_before);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_startup_requires_proven_venue_binding(
+    #[values("unproven", "parent", "wrong_parent", "venue_owner", "external")] binding: &str,
+    #[values(false, true)] zero: bool,
+) {
+    let mut ctx = TestContext::new();
+    ctx.advance_time(1_000_000_000);
+    let instrument = test_instrument();
+    ctx.add_instrument(instrument.clone());
+    let cid = ClientOrderId::from("O-BINDING");
+    let parent = VenueOrderId::from("PARENT");
+    let child = VenueOrderId::from("CHILD");
+    let mut client = MockExecutionClient::new(Vec::new());
+    client.require_query_fills = true;
+    ctx.exec_engine
+        .borrow_mut()
+        .deregister_client(test_client_id())
+        .unwrap();
+    ctx.exec_engine
+        .borrow_mut()
+        .register_client(Box::new(client))
+        .unwrap();
+    let before = create_accepted_order(
+        "O-BINDING",
+        instrument.id(),
+        OrderSide::Buy,
+        "10.0",
+        "3000.00",
+        parent,
+    );
+
+    if binding != "external" {
+        ctx.add_order(before.clone());
+    }
+    let mut parent_query = create_order_report(
+        Some(cid),
+        parent,
+        instrument.id(),
+        OrderStatus::Accepted,
+        before.quantity(),
+        Quantity::from("0.0"),
+    );
+    parent_query.ts_last = UnixNanos::from(100_000_000);
+    ctx.manager
+        .observe_execution_report(&ExecutionReport::OrderQueryWithFills(
+            Box::new(parent_query),
+            Vec::new(),
+        ));
+    let mut report = create_order_report(
+        Some(cid),
+        child,
+        instrument.id(),
+        if zero {
+            OrderStatus::Accepted
+        } else {
+            OrderStatus::PartiallyFilled
+        },
+        before.quantity(),
+        Quantity::from(if zero { "0.0" } else { "1.0" }),
+    )
+    .with_price(Price::from("3000.00"));
+    report.parent_venue_order_id = match binding {
+        "unproven" => None,
+        "wrong_parent" => Some(VenueOrderId::from("WRONG")),
+        _ => Some(parent),
+    };
+    report.ts_last = UnixNanos::from(200_000_000);
+    report.ts_init = UnixNanos::from(300_000_000);
+
+    if binding == "venue_owner" {
+        ctx.cache
+            .borrow_mut()
+            .add_venue_order_id(&ClientOrderId::from("OTHER"), &child, false)
+            .unwrap();
+    }
+    let fills = if zero {
+        Vec::new()
+    } else {
+        let mut fill = create_fill_report(
+            cid,
+            child,
+            instrument.id(),
+            TradeId::from("CHILD-TRADE"),
+            "1.0",
+        );
+        fill.ts_event = report.ts_last;
+        fill.ts_init = report.ts_init;
+        vec![fill]
+    };
+    let result = ctx.manager.reconcile_execution_mass_status(
+        &create_mass_status(vec![report], fills),
+        &ctx.exec_engine,
+    );
+    assert_eq!(
+        result.order_fill_history_incomplete,
+        !matches!(binding, "parent" | "external")
+    );
+    let after = ctx.get_order(&cid).unwrap();
+    if matches!(binding, "parent" | "external") {
+        assert_eq!(after.venue_order_id(), Some(child));
+        assert!(after.venue_order_ids().contains(&&parent));
+        assert_eq!(
+            after.filled_qty(),
+            Quantity::from(if zero { "0.0" } else { "1.0" })
+        );
+        assert!(
+            !ctx.manager
+                .position_fill_recovery_pending(&(instrument.id(), test_account_id()))
+        );
+    } else {
+        assert_eq!(after.events(), before.events());
+        assert!(result.events.is_empty());
+        assert!(
+            ctx.cache
+                .borrow()
+                .positions(None, None, None, None, None)
+                .is_empty()
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_reconcile_mass_status_deduplicates_fills() {
     let mut ctx = TestContext::new();
@@ -15136,6 +15401,7 @@ async fn test_reconciliation_instrument_ids_filters_position_reports() {
 struct MockExecutionClient {
     order_venue_ids: IndexMap<ClientOrderId, Vec<VenueOrderId>>,
     retain_unresolved_submissions: bool,
+    require_query_fills: bool,
     client_id: ClientId,
     account_id: AccountId,
     venue: Venue,
@@ -15160,6 +15426,7 @@ impl MockExecutionClient {
     fn new(order_reports: Vec<OrderStatusReport>) -> Self {
         Self {
             retain_unresolved_submissions: false,
+            require_query_fills: false,
             order_venue_ids: IndexMap::new(),
             client_id: test_client_id(),
             account_id: test_account_id(),
@@ -15185,6 +15452,7 @@ impl MockExecutionClient {
     fn for_venue(client_id: ClientId, venue: Venue, order_reports: Vec<OrderStatusReport>) -> Self {
         Self {
             retain_unresolved_submissions: false,
+            require_query_fills: false,
             order_venue_ids: IndexMap::new(),
             client_id,
             account_id: test_account_id(),
@@ -15210,6 +15478,7 @@ impl MockExecutionClient {
     fn failing(client_id: ClientId, venue: Venue) -> Self {
         Self {
             retain_unresolved_submissions: false,
+            require_query_fills: false,
             order_venue_ids: IndexMap::new(),
             client_id,
             account_id: test_account_id(),
@@ -15276,6 +15545,10 @@ impl MockExecutionClient {
 
 #[async_trait(?Send)]
 impl ExecutionClient for MockExecutionClient {
+    fn requires_order_query_fills(&self, _instrument_id: InstrumentId) -> bool {
+        self.require_query_fills
+    }
+
     fn venue_order_ids(
         &self,
         _mass_status: &ExecutionMassStatus,

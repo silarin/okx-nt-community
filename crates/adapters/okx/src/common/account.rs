@@ -15,11 +15,15 @@
 
 //! Provenance and currency-specific timestamps for OKX `AccountState` events.
 
-use std::collections::BTreeMap;
+#[cfg(test)]
+mod history_tests;
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
 use nautilus_core::{UnixNanos, params::Params};
 use nautilus_model::{
+    accounts::{Account, AccountAny},
     events::AccountState,
     types::{AccountBalance, Currency},
 };
@@ -56,6 +60,9 @@ pub struct OKXAccountStateInfo {
     /// This is observation provenance, not a replacement for venue update times.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rest_request_started: Option<UnixNanos>,
+    /// Currencies whose native amounts exactly match unnormalized source total/free/locked.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub exact_balance_currencies: BTreeSet<String>,
 }
 
 impl OKXAccountStateInfo {
@@ -162,6 +169,106 @@ pub fn reported_currency_balance_after(
         "Invalid OKX REST snapshot request chronology"
     );
     Ok(balance.filter(|_| started > after))
+}
+
+/// Returns the latest explicit currency balance backed by a post-boundary REST observation.
+///
+/// Searches only the account's known-contiguous retained suffix, in reverse arrival order.
+/// Every intervening event must explicitly report the same currency timestamp and exact
+/// total/free/locked balance through a known WebSocket source. The nearest REST response is
+/// decisive, including when its request started too early. Omitted currencies, changed
+/// balances/timestamps, unknown sources and missing history return `None`; no old balance is
+/// substituted for the latest event. A retained pre-request event must anchor the request;
+/// all preceding retained and excluded events must predate its start. Activity during the
+/// request invalidates it. A later quiet REST request can re-establish evidence. Restored
+/// event lists and legacy accounts without an excluded-history bound remain ineligible.
+///
+/// `after` must be the latest nonzero local fill initialization timestamp, not a venue time.
+/// Callers must still check venue chronology, balance restoration and lifecycle state.
+///
+/// # Errors
+///
+/// Returns an error if reported metadata, account identity or request chronology is invalid,
+/// or if initialization times are zero or reversed.
+pub fn reported_account_currency_balance_after(
+    account: &AccountAny,
+    currency: Currency,
+    after: UnixNanos,
+) -> anyhow::Result<Option<(AccountBalance, UnixNanos)>> {
+    anyhow::ensure!(
+        after != UnixNanos::default(),
+        "Missing local observation boundary"
+    );
+    let (events, Some(excluded_until)) = account.contiguous_events() else {
+        return Ok(None);
+    };
+    let Some(latest) = events.last() else {
+        return Ok(None);
+    };
+    let Some(balance) = reported_currency_balance(latest, currency)? else {
+        return Ok(None);
+    };
+    let mut later_init = latest.ts_init;
+
+    for (index, state) in events.iter().enumerate().rev() {
+        anyhow::ensure!(
+            state.account_id == account.id()
+                && state.account_type == account.account_type()
+                && state.base_currency == account.base_currency(),
+            "Inconsistent OKX account observation identity"
+        );
+        anyhow::ensure!(
+            state.ts_init != UnixNanos::default() && state.ts_init <= later_init,
+            "Invalid OKX account observation chronology"
+        );
+        later_init = state.ts_init;
+        if reported_currency_balance(state, currency)? != Some(balance) {
+            return Ok(None);
+        }
+        let info: OKXAccountStateInfo = serde_json::from_value(
+            state
+                .info
+                .as_ref()
+                .and_then(|info| info.get("okx"))
+                .context("OKX AccountState is missing balance provenance")?
+                .clone(),
+        )?;
+
+        if !info
+            .exact_balance_currencies
+            .contains(currency.code.as_str())
+        {
+            return Ok(None);
+        }
+
+        match info.update {
+            OKXAccountUpdate::Rest => {
+                let observation = reported_currency_balance_after(state, currency, after)?;
+                let Some(started) = info.rest_request_started else {
+                    return Ok(None);
+                };
+                // Require a retained pre-request anchor and no account activity during
+                // the request. Examine the whole prefix: arrival order can be reversed.
+                if started <= excluded_until
+                    || index == 0
+                    || events[..index].iter().any(|prior| {
+                        prior.ts_init == UnixNanos::default() || prior.ts_init >= started
+                    })
+                {
+                    return Ok(None);
+                }
+                return Ok(observation);
+            }
+            OKXAccountUpdate::Unknown => return Ok(None),
+            OKXAccountUpdate::WebSocketSnapshot { .. } | OKXAccountUpdate::WebSocketUpdate => {
+                anyhow::ensure!(
+                    info.rest_request_started.is_none(),
+                    "Invalid OKX WebSocket observation provenance"
+                );
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

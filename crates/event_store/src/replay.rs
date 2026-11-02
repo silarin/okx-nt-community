@@ -40,7 +40,10 @@ use nautilus_common::{
 use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos};
 use nautilus_execution::{
     engine::settlement::{settle_instrument_close, settlement_close},
-    reconciliation::{query_fill_evidence_matches, query_fill_recovery_complete},
+    reconciliation::{
+        query_fill_evidence_matches, query_fill_history_complete, query_fill_recovery_complete,
+        query_fill_witness_preserves_history,
+    },
 };
 use nautilus_model::{
     data::{Bar, BatchView, InstrumentClose, QuoteTick, TradeTick},
@@ -120,6 +123,8 @@ pub(crate) const ORDER_CAPTURE_CONTRACT: &str = "order-capture=committed-routes-
 struct QueryFillEvidence {
     #[serde(skip)]
     stream: bool,
+    #[serde(skip)]
+    fresh_receipt: bool,
     order_report: OrderStatusReport,
     fill_reports: Vec<FillReport>,
 }
@@ -159,12 +164,13 @@ impl QueryFillEvidence {
                 complete_query_history,
             )
         } else {
-            query_fill_recovery_complete(
-                order,
-                &self.order_report,
-                &self.fill_reports,
-                complete_query_history,
-            )
+            query_fill_witness_preserves_history(accounting, order, self.order_report.ts_last)
+                && query_fill_recovery_complete(
+                    order,
+                    &self.order_report,
+                    &self.fill_reports,
+                    complete_query_history,
+                )
         }
     }
 }
@@ -1086,6 +1092,7 @@ impl CacheReplayContext {
         Ok(())
     }
 
+    #[expect(clippy::too_many_lines)]
     fn record_query_fill_evidence(
         &mut self,
         entry: &EventStoreEntry,
@@ -1142,8 +1149,61 @@ impl CacheReplayContext {
         let mut evidence = decode_payload::<QueryFillEvidence>(entry)?;
         evidence.stream = entry.payload_type.as_str() == PAYLOAD_TYPE_ORDER_FILL_EVIDENCE;
         let report = &evidence.order_report;
-        if report.filled_qty.is_zero() {
-            return Ok(());
+        if report.parent_venue_order_id.is_some_and(|parent| {
+            self.query_fill_evidence.iter().any(|(_, previous)| {
+                previous.order_report.account_id == report.account_id
+                    && previous.order_report.instrument_id == report.instrument_id
+                    && previous.order_report.venue_order_id == report.venue_order_id
+                    && previous
+                        .order_report
+                        .parent_venue_order_id
+                        .is_some_and(|known| known != parent)
+            })
+        }) {
+            return Err(apply_error(
+                entry,
+                "Conflicting persisted parent venue identity",
+            ));
+        }
+
+        if !evidence.stream {
+            evidence.fresh_receipt = !self.query_fill_evidence.iter().any(|(_, previous)| {
+                !previous.stream
+                    && previous.order_report.ts_init >= report.ts_init
+                    && query_fill_evidence_matches(
+                        report,
+                        &evidence.fill_reports,
+                        &previous.order_report,
+                        &previous.fill_reports,
+                    )
+            });
+
+            if self.query_fill_evidence.iter().any(|(seq, previous)| {
+                !previous.stream
+                    && (previous.order_report.ts_init == report.ts_init
+                        || (*seq >= entry.seq && previous.order_report.ts_init > report.ts_init))
+                    && query_fill_evidence_matches(
+                        report,
+                        &evidence.fill_reports,
+                        &previous.order_report,
+                        &previous.fill_reports,
+                    )
+            }) {
+                return Ok(());
+            }
+            // Keep actual receipt/sequence witnesses. Incomparable obsolete receipts
+            // remain constraints but cannot become fresh-query proof after compaction.
+            self.query_fill_evidence.retain(|(seq, previous)| {
+                previous.stream
+                    || *seq >= entry.seq
+                    || previous.order_report.ts_init >= report.ts_init
+                    || !query_fill_evidence_matches(
+                        report,
+                        &evidence.fill_reports,
+                        &previous.order_report,
+                        &previous.fill_reports,
+                    )
+            });
         }
         // Exact retransmissions retain the original observation sequence. Distinct
         // temporal and identity constraints must each acquire native completion proof.
@@ -1159,8 +1219,8 @@ impl CacheReplayContext {
                         && previous.fill_reports == evidence.fill_reports;
 
                     same_capture
-                        || (evidence.stream == previous.stream
-                            && (evidence.stream || report.ts_init <= previous.order_report.ts_init)
+                        || (evidence.stream
+                            && previous.stream
                             && query_fill_evidence_matches(
                                 report,
                                 &evidence.fill_reports,
@@ -1252,6 +1312,7 @@ impl CacheReplayContext {
             .any(|(query_seq, evidence)| {
                 *query_seq > seq
                     && !evidence.stream
+                    && evidence.fresh_receipt
                     && matches(&evidence.order_report, &evidence.fill_reports)
                     && self.order_recovered_after(*query_seq, order, &|projection| {
                         query_fill_recovery_complete(
@@ -1371,7 +1432,9 @@ impl CacheReplayContext {
                 .query_fill_evidence
                 .iter()
                 .filter(|(query_seq, query)| {
-                    !query.stream && (!observed.requires_fresh_query || query_seq > seq)
+                    !query.stream
+                        && (!observed.requires_fresh_query
+                            || (query.fresh_receipt && query_seq > seq))
                 })
                 .map(|(_, query)| (query.order_report.clone(), query.fill_reports.clone()))
                 .collect();
@@ -1434,13 +1497,22 @@ impl CacheReplayContext {
                         .and_then(|id| cache.order(id))
                 });
 
-            let complete = order.is_some_and(|order| {
-                let recovered = |projection: &OrderAny| {
-                    evidence.recovery_complete(projection, &order, &self.query_fill_evidence)
-                };
+            let complete = if report.filled_qty.is_zero() {
+                // Retain zero observations even without a cached order. Once executions
+                // exist, a historical unfilled projection cannot erase their contradiction.
+                query_fill_history_complete(report, &evidence.fill_reports)
+                    && order.is_none_or(|order| {
+                        evidence.recovery_complete(&order, &order, &self.query_fill_evidence)
+                    })
+            } else {
+                order.is_some_and(|order| {
+                    let recovered = |projection: &OrderAny| {
+                        evidence.recovery_complete(projection, &order, &self.query_fill_evidence)
+                    };
 
-                self.order_recovered_after(*seq, &order, &recovered)
-            });
+                    self.order_recovered_after(*seq, &order, &recovered)
+                })
+            };
 
             Self::require_complete(
                 *seq,
@@ -2042,6 +2114,10 @@ struct OrderReplayIdentity {
     event_id: Option<UUID4>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Native replay dispatch keeps account state and history changes together"
+)]
 fn apply_cache_replay_entry_with_context(
     cache: &mut Cache,
     entry: &EventStoreEntry,
@@ -2067,7 +2143,11 @@ fn apply_cache_replay_entry_with_context(
     match entry.payload_type.as_str() {
         PAYLOAD_TYPE_ACCOUNT_STATE => {
             let state = decode_payload::<AccountState>(entry)?;
-            apply_result(entry, cache.update_account_state(&state))?;
+            let result = cache.update_account_state(&state);
+            if let Some(mut account) = cache.account_mut(&state.account_id) {
+                account.invalidate_event_history();
+            }
+            apply_result(entry, result)?;
         }
         PAYLOAD_TYPE_INSTRUMENT_CLOSE => {
             let close = decode_payload::<InstrumentClose>(entry)?;
@@ -4262,6 +4342,65 @@ mod tests {
         assert_eq!(report.applied_entries, 1);
         assert_eq!(report.ignored_entries, 0);
         assert_eq!(events, vec![restored, replayed]);
+        assert!(account.contiguous_events().0.is_empty());
+        assert!(account.contiguous_events().1.is_none());
+    }
+
+    #[rstest]
+    #[case::empty_cache(false)]
+    #[case::existing_account(true)]
+    fn replayed_accounts_do_not_establish_live_observation_history(#[case] existing: bool) {
+        let mut cache = Cache::default();
+        let mut state = cash_account_state();
+        state.ts_init = UnixNanos::from(100);
+        if existing {
+            cache.update_account_state(&state).unwrap();
+            assert_eq!(
+                cache
+                    .account_owned(&state.account_id)
+                    .unwrap()
+                    .contiguous_events()
+                    .0
+                    .len(),
+                1
+            );
+        }
+
+        for seq in 1..=3 {
+            state.ts_init = UnixNanos::from(100 + seq * 100);
+            let entry = append_account_state(seq, &state).entry;
+            assert!(apply_cache_replay_entry(&mut cache, &entry).unwrap());
+            let account = cache.account_owned(&state.account_id).unwrap();
+            assert_eq!(account.last_event(), Some(state.clone()));
+            assert!(account.contiguous_events().0.is_empty());
+            assert!(account.contiguous_events().1.is_none());
+        }
+        state.ts_init = UnixNanos::from(500);
+        cache.update_account_state(&state).unwrap();
+        assert!(
+            cache
+                .account_owned(&state.account_id)
+                .unwrap()
+                .contiguous_events()
+                .1
+                .is_none()
+        );
+    }
+
+    #[rstest]
+    fn failed_account_replay_also_invalidates_observation_history() {
+        let mut cache = Cache::default();
+        let mut initial = cash_account_state();
+        initial.ts_init = UnixNanos::from(100);
+        cache.update_account_state(&initial).unwrap();
+        let mut invalid = cash_account_state_million_usd("-10 USD", "0 USD", "-10 USD");
+        invalid.ts_init = UnixNanos::from(200);
+        let entry = append_account_state(1, &invalid).entry;
+        assert!(apply_cache_replay_entry(&mut cache, &entry).is_err());
+        let account = cache.account_owned(&initial.account_id).unwrap();
+        assert_eq!(account.last_event(), Some(initial));
+        assert!(account.contiguous_events().0.is_empty());
+        assert!(account.contiguous_events().1.is_none());
     }
 
     #[rstest]
@@ -5051,6 +5190,115 @@ mod tests {
     }
 
     #[rstest]
+    fn sealed_replay_preserves_zero_cumulative_observations(
+        #[values(false, true)] older_snapshot: bool,
+        #[values(false, true)] query_before_fill: bool,
+        #[values(false, true)] with_order: bool,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let initialized = OrderInitializedSpec::builder()
+            .instrument_id(instrument.id())
+            .quantity(Quantity::from("1000"))
+            .build();
+        let submitted = OrderSubmittedSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(initialized.client_order_id)
+            .build();
+        let accepted = OrderAcceptedSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(initialized.client_order_id)
+            .account_id(submitted.account_id)
+            .build();
+        let mut fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(initialized.client_order_id)
+            .account_id(submitted.account_id)
+            .venue_order_id(accepted.venue_order_id)
+            .position_id(PositionId::from("P-ZERO-BOUND"))
+            .last_qty(Quantity::from("400"))
+            .commission(Money::from("0.01 USD"))
+            .build();
+        fill.ts_event = UnixNanos::from(1000);
+        let report = OrderStatusReport::new(
+            fill.account_id,
+            fill.instrument_id,
+            Some(fill.client_order_id),
+            fill.venue_order_id,
+            Some(fill.order_side),
+            fill.order_type,
+            initialized.time_in_force,
+            OrderStatus::Accepted,
+            initialized.quantity,
+            Quantity::from("0"),
+            UnixNanos::default(),
+            UnixNanos::from(if older_snapshot { 500 } else { 2000 }),
+            UnixNanos::from(3000),
+            None,
+        );
+        let encoded = encode_execution_report(&ExecutionReport::OrderQueryWithFills(
+            Box::new(report),
+            Vec::new(),
+        ))
+        .unwrap();
+        let tmp = TempDir::new().unwrap();
+        {
+            let mut backend = RedbBackend::new(tmp.path().to_path_buf());
+            backend.open_run(manifest("zero-cumulative")).unwrap();
+            let entries = if with_order {
+                let mut entries = vec![
+                    append_order_event(1, &OrderEventAny::Initialized(initialized)),
+                    append_order_event(2, &OrderEventAny::Submitted(submitted)),
+                    append_order_event(3, &OrderEventAny::Accepted(accepted)),
+                ];
+
+                if query_before_fill {
+                    entries.push(append_payload(
+                        4,
+                        PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
+                        encoded.payload,
+                    ));
+                    entries.push(append_order_event(5, &OrderEventAny::Filled(fill)));
+                } else {
+                    entries.push(append_order_event(4, &OrderEventAny::Filled(fill)));
+                    entries.push(append_payload(
+                        5,
+                        PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
+                        encoded.payload,
+                    ));
+                }
+                entries
+            } else {
+                vec![append_payload(
+                    1,
+                    PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
+                    encoded.payload,
+                )]
+            };
+            backend.append_batch(&entries).unwrap();
+            backend.seal(RunStatus::Ended).unwrap();
+        }
+        let mut cache = Cache::default();
+        cache.add_instrument(instrument).unwrap();
+        let result = restore_cache_from_sealed_run(
+            &mut cache,
+            tmp.path().to_path_buf(),
+            "trader-001",
+            "zero-cumulative",
+        );
+
+        if !with_order || older_snapshot {
+            result.unwrap();
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Unresolved persisted order fill recovery")
+            );
+        }
+    }
+
+    #[rstest]
     #[case::complete_follow_up(true, true, false, false)]
     #[case::incomplete_follow_up(false, true, false, false)]
     #[case::stream_after_resolved_query(true, false, false, false)]
@@ -5062,6 +5310,8 @@ mod tests {
         #[case] late_initial_query: bool,
         #[case] repeat_initial_query: bool,
         #[values(false, true)] conflicting_position: bool,
+        #[values(false, true)] strictly_earlier: bool,
+        #[values(false, true)] newer_initial_query: bool,
     ) {
         let instrument = InstrumentAny::CurrencyPair(audusd_sim());
         let initialized = OrderInitializedSpec::builder()
@@ -5131,6 +5381,9 @@ mod tests {
             None,
         );
         initial_report.venue_position_id = first.position_id;
+        if strictly_earlier {
+            initial_report.ts_last = UnixNanos::from(first.ts_event.as_u64() + 1);
+        }
         let mut final_report = initial_report.clone();
         final_report.order_status = OrderStatus::Filled;
         final_report.filled_qty = initialized.quantity;
@@ -5139,14 +5392,14 @@ mod tests {
             fills[0].venue_position_id = Some(PositionId::from("P-CONTRADICTORY"));
         }
         let first_query = encode_execution_report(&ExecutionReport::OrderQueryWithFills(
-            Box::new(initial_report),
+            Box::new(initial_report.clone()),
             vec![fills[0].clone()],
         ))
         .unwrap();
         let final_query = encode_execution_report(&ExecutionReport::OrderQueryWithFills(
             Box::new(final_report),
             if complete {
-                fills
+                fills.clone()
             } else {
                 vec![fills[1].clone()]
             },
@@ -5188,10 +5441,21 @@ mod tests {
             }
 
             if repeat_initial_query {
+                let payload = if newer_initial_query {
+                    initial_report.ts_init = UnixNanos::from(initial_report.ts_init.as_u64() + 1);
+                    encode_execution_report(&ExecutionReport::OrderQueryWithFills(
+                        Box::new(initial_report),
+                        vec![fills[0].clone()],
+                    ))
+                    .unwrap()
+                    .payload
+                } else {
+                    first_query.payload
+                };
                 entries.push(append_payload(
                     8,
                     PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
-                    first_query.payload,
+                    payload,
                 ));
             }
             backend.append_batch(&entries).unwrap();
@@ -5206,7 +5470,19 @@ mod tests {
             "shared-fill-time",
         );
 
-        if complete && !late_initial_query && !conflicting_position {
+        if !complete
+            || late_initial_query
+            || conflicting_position
+            || strictly_earlier
+            || (repeat_initial_query && newer_initial_query)
+        {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Unresolved persisted order fill recovery")
+            );
+        } else {
             let restored = result.unwrap();
             assert_eq!(restored.cache.applied_entries, 5);
             let position = cache
@@ -5214,13 +5490,6 @@ mod tests {
                 .unwrap();
             assert_eq!(position.quantity, Quantity::from("1000"));
             assert_eq!(position.commissions(), vec![Money::from("0.03 USD")]);
-        } else {
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("Unresolved persisted order fill recovery")
-            );
         }
     }
 
@@ -5415,7 +5684,15 @@ mod tests {
 
     #[rstest]
     fn execution_observation_replay_budget_matches_live(
-        #[values("query", "stream", "standalone", "requires_query")] source: &str,
+        #[values(
+            "query",
+            "stream",
+            "query_zero",
+            "stream_zero",
+            "standalone",
+            "requires_query"
+        )]
+        source: &str,
         #[values(false, true)] same_snapshot: bool,
     ) {
         use nautilus_model::enums::{LiquiditySide, OrderType, TimeInForce};
@@ -5437,8 +5714,10 @@ mod tests {
             None,
         );
         let mut context = CacheReplayContext::default();
-        let bundled = matches!(source, "query" | "stream");
-        let capacity = MAX_ORDER_FILL_OBSERVATIONS / if bundled { 2 } else { 1 };
+        let zero = matches!(source, "query_zero" | "stream_zero");
+        let bundled = zero || matches!(source, "query" | "stream");
+        let compacted = same_snapshot && bundled;
+        let capacity = MAX_ORDER_FILL_OBSERVATIONS / if bundled && !zero { 2 } else { 1 };
         for index in 0..=capacity {
             fill.ts_init = UnixNanos::from(10 + index as u64);
             if source == "standalone" {
@@ -5453,19 +5732,28 @@ mod tests {
                     Some(fill.order_side),
                     OrderType::Limit,
                     TimeInForce::Gtc,
-                    OrderStatus::Filled,
+                    if zero {
+                        OrderStatus::Accepted
+                    } else {
+                        OrderStatus::Filled
+                    },
                     fill.last_qty,
-                    fill.last_qty,
+                    if zero {
+                        Quantity::from("0.0")
+                    } else {
+                        fill.last_qty
+                    },
                     UnixNanos::default(),
                     UnixNanos::from(if same_snapshot { 10 } else { 10 + index as u64 }),
                     fill.ts_init,
                     None,
                 );
 
-                if source == "stream" {
-                    ExecutionReport::OrderFillEvidence(Box::new(report), vec![fill.clone()])
+                let fills = if zero { Vec::new() } else { vec![fill.clone()] };
+                if matches!(source, "stream" | "stream_zero") {
+                    ExecutionReport::OrderFillEvidence(Box::new(report), fills)
                 } else {
-                    ExecutionReport::OrderQueryWithFills(Box::new(report), vec![fill.clone()])
+                    ExecutionReport::OrderQueryWithFills(Box::new(report), fills)
                 }
             } else if source == "requires_query" {
                 ExecutionReport::FillQueryRequired(Box::new(fill.clone()))
@@ -5487,7 +5775,7 @@ mod tests {
             }
             let result = context.record_query_fill_evidence(&entry.entry);
 
-            if index == capacity && !(source == "stream" && same_snapshot) {
+            if index == capacity && !compacted {
                 assert!(
                     result
                         .unwrap_err()
@@ -5506,12 +5794,346 @@ mod tests {
             } else {
                 context.standalone_fill_evidence.len()
             },
-            if source == "stream" && same_snapshot {
-                1
-            } else {
-                capacity
-            }
+            if compacted { 1 } else { capacity }
         );
+    }
+
+    #[rstest]
+    fn sealed_replay_preserves_parent_to_child_venue_proof(
+        #[values("valid", "wrong_parent", "zero_child", "conflicting_parent")] case: &str,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let initialized = OrderInitializedSpec::builder()
+            .instrument_id(instrument.id())
+            .quantity(Quantity::from("1000"))
+            .build();
+        let cid = initialized.client_order_id;
+        let parent = VenueOrderId::from("PARENT");
+        let child = VenueOrderId::from("CHILD");
+        let submitted = OrderSubmittedSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(cid)
+            .build();
+        let accepted = OrderAcceptedSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(cid)
+            .account_id(submitted.account_id)
+            .venue_order_id(parent)
+            .build();
+        let parent_report = OrderStatusReport::new(
+            submitted.account_id,
+            instrument.id(),
+            Some(cid),
+            parent,
+            Some(initialized.order_side),
+            initialized.order_type,
+            initialized.time_in_force,
+            OrderStatus::Accepted,
+            initialized.quantity,
+            Quantity::from("0"),
+            1.into(),
+            100.into(),
+            110.into(),
+            None,
+        );
+        let mut child_report = parent_report.clone();
+        child_report.venue_order_id = child;
+        child_report.parent_venue_order_id = Some(parent);
+        child_report.order_status = OrderStatus::Filled;
+        child_report.filled_qty = initialized.quantity;
+        child_report.ts_last = 200.into();
+        child_report.ts_init = 210.into();
+        let events = [
+            OrderEventAny::Initialized(initialized.clone()),
+            OrderEventAny::Submitted(submitted),
+            OrderEventAny::Accepted(accepted),
+        ];
+        let mut order = OrderAny::try_from(initialized).unwrap();
+        for event in &events[1..] {
+            order.apply(event.clone()).unwrap();
+        }
+        let updates =
+            nautilus_execution::reconciliation::generate_reconciliation_order_pre_fill_events(
+                &order,
+                &child_report,
+                210.into(),
+            );
+        assert!(
+            matches!(updates.as_slice(), [OrderEventAny::Updated(update)] if update.venue_order_id == Some(child))
+        );
+        let filled = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(cid)
+            .account_id(parent_report.account_id)
+            .venue_order_id(child)
+            .position_id(PositionId::from("P-CHILD"))
+            .last_qty(child_report.filled_qty)
+            .commission(Money::from("0.01 USD"))
+            .ts_event(200.into())
+            .build();
+        child_report.venue_position_id = filled.position_id;
+        let fill = FillReport::new(
+            filled.account_id,
+            filled.instrument_id,
+            child,
+            filled.trade_id,
+            filled.order_side,
+            filled.last_qty,
+            filled.last_px,
+            filled.commission.unwrap(),
+            filled.liquidity_side,
+            Some(cid),
+            filled.position_id,
+            filled.ts_event,
+            210.into(),
+            None,
+        );
+        let mut entries: Vec<_> = events
+            .iter()
+            .enumerate()
+            .map(|(i, event)| append_order_event(i as u64 + 1, event))
+            .collect();
+        let encoded = encode_execution_report(&ExecutionReport::OrderQueryWithFills(
+            Box::new(parent_report),
+            Vec::new(),
+        ))
+        .unwrap();
+        entries.push(append_payload(
+            4,
+            PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
+            encoded.payload,
+        ));
+        entries.push(append_order_event(5, &updates[0]));
+        entries.push(append_order_event(6, &OrderEventAny::Filled(filled)));
+
+        if case == "conflicting_parent" {
+            let encoded = encode_execution_report(&ExecutionReport::OrderQueryWithFills(
+                Box::new(child_report.clone()),
+                vec![fill.clone()],
+            ))
+            .unwrap();
+            entries.push(append_payload(
+                entries.len() as u64 + 1,
+                PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
+                encoded.payload,
+            ));
+            child_report.parent_venue_order_id = Some(VenueOrderId::from("WRONG"));
+        }
+
+        if case == "wrong_parent" {
+            child_report.parent_venue_order_id = Some(VenueOrderId::from("WRONG"));
+        }
+
+        if case == "zero_child" {
+            let mut zero = child_report.clone();
+            zero.order_status = OrderStatus::Accepted;
+            zero.filled_qty = Quantity::from("0");
+            let encoded = encode_execution_report(&ExecutionReport::OrderQueryWithFills(
+                Box::new(zero),
+                Vec::new(),
+            ))
+            .unwrap();
+            entries.push(append_payload(
+                entries.len() as u64 + 1,
+                PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
+                encoded.payload,
+            ));
+        }
+        let encoded = encode_execution_report(&ExecutionReport::OrderQueryWithFills(
+            Box::new(child_report),
+            vec![fill],
+        ))
+        .unwrap();
+        entries.push(append_payload(
+            entries.len() as u64 + 1,
+            PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
+            encoded.payload,
+        ));
+        let tmp = TempDir::new().unwrap();
+        {
+            let mut backend = RedbBackend::new(tmp.path().to_path_buf());
+            backend.open_run(manifest("parent-child-proof")).unwrap();
+            backend.append_batch(&entries).unwrap();
+            backend.seal(RunStatus::Ended).unwrap();
+        }
+        let mut cache = Cache::default();
+        cache.add_instrument(instrument).unwrap();
+        let result = restore_cache_from_sealed_run(
+            &mut cache,
+            tmp.path().to_path_buf(),
+            "trader-001",
+            "parent-child-proof",
+        );
+
+        if case == "valid" {
+            result.unwrap();
+            let order = cache.order_owned(&cid).unwrap();
+            assert_eq!(order.venue_order_id(), Some(child));
+            assert!(order.venue_order_ids().contains(&&parent));
+            assert_eq!(order.filled_qty(), Quantity::from("1000"));
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains(if case == "conflicting_parent" {
+                        "Conflicting persisted parent venue identity"
+                    } else {
+                        "Unresolved persisted order fill recovery"
+                    })
+            );
+        }
+    }
+
+    #[rstest]
+    fn zero_query_compaction_preserves_fee_receipt_order(
+        #[values(false, true)] compact_before_fee: bool,
+        #[values(false, true)] fresh_after_fee: bool,
+        #[values(false, true)] final_fresh_query: bool,
+    ) {
+        use nautilus_common::messages::execution::{
+            CommissionBasis, CumulativeCommissionConstraint, OrderFeeOrigin,
+        };
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let initialized = OrderInitializedSpec::builder()
+            .instrument_id(instrument.id())
+            .build();
+        let cid = initialized.client_order_id;
+        let submitted = OrderSubmittedSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(cid)
+            .build();
+        let accepted = OrderAcceptedSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(cid)
+            .account_id(submitted.account_id)
+            .build();
+        let mut report = OrderStatusReport::new(
+            submitted.account_id,
+            instrument.id(),
+            Some(cid),
+            accepted.venue_order_id,
+            Some(initialized.order_side),
+            initialized.order_type,
+            initialized.time_in_force,
+            OrderStatus::Accepted,
+            initialized.quantity,
+            Quantity::from("0"),
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+            UnixNanos::from(10),
+            None,
+        );
+        let mut entries = vec![
+            append_order_event(1, &OrderEventAny::Initialized(initialized)),
+            append_order_event(2, &OrderEventAny::Submitted(submitted)),
+            append_order_event(3, &OrderEventAny::Accepted(accepted)),
+        ];
+        let fee = OrderFeeEvidence {
+            account_id: report.account_id,
+            instrument_id: report.instrument_id,
+            venue_order_id: report.venue_order_id,
+            client_order_id: Some(cid),
+            venue_position_id: None,
+            order_side: report.order_side.unwrap(),
+            boundary_quantity: Some("0".parse().unwrap()),
+            boundary_time: Some(report.ts_last),
+            anchor_trade_id: None,
+            anchor_trade_time: None,
+            origin: OrderFeeOrigin::Stream,
+            constraints: vec![CumulativeCommissionConstraint {
+                basis: Some(CommissionBasis::ChargesOnly),
+                amount: None,
+                currency: Some(Currency::USD()),
+            }],
+            unrepresentable_values: false,
+            requires_fresh_query: true,
+            ts_init: UnixNanos::from(5),
+        };
+        let mut observations = vec![ExecutionReport::OrderQueryWithFills(
+            Box::new(report.clone()),
+            Vec::new(),
+        )];
+
+        if compact_before_fee {
+            report.ts_init = UnixNanos::from(30);
+            observations.push(ExecutionReport::OrderQueryWithFills(
+                Box::new(report.clone()),
+                Vec::new(),
+            ));
+        }
+        observations.push(ExecutionReport::OrderFeeEvidence(Box::new(fee)));
+        report.ts_init = UnixNanos::from(if fresh_after_fee { 40 } else { 10 });
+        observations.push(ExecutionReport::OrderQueryWithFills(
+            Box::new(report.clone()),
+            Vec::new(),
+        ));
+
+        if final_fresh_query {
+            report.ts_init = UnixNanos::from(50);
+            observations.push(ExecutionReport::OrderQueryWithFills(
+                Box::new(report),
+                Vec::new(),
+            ));
+        }
+
+        for observation in observations {
+            let encoded = encode_execution_report(&observation).unwrap();
+            entries.push(append_payload(
+                entries.len() as u64 + 1,
+                encoded.payload_type.unwrap().as_str(),
+                encoded.payload,
+            ));
+        }
+        let mut context = CacheReplayContext::default();
+        for entry in &entries {
+            context.record_order_fee_evidence(&entry.entry).unwrap();
+            context.record_query_fill_evidence(&entry.entry).unwrap();
+        }
+        let receipts: Vec<_> = context
+            .query_fill_evidence
+            .iter()
+            .map(|(seq, query)| (*seq, query.order_report.ts_init, query.fresh_receipt))
+            .collect();
+
+        for entry in &entries {
+            context.record_order_fee_evidence(&entry.entry).unwrap();
+            context.record_query_fill_evidence(&entry.entry).unwrap();
+        }
+        assert_eq!(
+            receipts,
+            context
+                .query_fill_evidence
+                .iter()
+                .map(|(seq, query)| (*seq, query.order_report.ts_init, query.fresh_receipt))
+                .collect::<Vec<_>>()
+        );
+        let tmp = TempDir::new().unwrap();
+        {
+            let mut backend = RedbBackend::new(tmp.path().to_path_buf());
+            backend.open_run(manifest("zero-fee-receipts")).unwrap();
+            backend.append_batch(&entries).unwrap();
+            backend.seal(RunStatus::Ended).unwrap();
+        }
+        let mut cache = Cache::default();
+        cache.add_instrument(instrument).unwrap();
+        let result = restore_cache_from_sealed_run(
+            &mut cache,
+            tmp.path().to_path_buf(),
+            "trader-001",
+            "zero-fee-receipts",
+        );
+
+        if fresh_after_fee || final_fresh_query {
+            result.unwrap();
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Unresolved persisted cumulative commission recovery")
+            );
+        }
     }
 
     #[rstest]

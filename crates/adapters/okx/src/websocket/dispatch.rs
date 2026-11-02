@@ -42,8 +42,8 @@ use nautilus_live::{
 use nautilus_model::{
     enums::{AccountType, OrderStatus, OrderType},
     events::{
-        OrderAccepted, OrderCanceled, OrderEventAny, OrderFilled, OrderRejected, OrderTriggered,
-        OrderUpdated,
+        AccountState, OrderAccepted, OrderCanceled, OrderEventAny, OrderFilled, OrderRejected,
+        OrderTriggered, OrderUpdated,
     },
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId, VenueOrderId,
@@ -235,6 +235,28 @@ impl Default for WsDispatchState {
 }
 
 impl WsDispatchState {
+    pub(crate) fn invalidate_account_observation(
+        &self,
+        emitter: &ExecutionEventEmitter,
+        account_id: AccountId,
+        account_type: AccountType,
+        ts_init: UnixNanos,
+    ) {
+        // An unreported empty event records the gap without changing venue balances or margins
+        let event = AccountState::new(
+            account_id,
+            account_type,
+            vec![],
+            vec![],
+            false,
+            UUID4::new(),
+            ts_init,
+            ts_init,
+            None,
+        );
+        emitter.send_account_state(event);
+    }
+
     // Creates a dispatch state sharing the pending operation maps
     // with the WebSocket client that populates them
     pub(crate) fn with_pending_maps(
@@ -597,6 +619,15 @@ pub fn dispatch_ws_message(
 
             match serde_json::from_value::<Vec<OKXAccount>>(data) {
                 Ok(accounts) => {
+                    if accounts.is_empty() {
+                        state.invalidate_account_observation(
+                            emitter,
+                            account_id,
+                            account_type,
+                            ts_init,
+                        );
+                    }
+
                     for account in &accounts {
                         match crate::common::parse::parse_account_state_with_source(
                             account,
@@ -607,11 +638,27 @@ pub fn dispatch_ws_message(
                             None,
                         ) {
                             Ok(account_state) => emitter.send_account_state(account_state),
-                            Err(e) => log::error!("Failed to parse account state: {e}"),
+                            Err(e) => {
+                                log::error!("Failed to parse account state: {e}");
+                                state.invalidate_account_observation(
+                                    emitter,
+                                    account_id,
+                                    account_type,
+                                    ts_init,
+                                );
+                            }
                         }
                     }
                 }
-                Err(e) => log::error!("Failed to deserialize account data: {e}"),
+                Err(e) => {
+                    log::error!("Failed to deserialize account data: {e}");
+                    state.invalidate_account_observation(
+                        emitter,
+                        account_id,
+                        account_type,
+                        ts_init,
+                    );
+                }
             }
         }
         OKXWsMessage::Positions(data) => {
@@ -854,6 +901,15 @@ pub fn dispatch_ws_message(
                 "OKX rejected {channel:?} subscription for {inst_id:?} \
                  (code={code}, msg={msg}); execution updates for it will not flow"
             );
+
+            if channel == super::enums::OKXWsChannel::Account {
+                state.invalidate_account_observation(
+                    emitter,
+                    account_id,
+                    account_type,
+                    clock.get_time_ns(),
+                );
+            }
         }
         OKXWsMessage::LiquidationWarnings(warnings) => {
             for warning in warnings {
@@ -873,8 +929,21 @@ pub fn dispatch_ws_message(
         | OKXWsMessage::Instruments(_) => {
             log::debug!("Ignoring data message on execution client");
         }
-        OKXWsMessage::Error(_) => {}
+        OKXWsMessage::Error(_) => {
+            state.invalidate_account_observation(
+                emitter,
+                account_id,
+                account_type,
+                clock.get_time_ns(),
+            );
+        }
         OKXWsMessage::Reconnected => {
+            state.invalidate_account_observation(
+                emitter,
+                account_id,
+                account_type,
+                clock.get_time_ns(),
+            );
             log::info!("Websocket reconnected");
         }
         OKXWsMessage::Authenticated => {
@@ -2436,7 +2505,7 @@ fn dispatch_order_msg_as_report(
                 ExecutionReport::Fill(fill) => Some(fill.clone()),
                 _ => None,
             };
-            let status_obligation = matches!(&report, ExecutionReport::Order(report) if report.filled_qty.is_positive());
+            let status_obligation = matches!(&report, ExecutionReport::Order(_));
             let needs_status = status_obligation
                 || msg.trade_id.is_empty()
                 || !state.contains_trade(&TradeId::new(&msg.trade_id));
@@ -2668,10 +2737,7 @@ fn dispatch_order_fill_obligation(
     }
 
     match parse_order_status_report(msg, instrument, emitter.account_id(), ts_init) {
-        Ok(mut report)
-            if report.filled_qty.is_positive()
-                || (client_order_id.is_some() && report.order_status.is_closed()) =>
-        {
+        Ok(mut report) => {
             report.client_order_id = client_order_id.or(report.client_order_id);
             // Publish cumulative evidence first so the native manager can check the
             // committed cache before admitting the accompanying individual execution.
@@ -2681,7 +2747,6 @@ fn dispatch_order_fill_obligation(
             ));
             Some(report)
         }
-        Ok(_) => None,
         Err(e) => {
             log::error!(
                 "Cannot parse cumulative fill obligation for {}: {e}",
@@ -2783,11 +2848,8 @@ fn dispatch_terminal_order_fill_as_report(
                 update_fee_fill_caches(msg, instrument, fee_cache, filled_qty_cache);
             }
         }
-        Ok(ExecutionReport::Order(report)) => {
-            if report.filled_qty.is_positive()
-                && !duplicate
-                && let Some(instrument) = instruments.get(&msg.inst_id)
-            {
+        Ok(ExecutionReport::Order(_)) => {
+            if !duplicate && let Some(instrument) = instruments.get(&msg.inst_id) {
                 dispatch_order_fill_obligation(
                     msg,
                     Some(client_order_id),
@@ -3677,11 +3739,37 @@ mod tests {
             );
 
             if !amended {
-                assert!(drain_execution_events(&mut rx).is_empty());
+                let observations = drain_execution_events(&mut rx);
+                if spread {
+                    assert!(observations.is_empty());
+                } else {
+                    assert!(
+                        matches!(observations.as_slice(), [ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))]
+                        if report.filled_qty.is_zero() && fills.is_empty())
+                    );
+                }
             }
         }
 
-        let events = drain_execution_events(&mut rx);
+        let mut events = drain_execution_events(&mut rx);
+
+        if !spread {
+            let mut observations = 0;
+            events.retain(|event| {
+                if let ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(
+                    report,
+                    fills,
+                )) = event
+                {
+                    assert!(report.filled_qty.is_zero() && fills.is_empty());
+                    observations += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            assert_eq!(observations, 2);
+        }
 
         let [ExecutionEvent::Order(OrderEventAny::Updated(updated))] = events.as_slice() else {
             panic!("expected exactly one imported update, was {events:?}");
@@ -4090,6 +4178,302 @@ mod tests {
         } else {
             assert_duplicate_fill_evidence(&duplicate);
         }
+    }
+
+    #[rstest]
+    #[case("deserialize")]
+    #[case("duplicate")]
+    #[case("overflow")]
+    #[case("account_overflow")]
+    #[case("empty")]
+    #[case("error")]
+    #[case("subscription")]
+    #[case("reconnect")]
+    #[case("disconnect")]
+    #[case("intentional_close")]
+    #[case("negative")]
+    #[tokio::test]
+    async fn account_evidence_gaps_reach_native_cache_without_changing_balances(
+        #[case] gap: &str,
+        #[values(AccountType::Cash, AccountType::Margin)] account_type: AccountType,
+    ) {
+        use nautilus_common::cache::Cache;
+        use nautilus_model::{
+            accounts::AccountAny,
+            types::{MarginBalance, Money},
+        };
+        use nautilus_network::websocket::TransportBackend;
+
+        use crate::common::{
+            account::{OKXAccountUpdate, reported_account_currency_balance_after},
+            parse::parse_account_state_with_source,
+        };
+        let clock = get_atomic_clock_realtime();
+        let id = AccountId::from("OKX-001");
+        let mut payload: serde_json::Value = serde_json::from_str(include_str!(
+            "../../test_data/http_get_account_balance.json"
+        ))
+        .unwrap();
+        let raw = &mut payload["data"][0];
+        let mut detail = raw["details"][0].clone();
+        detail["ccy"] = serde_json::json!("ETH");
+        detail["cashBal"] = serde_json::json!("10");
+        detail["availBal"] = serde_json::json!("10");
+        detail["uTime"] = serde_json::json!("1");
+        raw["details"] = serde_json::json!([detail]);
+        raw["uTime"] = serde_json::json!("1");
+        raw["imr"] = serde_json::json!("");
+        raw["mmr"] = serde_json::json!("");
+        let source: OKXAccount = serde_json::from_value(raw.clone()).unwrap();
+        let boundary = clock.get_time_ns();
+        let anchor = parse_account_state_with_source(
+            &source,
+            id,
+            account_type,
+            boundary,
+            OKXAccountUpdate::WebSocketUpdate,
+            None,
+        )
+        .unwrap();
+        let mut cache = Cache::default();
+        cache.update_account_state(&anchor).unwrap();
+        let started = clock.get_time_ns();
+        let rest = parse_account_state_with_source(
+            &source,
+            id,
+            account_type,
+            clock.get_time_ns(),
+            OKXAccountUpdate::Rest,
+            Some(started),
+        )
+        .unwrap();
+        cache.update_account_state(&rest).unwrap();
+        assert!(
+            reported_account_currency_balance_after(
+                &cache.account_owned(&id).unwrap(),
+                Currency::ETH(),
+                boundary
+            )
+            .unwrap()
+            .is_some()
+        );
+        let instrument_id = InstrumentId::from("ETH-USDT.OKX");
+        let margin = MarginBalance::new(
+            Money::from("1 ETH"),
+            Money::from("0.5 ETH"),
+            Some(instrument_id),
+        );
+        {
+            let mut account = cache.account_mut(&id).unwrap();
+            match &mut *account {
+                AccountAny::Cash(account) => {
+                    account
+                        .balances_locked
+                        .insert((instrument_id, Currency::ETH()), Money::from("1 ETH"));
+                    account.recalculate_balance(Currency::ETH());
+                }
+                AccountAny::Margin(account) => account.update_margin(margin),
+                _ => unreachable!(),
+            }
+        }
+        let balances = cache.account_owned(&id).unwrap().balances();
+        let mut data = serde_json::json!([raw.clone()]);
+        let message = match gap {
+            "disconnect" | "intentional_close" => {
+                use futures_util::StreamExt;
+
+                use crate::websocket::client::OKXWebSocketClient;
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let (drop_tx, drop_rx) = tokio::sync::oneshot::channel();
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+                let peer = tokio::spawn(async move {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+                    drop(listener); // No reconnect can succeed after this peer is lost.
+                    ready_tx.send(()).unwrap();
+                    tokio::select! {
+                        _ = drop_rx => {},
+                        _ = socket.next() => {},
+                    }
+                    let _ = socket.close(None).await;
+                });
+                let mut client = OKXWebSocketClient::new(
+                    Some(format!("ws://{address}")),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(30),
+                    None,
+                    TransportBackend::default(),
+                    None,
+                )
+                .unwrap();
+                client.connect().await.unwrap();
+                ready_rx.await.unwrap();
+                let stream = client.stream();
+                futures_util::pin_mut!(stream);
+
+                if gap == "intentional_close" {
+                    client.close().await.unwrap();
+                    peer.await.unwrap();
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(100), stream.next())
+                            .await
+                            .map_or(true, |message| message.is_none())
+                    );
+                    assert!(
+                        reported_account_currency_balance_after(
+                            &cache.account_owned(&id).unwrap(),
+                            Currency::ETH(),
+                            boundary
+                        )
+                        .unwrap()
+                        .is_some()
+                    );
+                    return;
+                }
+                drop_tx.send(()).unwrap();
+                peer.await.unwrap();
+                let message = tokio::time::timeout(Duration::from_secs(3), stream.next())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(&message, OKXWsMessage::Error(error)
+                    if error.message == "WebSocket transport disconnected unexpectedly"));
+                assert!(!client.is_active());
+                client.close().await.unwrap();
+                message
+            }
+            "error" => OKXWsMessage::Error(crate::websocket::messages::OKXWebSocketError {
+                code: String::new(),
+                message: "Unreadable account observation".into(),
+                conn_id: None,
+                timestamp: clock.get_time_ns().as_u64(),
+            }),
+            "subscription" => OKXWsMessage::SubscriptionFailed {
+                channel: super::super::enums::OKXWsChannel::Account,
+                inst_id: None,
+                code: "60012".into(),
+                msg: "Rejected account subscription".into(),
+            },
+            "reconnect" => OKXWsMessage::Reconnected,
+            _ => {
+                match gap {
+                    "deserialize" => data[0]["details"][0]["uTime"] = serde_json::json!("bad"),
+                    "duplicate" => {
+                        let mut duplicate = data[0]["details"][0].clone();
+                        duplicate["cashBal"] = serde_json::json!("bad");
+                        data[0]["details"].as_array_mut().unwrap().push(duplicate);
+                    }
+                    "overflow" => {
+                        data[0]["details"][0]["uTime"] = serde_json::json!(u64::MAX.to_string());
+                    }
+                    "account_overflow" => {
+                        data[0]["uTime"] = serde_json::json!(u64::MAX.to_string());
+                    }
+                    "negative" => {
+                        data[0]["details"][0]["cashBal"] = serde_json::json!("-10");
+                        data[0]["details"][0]["availBal"] = serde_json::json!("-10");
+                    }
+                    "empty" => data = serde_json::json!([]),
+                    _ => unreachable!(),
+                }
+                OKXWsMessage::Account {
+                    data,
+                    update: OKXAccountUpdate::WebSocketUpdate,
+                }
+            }
+        };
+        let (emitter, mut receiver) = test_execution_emitter();
+        dispatch_ws_message(
+            message,
+            &emitter,
+            &WsDispatchState::default(),
+            id,
+            account_type,
+            &AtomicMap::new(),
+            &mut FeeCache::new(),
+            &mut FilledQtyCache::new(),
+            &mut AHashMap::new(),
+            clock,
+        );
+        let events = drain_execution_events(&mut receiver);
+        assert_eq!(events.len(), 1);
+        let ExecutionEvent::Account(barrier) = &events[0] else {
+            panic!("Expected account invalidation");
+        };
+
+        if gap == "negative" && account_type == AccountType::Margin {
+            assert!(barrier.is_reported);
+            assert!(barrier.balances[0].total.is_negative());
+            cache.update_account_state(barrier).unwrap();
+            assert!(
+                reported_account_currency_balance_after(
+                    &cache.account_owned(&id).unwrap(),
+                    Currency::ETH(),
+                    boundary
+                )
+                .unwrap()
+                .is_none()
+            );
+            return;
+        }
+        assert!(!barrier.is_reported);
+        assert!(barrier.balances.is_empty());
+        assert!(barrier.margins.is_empty());
+        cache.update_account_state(barrier).unwrap();
+        let account = cache.account_owned(&id).unwrap();
+        assert_eq!(account.last_event().as_ref(), Some(barrier));
+        assert_eq!(account.balances(), balances);
+        match account {
+            AccountAny::Cash(account) => assert_eq!(
+                account.balances_locked[&(instrument_id, Currency::ETH())],
+                Money::from("1 ETH")
+            ),
+            AccountAny::Margin(account) => assert_eq!(account.margins[&instrument_id], margin),
+            _ => unreachable!(),
+        }
+        let unchanged = parse_account_state_with_source(
+            &source,
+            id,
+            account_type,
+            clock.get_time_ns(),
+            OKXAccountUpdate::WebSocketUpdate,
+            None,
+        )
+        .unwrap();
+        cache.update_account_state(&unchanged).unwrap();
+        assert!(
+            reported_account_currency_balance_after(
+                &cache.account_owned(&id).unwrap(),
+                Currency::ETH(),
+                boundary
+            )
+            .is_err()
+        );
+        let started = clock.get_time_ns();
+        let rest = parse_account_state_with_source(
+            &source,
+            id,
+            account_type,
+            clock.get_time_ns(),
+            OKXAccountUpdate::Rest,
+            Some(started),
+        )
+        .unwrap();
+        cache.update_account_state(&rest).unwrap();
+        assert!(
+            reported_account_currency_balance_after(
+                &cache.account_owned(&id).unwrap(),
+                Currency::ETH(),
+                boundary
+            )
+            .unwrap()
+            .is_some()
+        );
     }
 
     #[rstest]
@@ -4577,6 +4961,11 @@ mod tests {
         ));
 
         dispatch_test_message(OKXWsMessage::Reconnected, &emitter, &state, &instruments);
+        let reconnect = drain_execution_events(&mut receiver);
+        assert!(
+            matches!(reconnect.as_slice(), [ExecutionEvent::Account(event)]
+            if !event.is_reported && event.balances.is_empty() && event.margins.is_empty())
+        );
         dispatch_test_message(
             OKXWsMessage::Orders(vec![child]),
             &emitter,
@@ -4840,7 +5229,11 @@ mod tests {
         );
 
         let events = drain_execution_events(&mut receiver);
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
+        assert!(
+            matches!(&events[1], ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
+            if report.filled_qty.is_zero() && fills.is_empty())
+        );
         assert!(matches!(
             &events[0],
             ExecutionEvent::Order(OrderEventAny::Updated(updated))
@@ -5047,6 +5440,11 @@ mod tests {
         stale_live.state = OKXAlgoOrderStatus::Live;
         stale_live.ord_id.clear();
         dispatch_test_message(OKXWsMessage::Reconnected, &emitter, &state, &instruments);
+        let reconnect = drain_execution_events(&mut receiver);
+        assert!(
+            matches!(reconnect.as_slice(), [ExecutionEvent::Account(event)]
+            if !event.is_reported && event.balances.is_empty() && event.margins.is_empty())
+        );
         dispatch_test_message(
             OKXWsMessage::AlgoOrders(vec![message, stale_live]),
             &emitter,

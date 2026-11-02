@@ -76,9 +76,10 @@ pub use orders::{
     generate_reconciliation_order_snapshot_events_with_commission,
     incomplete_fill_stream_recovery_complete, incremental_inferred_fill_price_and_liquidity,
     inferred_fill_price_and_liquidity, order_fill_evidence_matches, query_fill_evidence_matches,
-    query_fill_history_complete, query_fill_recovery_complete, query_fills_match_cached_history,
-    reconcile_fill_report, reconcile_order_report, reconcile_order_report_with_commission,
-    should_reconciliation_update, stream_fill_recovery_complete,
+    query_fill_history_complete, query_fill_recovery_complete,
+    query_fill_witness_preserves_history, query_fills_match_cached_history, reconcile_fill_report,
+    reconcile_order_report, reconcile_order_report_with_commission, should_reconciliation_update,
+    stream_fill_recovery_complete,
 };
 pub use positions::{
     calculate_reconciliation_price, check_position_reconciliation,

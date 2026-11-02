@@ -68,6 +68,7 @@ pub fn order_status_report_schema() -> Schema {
         bool_field("reduce_only", false),
         utf8_field("cancel_reason", true),
         timestamp_field("ts_triggered", true),
+        utf8_field("parent_venue_order_id", true),
     ])
 }
 
@@ -87,6 +88,7 @@ pub fn encode_order_status_reports(data: &[OrderStatusReport]) -> Result<RecordB
     let mut instrument_id = StringBuilder::new();
     let mut client_order_id = StringBuilder::new();
     let mut venue_order_id = StringBuilder::new();
+    let mut parent_venue_order_id = StringBuilder::new();
     let mut order_side = StringBuilder::new();
     let mut order_type = StringBuilder::new();
     let mut time_in_force = StringBuilder::new();
@@ -127,6 +129,7 @@ pub fn encode_order_status_reports(data: &[OrderStatusReport]) -> Result<RecordB
         instrument_id.append_value(report.instrument_id.to_string());
         client_order_id.append_option(report.client_order_id.map(|v| v.to_string()));
         venue_order_id.append_value(report.venue_order_id);
+        parent_venue_order_id.append_option(report.parent_venue_order_id.map(|id| id.to_string()));
         order_side.append_value(
             report
                 .order_side
@@ -212,6 +215,7 @@ pub fn encode_order_status_reports(data: &[OrderStatusReport]) -> Result<RecordB
             Arc::new(reduce_only.finish()),
             Arc::new(cancel_reason.finish()),
             Arc::new(ts_triggered.finish()),
+            Arc::new(parent_venue_order_id.finish()),
         ],
     )
 }
@@ -252,6 +256,7 @@ mod tests {
             venue_position_id: None,
             linked_order_ids: None,
             parent_order_id: None,
+            parent_venue_order_id: None,
             contingency_type: None,
             expire_time: None,
             price: Some(Price::from("100.50")),
@@ -275,7 +280,7 @@ mod tests {
         let batch = encode_order_status_reports(&[]).unwrap();
         let schema = batch.schema();
         let fields = schema.fields();
-        assert_eq!(fields.len(), 33);
+        assert_eq!(fields.len(), 34);
         assert_eq!(fields[0].name(), "account_id");
         assert_eq!(fields[0].data_type(), &DataType::Utf8);
         assert_eq!(fields[8].name(), "quantity");
@@ -289,11 +294,16 @@ mod tests {
         assert_eq!(fields[21].data_type(), &DataType::Float64);
         assert_eq!(fields[29].name(), "post_only");
         assert_eq!(fields[29].data_type(), &DataType::Boolean);
+        assert_eq!(fields[33].name(), "parent_venue_order_id");
+        assert_eq!(fields[33].data_type(), &DataType::Utf8);
+        assert!(fields[33].is_nullable());
     }
 
     #[rstest]
     fn test_encode_order_status_reports_values() {
-        let reports = vec![make_report("AAPL.XNAS", 1_000_000)];
+        let mut report = make_report("AAPL.XNAS", 1_000_000);
+        report.parent_venue_order_id = Some(VenueOrderId::from("PARENT"));
+        let reports = vec![report];
         let batch = encode_order_status_reports(&reports).unwrap();
 
         assert_eq!(batch.num_rows(), 1);
@@ -329,6 +339,12 @@ mod tests {
         assert!((price_col.value(0) - 100.50).abs() < 1e-9);
         assert!(post_only_col.value(0));
         assert_eq!(ts_accepted_col.value(0), 1_000_000);
+        let parent_col = batch
+            .column(33)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(parent_col.value(0), "PARENT");
     }
 
     #[rstest]
@@ -381,6 +397,7 @@ mod tests {
 
         assert!(trigger_price_col.is_null(0));
         assert!(expire_time_col.is_null(0));
+        assert!(batch.column(33).is_null(0));
     }
 
     #[rstest]
@@ -402,7 +419,7 @@ mod tests {
     fn test_encode_order_status_reports_empty() {
         let batch = encode_order_status_reports(&[]).unwrap();
         assert_eq!(batch.num_rows(), 0);
-        assert_eq!(batch.schema().fields().len(), 33);
+        assert_eq!(batch.schema().fields().len(), 34);
     }
 
     #[rstest]

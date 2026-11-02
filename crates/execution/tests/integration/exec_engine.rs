@@ -23130,6 +23130,7 @@ fn test_order_query_with_fills_rejects_conflicting_canonical_side(
 #[rstest]
 #[case("matching", Some(OrderStatus::Accepted))]
 #[case("canceled", Some(OrderStatus::Canceled))]
+#[case("expired", Some(OrderStatus::Expired))]
 #[case("side", None)]
 #[case("account", None)]
 #[case("instrument", None)]
@@ -23140,6 +23141,7 @@ fn test_zero_fill_query_validates_missing_acceptance_identity(
     mut execution_engine: ExecutionEngine,
     #[case] case: &str,
     #[case] expected: Option<OrderStatus>,
+    #[values(false, true)] defer_terminal: bool,
 ) {
     let (instrument, order) = prepare_initialized_order_with_account(
         &execution_engine,
@@ -23179,15 +23181,32 @@ fn test_zero_fill_query_validates_missing_acceptance_identity(
         _ => {}
     }
     let before = cached_order_or(&execution_engine, &order);
-    execution_engine.reconcile_execution_report(&ExecutionReport::OrderQueryWithFills(
-        Box::new(report),
-        Vec::new(),
-    ));
+    if defer_terminal {
+        execution_engine.reconcile_order_query_executions(&report, &[]);
+        let recovered = cached_order_or(&execution_engine, &order);
+        execution_engine.reconcile_order_query_executions(&report, &[]);
+        assert_eq!(
+            cached_order_or(&execution_engine, &order).events(),
+            recovered.events()
+        );
+    } else {
+        execution_engine.reconcile_execution_report(&ExecutionReport::OrderQueryWithFills(
+            Box::new(report),
+            Vec::new(),
+        ));
+    }
     let cache = execution_engine.cache().borrow();
     let recovered = cache.order(&client_order_id).unwrap();
 
     if let Some(expected) = expected {
-        assert_eq!(recovered.status(), expected);
+        assert_eq!(
+            recovered.status(),
+            if defer_terminal {
+                OrderStatus::Accepted
+            } else {
+                expected
+            }
+        );
         assert_eq!(recovered.venue_order_id(), Some(venue_order_id));
         assert_eq!(
             cache.client_order_id(&venue_order_id),
@@ -23199,6 +23218,163 @@ fn test_zero_fill_query_validates_missing_acceptance_identity(
     assert!(recovered.filled_qty().is_zero());
     assert!(recovered.trade_ids().is_empty());
     assert!(cache.positions(None, None, None, None, None).is_empty());
+}
+
+#[rstest]
+fn test_query_requires_proven_venue_binding(
+    mut execution_engine: ExecutionEngine,
+    #[values(
+        "unproven",
+        "parent",
+        "wrong_parent",
+        "venue_owner",
+        "parent_owner",
+        "sibling",
+        "unacknowledged",
+        "external"
+    )]
+    binding: &str,
+    #[values(false, true)] zero: bool,
+    #[values(false, true)] defer_terminal: bool,
+) {
+    let (instrument, order) = prepare_initialized_order_with_account(
+        &execution_engine,
+        CashAccount::default().into(),
+        if binding == "unproven" {
+            OrderType::Limit
+        } else {
+            OrderType::StopMarket
+        },
+    );
+    let cid = order.client_order_id();
+    let parent = VenueOrderId::from("PARENT");
+    let child = VenueOrderId::from("CHILD");
+    execution_engine.process(&TestOrderEventStubs::submitted(
+        &order,
+        AccountId::test_default(),
+    ));
+
+    if !matches!(binding, "unacknowledged" | "external" | "parent_owner") {
+        execution_engine.process(&TestOrderEventStubs::accepted(
+            &order,
+            AccountId::test_default(),
+            parent,
+        ));
+    }
+
+    if binding == "external" {
+        execution_engine.cache().borrow_mut().purge_order(cid);
+        assert!(execution_engine.cache().borrow().order(&cid).is_none());
+    }
+    let mut report = create_order_status_report(
+        Some(cid),
+        child,
+        instrument.id(),
+        if zero {
+            OrderStatus::Accepted
+        } else {
+            OrderStatus::PartiallyFilled
+        },
+        order.quantity(),
+        Quantity::from(if zero { 0 } else { 100 }),
+    );
+    report.parent_venue_order_id = (binding != "unproven").then_some(parent);
+    if binding == "sibling" {
+        let mut first = report.clone();
+        first.filled_qty = Quantity::from(0);
+        first.order_status = OrderStatus::Accepted;
+        execution_engine.reconcile_order_query_executions(&first, &[]);
+        assert_eq!(
+            cached_order_or(&execution_engine, &order).venue_order_id(),
+            Some(child)
+        );
+        report.venue_order_id = VenueOrderId::from("SIBLING");
+    }
+
+    if binding == "wrong_parent" {
+        report.parent_venue_order_id = Some(VenueOrderId::from("WRONG"));
+    }
+
+    if matches!(binding, "venue_owner" | "parent_owner") {
+        execution_engine
+            .cache()
+            .borrow_mut()
+            .add_venue_order_id(
+                &ClientOrderId::from("OTHER"),
+                &if binding == "venue_owner" {
+                    child
+                } else {
+                    parent
+                },
+                true,
+            )
+            .unwrap();
+    }
+    let before = cached_order_or(&execution_engine, &order);
+    let fills = if zero {
+        Vec::new()
+    } else {
+        vec![FillReport::new(
+            report.account_id,
+            instrument.id(),
+            report.venue_order_id,
+            TradeId::from("EXACT-CHILD"),
+            OrderSide::Buy,
+            report.filled_qty,
+            Price::from("1.00000"),
+            Money::from("0.01 USD"),
+            LiquiditySide::Taker,
+            Some(cid),
+            None,
+            report.ts_last,
+            report.ts_init,
+            None,
+        )]
+    };
+
+    if defer_terminal {
+        execution_engine.reconcile_order_query_executions(&report, &fills);
+    } else {
+        execution_engine.reconcile_execution_report(&ExecutionReport::OrderQueryWithFills(
+            Box::new(report.clone()),
+            fills.clone(),
+        ));
+    }
+    let after = cached_order_or(&execution_engine, &order);
+    if matches!(binding, "parent" | "unacknowledged" | "external") {
+        assert_eq!(after.venue_order_id(), Some(child));
+        assert!(after.venue_order_ids().contains(&&parent));
+        assert_eq!(after.filled_qty(), report.filled_qty);
+        assert!(after.events().iter().any(|event| matches!(event, OrderEventAny::Updated(update) if update.venue_order_id == Some(child))));
+        if !zero {
+            let filled = after
+                .events()
+                .iter()
+                .find_map(|event| match event {
+                    OrderEventAny::Filled(fill) => Some(fill.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(filled.venue_order_id, child);
+            assert_eq!(filled.trade_id, TradeId::from("EXACT-CHILD"));
+            assert_eq!(filled.commission, Some(Money::from("0.01 USD")));
+        }
+        // Exact duplicate proof does not repeat the native identity transition or fill.
+        execution_engine.reconcile_order_query_executions(&report, &fills);
+        assert_eq!(
+            cached_order_or(&execution_engine, &order).events(),
+            after.events()
+        );
+    } else {
+        assert_eq!(after.events(), before.events());
+        assert!(
+            execution_engine
+                .cache()
+                .borrow()
+                .positions(None, None, None, None, None)
+                .is_empty()
+        );
+    }
 }
 
 #[rstest]

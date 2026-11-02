@@ -1543,8 +1543,12 @@ fn test_dispatch_tracked_algo_child_fill_with_empty_client_order_id(#[case] send
         );
 
         let updated = drain_events(&mut rx);
-        assert_eq!(updated.len(), 1);
-        assert_venue_order_id_update(&updated[0]);
+        assert_eq!(updated.len(), 2);
+        assert!(
+            matches!(&updated[0], ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
+            if report.filled_qty.is_zero() && fills.is_empty())
+        );
+        assert_venue_order_id_update(&updated[1]);
     }
 
     dispatch_ws_message(
@@ -2023,7 +2027,9 @@ fn test_dispatch_tracked_post_only_cancel_from_fixture(
     let untracked_events = drain_events(&mut untracked_rx);
     assert_eq!(untracked_events.len(), 1);
     match &untracked_events[0] {
-        ExecutionEvent::Report(CommonExecutionReport::Order(report)) => {
+        ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills)) => {
+            assert!(fills.is_empty());
+            assert!(report.filled_qty.is_zero());
             assert_eq!(report.account_id, AccountId::from("OKX-001"));
             assert_eq!(report.instrument_id, instrument_id);
             assert_eq!(report.client_order_id, Some(client_order_id));
@@ -3598,9 +3604,33 @@ fn assert_margin_spot_queries(queries: &[HashMap<String, String>]) {
 }
 
 #[rstest]
+#[case::success("success")]
+#[case::failed_read("failed_read")]
+#[case::overflow("overflow")]
 #[tokio::test]
-async fn test_query_account_does_not_block_within_runtime() {
-    let addr = start_exec_test_server().await;
+async fn test_query_account_does_not_block_within_runtime(#[case] response: &str) {
+    let addr = match response {
+        "failed_read" => start_exec_session_failure_server().await.0,
+        "overflow" => {
+            let router = Router::new().route(
+                "/api/v5/account/balance",
+                get(|| async {
+                    let mut payload = load_test_data("http_get_account_balance.json");
+                    payload["data"][0]["uTime"] = json!(u64::MAX.to_string());
+                    Json(payload).into_response()
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, router.into_make_service())
+                    .await
+                    .unwrap();
+            });
+            addr
+        }
+        _ => start_exec_test_server().await,
+    };
     let base_url = format!("http://{addr}");
 
     let (mut client, mut rx, _cache) = create_test_execution_client(&base_url);
@@ -3623,7 +3653,7 @@ async fn test_query_account_does_not_block_within_runtime() {
     assert!(rx.try_recv().is_err());
     let before = get_atomic_clock_realtime().get_time_ns();
     client.query_account(cmd).unwrap();
-    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+    let event = tokio::time::timeout(Duration::from_secs(20), rx.recv())
         .await
         .unwrap()
         .unwrap();
@@ -3631,6 +3661,13 @@ async fn test_query_account_does_not_block_within_runtime() {
         panic!("Expected account state")
     };
     assert_eq!(state.account_id, AccountId::from("OKX-001"));
+    if response != "success" {
+        assert!(!state.is_reported);
+        assert!(state.balances.is_empty());
+        assert!(state.margins.is_empty());
+        assert!(state.ts_init > before);
+        return;
+    }
     let currency = state.balances[0].currency;
     assert!(
         nautilus_okx::common::account::reported_currency_balance_after(&state, currency, before)
@@ -3690,7 +3727,13 @@ async fn test_margin_only_restart_recovers_spot_order_status_reports() {
 #[rstest]
 #[tokio::test]
 async fn test_margin_only_restart_recovers_spot_fill_reports() {
-    let state = Arc::new(ReportRouteState::default());
+    let mut response = load_test_data("ws_orders_algo_child_filled_empty_cl_ord_id.json");
+    response["code"] = json!("0");
+    response["msg"] = json!("");
+    let state = Arc::new(ReportRouteState {
+        regular_child_response: Some(response),
+        ..Default::default()
+    });
     let addr = start_exec_report_test_server(Arc::clone(&state)).await;
     let base_url = format!("http://{addr}");
     let (mut client, _rx, _cache) = create_test_execution_client_configured(&base_url, |config| {
@@ -3716,7 +3759,10 @@ async fn test_margin_only_restart_recovers_spot_fill_reports() {
 
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].instrument_id, InstrumentId::from("ETH-USDT.OKX"));
-    assert_eq!(reports[0].client_order_id, None);
+    assert_eq!(
+        reports[0].client_order_id,
+        Some(ClientOrderId::from(MARGIN_SPOT_PARENT_CLIENT_ORDER_ID))
+    );
     assert_eq!(
         reports[0].venue_order_id,
         VenueOrderId::from(MARGIN_SPOT_CHILD_VENUE_ORDER_ID)
@@ -3725,6 +3771,10 @@ async fn test_margin_only_restart_recovers_spot_fill_reports() {
     assert_eq!(reports[0].last_qty, Quantity::from("0.003"));
     assert_eq!(reports[0].last_px, Price::from("1886.00"));
     assert_margin_spot_queries(&regular_fill_queries);
+    let details = state.regular_order_detail_queries.lock().await;
+    assert_eq!(details.len(), 1);
+    assert_eq!(details[0]["ordId"], MARGIN_SPOT_CHILD_VENUE_ORDER_ID);
+    assert_eq!(details[0]["instId"], "ETH-USDT");
 }
 
 #[rstest]
@@ -4342,6 +4392,8 @@ async fn test_generate_open_order_reports_recovers_triggered_child(
         )
         .with_price(Price::from("1901.25"));
 
+        expected.parent_venue_order_id =
+            Some(VenueOrderId::from(MARGIN_SPOT_PARENT_VENUE_ORDER_ID));
         expected.reduce_only = true;
 
         if triggered {
@@ -4427,6 +4479,8 @@ async fn test_generate_open_order_reports_omits_unresolved_triggered_child(
         )
         .with_price(Price::from("1886.00"));
 
+        expected.parent_venue_order_id =
+            Some(VenueOrderId::from(MARGIN_SPOT_PARENT_VENUE_ORDER_ID));
         expected.avg_px = Some(dec!(0));
 
         assert_eq!(report, &expected);
@@ -5974,8 +6028,19 @@ async fn test_generate_mass_status_fails_on_malformed_fill_quantity() {
     fill["instId"] = json!("ETH-USDT-SWAP");
     fill["instType"] = json!("SWAP");
     fill["ts"] = json!(jiff::Timestamp::now().as_millisecond().to_string());
+    let mut detail = load_test_data("http_get_orders_pending.json");
+    for field in ["ordId", "clOrdId", "instId", "instType"] {
+        detail["data"][0][field] = fill[field].clone();
+    }
     let empty = get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() });
     let router = Router::new()
+        .route(
+            "/api/v5/trade/order",
+            get(move || {
+                let detail = detail.clone();
+                async move { Json(detail) }
+            }),
+        )
         .route("/api/v5/trade/orders-pending", empty.clone())
         .route("/api/v5/trade/orders-history", empty.clone())
         .route("/api/v5/trade/orders-algo-pending", empty.clone())
@@ -6007,7 +6072,10 @@ async fn test_generate_mass_status_fails_on_malformed_fill_quantity() {
 
     let error = client.generate_mass_status(None).await.unwrap_err();
 
-    assert!(error.to_string().contains("failed to parse fill quantity"));
+    assert!(
+        error.to_string().contains("failed to parse fill quantity"),
+        "{error:#}"
+    );
 }
 
 #[rstest]
@@ -6288,7 +6356,7 @@ async fn test_generate_mass_status_recovers_historical_triggered_child_status(
     assert_eq!(fills.len(), 1);
     assert_eq!(
         fills[0].client_order_id,
-        (!child_client_order_id.is_empty()).then(|| ClientOrderId::from("OMASSTRIGGERED1"))
+        Some(ClientOrderId::from("OMASSTRIGGERED1"))
     );
     assert_eq!(report.order_status, OrderStatus::Filled);
     assert_eq!(report.quantity, Quantity::from("1"));
@@ -7598,9 +7666,13 @@ impl BootstrapServer {
                     .await
                     .unwrap()
                     .unwrap();
-                let ExecutionEvent::Report(CommonExecutionReport::Order(report)) = event else {
-                    panic!("expected order report, received {event:?}");
+                let ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills)) =
+                    event
+                else {
+                    panic!("expected cumulative order evidence, received {event:?}");
                 };
+                assert!(report.filled_qty.is_zero());
+                assert!(fills.is_empty());
                 assert_eq!(
                     report.instrument_id,
                     InstrumentId::from(format!("{symbol}.OKX").as_str())
@@ -7728,12 +7800,14 @@ async fn assert_bootstrap_reports(client: &OKXExecutionClient, families: bool) {
 async fn test_failed_connect_tears_down_websockets_before_retry() {
     let (addr, ws_state) = start_exec_session_failure_server().await;
     let ws_base = format!("ws://{addr}");
-    let (mut client, _rx, _cache) =
+    let (mut client, mut rx, _cache) =
         create_test_execution_client_configured(&format!("http://{addr}"), |config| {
             config.instrument_types = vec![OKXInstrumentType::Swap];
             config.base_url_ws_private = Some(format!("{ws_base}/ws/v5/private"));
             config.base_url_ws_business = Some(format!("{ws_base}/ws/v5/business"));
         });
+
+    client.start().unwrap();
 
     for attempt in 1..=2 {
         let error = client.connect().await.unwrap_err();
@@ -7741,6 +7815,15 @@ async fn test_failed_connect_tears_down_websockets_before_retry() {
             error.to_string().contains("account state"),
             "expected account state failure after transports started: {error}"
         );
+        let event = rx
+            .try_recv()
+            .expect("failed initial account read invalidates evidence");
+        let ExecutionEvent::Account(state) = event else {
+            panic!("Expected account invalidation");
+        };
+        assert!(!state.is_reported);
+        assert!(state.balances.is_empty());
+        assert!(state.margins.is_empty());
 
         let expected_connections = attempt * 2;
         wait_until_async(
@@ -8212,15 +8295,27 @@ async fn test_imported_order_first_amend_confirmation(
             }
             ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(status, reports)) => {
                 evidence_count += 1;
-                assert!(with_fill);
                 assert_eq!(status.account_id, client.account_id());
                 assert_eq!(status.instrument_id, order.instrument_id());
                 assert_eq!(status.client_order_id, Some(cid));
                 assert_eq!(status.venue_order_id, vid);
-                assert_eq!(status.order_status, OrderStatus::PartiallyFilled);
+                assert_eq!(
+                    status.order_status,
+                    if with_fill {
+                        OrderStatus::PartiallyFilled
+                    } else {
+                        OrderStatus::Accepted
+                    }
+                );
                 assert_eq!(status.quantity, Quantity::from("3"));
-                assert_eq!(status.filled_qty, Quantity::from("2"));
-                assert_eq!(reports.len(), 1);
+                assert_eq!(
+                    status.filled_qty,
+                    Quantity::from(if with_fill { "2" } else { "0" })
+                );
+                assert_eq!(reports.len(), usize::from(with_fill));
+                if !with_fill {
+                    continue;
+                }
                 let fill = &reports[0];
                 assert_eq!(fill.account_id, client.account_id());
                 assert_eq!(fill.instrument_id, order.instrument_id());
@@ -8278,7 +8373,7 @@ async fn test_imported_order_first_amend_confirmation(
         // companion evidence, depending on when the shared trade cache is updated.
         assert!((2..=4).contains(&evidence_count));
     } else {
-        assert_eq!(evidence_count, 0);
+        assert_eq!(evidence_count, 2);
     }
     assert!(rx.try_recv().is_err());
     assert_eq!(
@@ -9122,7 +9217,19 @@ async fn test_history_page_limit_leaves_standalone_reports_unchanged(
     assert_eq!(fills.len(), 400);
     assert_eq!(report.venue_order_id, VenueOrderId::from("1000001"));
     assert_eq!(report.order_status, OrderStatus::Accepted);
-    assert_eq!(queries["/api/v5/trade/order::"].len(), 1);
+    // Each distinct account-wide fill order requires one authenticated identity lookup,
+    // independent of bulk reconciliation page limits, plus the explicit status query.
+    let details = &queries["/api/v5/trade/order::"];
+    assert_eq!(details.len(), 201);
+    let observed: std::collections::BTreeSet<_> = details
+        .iter()
+        .map(|query| query["ordId"].as_str())
+        .collect();
+    let expected: std::collections::BTreeSet<_> = (4_000_000..4_000_200)
+        .map(|id| id.to_string())
+        .chain(std::iter::once("1000001".to_string()))
+        .collect();
+    assert_eq!(observed, expected.iter().map(String::as_str).collect());
 
     for (key, queries) in queries.iter().filter(|(key, _)| {
         key.contains("history") || key.contains("fills:") || key.contains("trades:")

@@ -121,6 +121,7 @@ pub fn query_fill_evidence_matches(
         && report.instrument_id == other.instrument_id
         && report.client_order_id == other.client_order_id
         && report.venue_order_id == other.venue_order_id
+        && report.parent_venue_order_id == other.parent_venue_order_id
         && report.venue_position_id == other.venue_position_id
         && report.order_side == other.order_side
         && report.filled_qty == other.filled_qty
@@ -180,7 +181,9 @@ pub fn query_fills_match_cached_history(
     report: &OrderStatusReport,
     fills: &[FillReport],
 ) -> bool {
-    if fills.iter().any(|fill| fill.ts_event > report.ts_last) {
+    if !report.matches_order_identity(order)
+        || fills.iter().any(|fill| fill.ts_event > report.ts_last)
+    {
         return false;
     }
     let active_ids = order.trade_ids();
@@ -213,6 +216,29 @@ pub fn query_fills_match_cached_history(
             }
             None => cached.ts_event > report.ts_last,
         }
+    })
+}
+
+/// Checks that a historical query witness retains current executions before its boundary.
+///
+/// Tied venue timestamps remain subject to the caller's observation-order eligibility check.
+/// Active earlier executions must appear with identical native events in the witness.
+#[must_use]
+pub fn query_fill_witness_preserves_history(
+    order: &OrderAny,
+    witness: &OrderAny,
+    boundary: UnixNanos,
+) -> bool {
+    let active = order.trade_ids();
+    let witnessed = witness.trade_ids();
+    let events = witness.events();
+    order.events().iter().all(|event| {
+        let OrderEventAny::Filled(fill) = event else {
+            return true;
+        };
+        !active.contains(&&fill.trade_id)
+            || fill.ts_event >= boundary
+            || (witnessed.contains(&&fill.trade_id) && events.contains(event))
     })
 }
 
@@ -305,7 +331,9 @@ fn committed_order_fill_evidence<'a>(
             .is_some_and(|id| id != order.client_order_id())
         || report.order_side != Some(order.order_side())
         || order.account_id() != Some(report.account_id)
-        || order.venue_order_id() != Some(report.venue_order_id)
+        || !report.matches_order_identity(order)
+        || (order.venue_order_id() != Some(report.venue_order_id)
+            && !order.venue_order_ids().contains(&&report.venue_order_id))
         || order.filled_qty() < report.filled_qty
         || super::inferred_reconciliation_trade_ids(order).map_or(true, |ids| !ids.is_empty())
         || fills
@@ -376,7 +404,8 @@ pub fn order_fill_evidence_matches(
 /// executions, or companions accounting for the entire reported quantity. Reconciled fragments
 /// alone cannot supply completeness. This neither reorders accounting nor invents executions.
 /// Empty evidence keeps the stricter snapshot rule; arithmetic or search-bound exhaustion
-/// remains unresolved.
+/// remains unresolved. An open zero-fill stream snapshot excludes strictly earlier
+/// executions but permits later-delivered executions sharing its venue timestamp.
 #[must_use]
 pub fn stream_fill_recovery_complete(
     order: &OrderAny,
@@ -389,6 +418,12 @@ pub fn stream_fill_recovery_complete(
     let Some(committed) = committed_order_fill_evidence(order, report, fills) else {
         return false;
     };
+
+    if report.filled_qty.is_zero() && fills.is_empty() && !report.order_status.is_closed() {
+        // An open stream snapshot can precede executions sharing its timestamp.
+        // It still excludes any execution strictly earlier than that boundary.
+        return committed.iter().all(|fill| fill.ts_event == report.ts_last);
+    }
     let reconciled = committed.iter().any(|fill| fill.reconciliation);
     let Some(last_time) = fills.iter().map(|fill| fill.ts_event).max() else {
         return (complete_query_history || !reconciled)
@@ -895,7 +930,9 @@ pub fn generate_external_order_status_events_with_commission(
         order.strategy_id(),
         order.instrument_id(),
         order.client_order_id(),
-        report.venue_order_id,
+        report
+            .parent_venue_order_id
+            .unwrap_or(report.venue_order_id),
         *account_id,
         UUID4::new(),
         report.ts_accepted,
@@ -903,7 +940,7 @@ pub fn generate_external_order_status_events_with_commission(
         true, // reconciliation
     ));
 
-    match report.order_status {
+    let mut result = match report.order_status {
         OrderStatus::Accepted | OrderStatus::Triggered => vec![accepted],
         OrderStatus::PartiallyFilled | OrderStatus::Filled => {
             let mut events = vec![accepted];
@@ -994,7 +1031,17 @@ pub fn generate_external_order_status_events_with_commission(
             );
             Vec::new()
         }
+    };
+
+    if report.parent_venue_order_id.is_some()
+        && matches!(result.first(), Some(OrderEventAny::Accepted(_)))
+    {
+        let mut working = order.clone();
+        if working.apply(result[0].clone()).is_ok() && report.matches_order_identity(&working) {
+            result.insert(1, create_reconciliation_updated(&working, report, ts_now));
+        }
     }
+    result
 }
 
 fn create_reconciliation_fill_voids(
@@ -1268,6 +1315,14 @@ pub fn reconcile_fill_report(
 /// snapshot (for example, a Filled report that omits price but supplies
 /// `avg_px`) does not trigger a spurious `OrderUpdated`.
 pub fn should_reconciliation_update(order: &OrderAny, report: &OrderStatusReport) -> bool {
+    if report.parent_venue_order_id.is_some()
+        && report.parent_venue_order_id == order.venue_order_id()
+        && Some(report.venue_order_id) != order.venue_order_id()
+        && report.matches_order_identity(order)
+    {
+        return true;
+    }
+
     if report.quantity != order.quantity() && report.quantity >= order.filled_qty() {
         return true;
     }
@@ -1302,7 +1357,10 @@ pub(super) fn create_reconciliation_accepted(
         order.strategy_id(),
         order.instrument_id(),
         order.client_order_id(),
-        order.venue_order_id().unwrap_or(report.venue_order_id),
+        order
+            .venue_order_id()
+            .or(report.parent_venue_order_id)
+            .unwrap_or(report.venue_order_id),
         account_id,
         UUID4::new(),
         report.ts_accepted,
@@ -1447,6 +1505,15 @@ pub(super) fn create_reconciliation_updated(
         None
     };
 
+    let venue_order_id = if report.parent_venue_order_id.is_some()
+        && report.parent_venue_order_id == order.venue_order_id()
+        && report.matches_order_identity(order)
+    {
+        Some(report.venue_order_id)
+    } else {
+        order.venue_order_id()
+    };
+
     OrderEventAny::Updated(OrderUpdated::new(
         order.trader_id(),
         order.strategy_id(),
@@ -1457,7 +1524,7 @@ pub(super) fn create_reconciliation_updated(
         report.ts_last,
         ts_now,
         true, // reconciliation
-        order.venue_order_id(),
+        venue_order_id,
         order.account_id(),
         price,
         trigger_price,

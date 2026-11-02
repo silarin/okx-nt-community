@@ -2362,24 +2362,39 @@ impl LiveNode {
             // contract, including external algo statuses and fatal callback drains.
             let event = match event {
                 ExecutionEvent::Report(ExecutionReport::Order(report))
-                    if report.filled_qty.is_positive()
-                        && self.kernel.exec_engine.borrow().requires_order_query_fills(
-                            report.account_id,
-                            report.instrument_id,
-                            report.client_order_id,
-                        ) =>
+                    if self.kernel.exec_engine.borrow().requires_order_query_fills(
+                        report.account_id,
+                        report.instrument_id,
+                        report.client_order_id,
+                    ) =>
                 {
-                    ExecutionEvent::Report(ExecutionReport::OrderQueryWithFills(report, Vec::new()))
+                    let query = ExecutionReport::OrderQueryWithFills(report, Vec::new());
+                    msgbus::publish_any(
+                        MessagingSwitchboard::reconciliation_raw_order_query_topic(),
+                        &query,
+                    );
+                    ExecutionEvent::Report(query)
                 }
                 ExecutionEvent::Report(ExecutionReport::OrderWithFills(report, fills))
-                    if report.filled_qty.is_positive()
-                        && self.kernel.exec_engine.borrow().requires_order_query_fills(
-                            report.account_id,
-                            report.instrument_id,
-                            report.client_order_id,
-                        ) =>
+                    if self.kernel.exec_engine.borrow().requires_order_query_fills(
+                        report.account_id,
+                        report.instrument_id,
+                        report.client_order_id,
+                    ) =>
                 {
-                    ExecutionEvent::Report(ExecutionReport::OrderQueryWithFills(report, fills))
+                    let query = ExecutionReport::OrderQueryWithFills(report, fills);
+                    msgbus::publish_any(
+                        MessagingSwitchboard::reconciliation_raw_order_query_topic(),
+                        &query,
+                    );
+                    ExecutionEvent::Report(query)
+                }
+                ExecutionEvent::Report(report @ ExecutionReport::OrderFillEvidence(..)) => {
+                    msgbus::publish_any(
+                        MessagingSwitchboard::reconciliation_raw_order_query_topic(),
+                        &report,
+                    );
+                    ExecutionEvent::Report(report)
                 }
                 event => event,
             };
@@ -14400,7 +14415,10 @@ mod tests {
     #[case::reconciliation("reconciliation")]
     #[case::mixed_batch("batch")]
     #[tokio::test(start_paused = true)]
-    async fn test_terminal_evidence_retains_raw_events_until_fills(#[case] kind: &str) {
+    async fn test_terminal_evidence_retains_raw_events_until_fills(
+        #[case] kind: &str,
+        #[values(false, true)] late_stream: bool,
+    ) {
         use nautilus_model::events::{
             OrderCanceledBatch,
             order::spec::{
@@ -14552,7 +14570,7 @@ mod tests {
             None,
         );
         node.process_exec_event(ExecutionEvent::Report(
-            ExecutionReport::OrderQueryWithFills(Box::new(report), vec![fill]),
+            ExecutionReport::OrderQueryWithFills(Box::new(report.clone()), vec![fill]),
         ));
         assert!(node.kernel.cache.borrow().order(&id).unwrap().is_closed());
         assert_eq!(
@@ -14570,8 +14588,21 @@ mod tests {
         node.kernel
             .cache
             .borrow_mut()
-            .purge_closed_orders(1_000_000_000.into(), 0);
+            .purge_closed_orders(UnixNanos::from(u64::MAX), 0);
+        assert!(node.kernel.cache.borrow().order(&id).is_none());
         assert!(node.exec_manager.unresolved_query_fill_ids().is_empty());
+
+        let mut contradictory = report;
+        contradictory.order_status = OrderStatus::Accepted;
+        contradictory.filled_qty = Quantity::from("0.000");
+        contradictory.ts_init = 40.into();
+        let contradictory = if late_stream {
+            ExecutionReport::OrderFillEvidence(Box::new(contradictory), Vec::new())
+        } else {
+            ExecutionReport::OrderQueryWithFills(Box::new(contradictory), Vec::new())
+        };
+        node.process_exec_event(ExecutionEvent::Report(contradictory));
+        assert!(node.exec_manager.unresolved_query_fill_ids().contains(&id));
     }
 
     #[rstest]

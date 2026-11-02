@@ -815,7 +815,7 @@ async fn scenario(query_first: bool, partial: bool, skip_first_stream: bool, sou
     assert_eq!(snapshot(&cache), final_state);
     assert_eq!(
         reports.borrow().len(),
-        2 + 3 * usize::from(!skip_first_stream) + 2 * usize::from(partial)
+        3 + 3 * usize::from(!skip_first_stream) + 2 * usize::from(partial)
     );
     msgbus::unsubscribe_any(report_topic.into(), &report_handler);
     let submissions = venue.submissions.lock().await;
@@ -997,6 +997,7 @@ async fn test_zero_fill_terminal_callbacks_preserve_wire_origin(
 #[rstest]
 #[case("live", OrderStatus::Accepted)]
 #[case("canceled", OrderStatus::Canceled)]
+#[case("canceled", OrderStatus::Expired)]
 #[tokio::test]
 async fn test_zero_fill_query_recovers_missing_acceptance(
     #[case] state: &str,
@@ -1043,6 +1044,9 @@ async fn test_zero_fill_query_recovers_missing_acceptance(
         assert!(order.venue_order_id().is_none());
         let timestamp = order.ts_submitted().unwrap().as_u64() / 1_000_000;
         let mut frame = wire_order(state, "0", "0", "", "0", "0", timestamp);
+        if expected == OrderStatus::Expired {
+            frame["data"][0]["cancelSource"] = json!("5");
+        }
         frame["data"][0]["avgPx"] = json!("");
         frame["data"][0]["fillPx"] = json!("");
         *venue.report.lock().await = json!({"code":"0","msg":"","data":frame["data"]});
@@ -1139,6 +1143,128 @@ async fn test_periodic_queries_preserve_authoritative_fills(
     #[case] partial: bool,
 ) {
     scenario(true, partial, true, source).await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_zero_observation_retains_bound_through_later_fill_and_restart(
+    #[values(1, 11, 20)] snapshot_offset: u64,
+    #[values(false, true)] stream: bool,
+) {
+    let valid = snapshot_offset < 11 || (stream && snapshot_offset == 11);
+    let store = tempfile::TempDir::new().unwrap();
+    let (addr, venue, server) = start_venue().await;
+    let mut node = build_node_with_store(
+        addr,
+        Rc::new(RefCell::new(Vec::new())),
+        QuerySource::Direct,
+        Some(EventStoreConfig {
+            base_dir: store.path().to_path_buf(),
+            retention: RetentionMode::Full,
+            ..Default::default()
+        }),
+        Some(Rc::new(RefCell::new(None))),
+    );
+    let instance = node.kernel().instance_id.to_string();
+    let cache = node.kernel().cache.clone();
+    let handle = node.handle();
+    let observed = Rc::new(RefCell::new(false));
+    let captured = observed.clone();
+    let handler = ShareableMessageHandler::from_typed(move |report: &ExecutionReport| {
+        if let ExecutionReport::OrderQueryWithFills(report, fills)
+        | ExecutionReport::OrderFillEvidence(report, fills) = report
+            && report.client_order_id == Some(ClientOrderId::from(CID))
+            && report.order_status == OrderStatus::Accepted
+            && report.filled_qty.is_zero()
+        {
+            assert!(fills.is_empty());
+            *captured.borrow_mut() = true;
+        }
+    });
+    let topic = MessagingSwitchboard::reconciliation_raw_order_query_topic();
+    msgbus::subscribe_any(topic.into(), handler.clone(), None);
+    let driver = async {
+        wait_until(|| cache.borrow().order_exists(&ClientOrderId::from(CID))).await;
+        wait_until(|| cached(&cache).ts_submitted().is_some()).await;
+        let timestamp = cached(&cache).ts_submitted().unwrap().as_u64() / 1_000_000;
+        venue
+            .updates
+            .send(wire_order("live", "0", "0", "", "0", "0", timestamp))
+            .unwrap();
+        wait_until(|| cached(&cache).status() == OrderStatus::Accepted).await;
+        *observed.borrow_mut() = false;
+        let zero_time = timestamp + snapshot_offset;
+        let mut zero = wire_order("live", "0", "0", "", "0", "0", timestamp);
+        zero["data"][0]["uTime"] = json!(zero_time.to_string());
+        if stream {
+            venue.updates.send(zero).unwrap();
+        } else {
+            *venue.report.lock().await = json!({"code":"0", "msg":"", "data":zero["data"]});
+            query(&cache);
+        }
+        wait_until(|| *observed.borrow()).await;
+        assert!(cached(&cache).filled_qty().is_zero());
+        let filled = wire_order(
+            "filled",
+            "0.00100000",
+            "0.00100000",
+            "90001",
+            "-0.05",
+            "-0.05",
+            timestamp + 10,
+        );
+        *venue.report.lock().await = json!({"code":"0", "msg":"", "data":filled["data"]});
+        venue.updates.send(filled).unwrap();
+        sentinel(&venue, &cache, timestamp + 30).await;
+        assert_eq!(cached(&cache).status(), OrderStatus::Filled);
+        assert_eq!(cached(&cache).filled_qty(), Quantity::from("0.00100000"));
+        assert_eq!(
+            snapshot(&cache)["positions"][0]["commissions"],
+            json!(["0.05 USD"])
+        );
+        handle.stop();
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(45), async {
+        tokio::join!(node.run(), driver)
+    })
+    .await
+    .unwrap();
+    msgbus::unsubscribe_any(topic.into(), &handler);
+
+    if valid {
+        result.unwrap();
+    } else {
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Order fill recovery incomplete")
+        );
+    }
+    node.dispose();
+    drop(node);
+    drop(cache);
+    let runs = RedbBackend::list_runs(store.path(), &instance).unwrap();
+    assert_eq!(runs.len(), 1);
+    let restarted = build_node(addr, Rc::new(RefCell::new(Vec::new())), QuerySource::Direct);
+    let restored = restore_cache_from_sealed_run(
+        &mut restarted.kernel().cache.borrow_mut(),
+        store.path().to_path_buf(),
+        &instance,
+        &runs[0].run_id,
+    );
+
+    if valid {
+        restored.unwrap();
+    } else {
+        assert!(
+            restored
+                .unwrap_err()
+                .to_string()
+                .contains("Unresolved persisted order fill recovery")
+        );
+    }
+    server.abort();
 }
 
 #[rstest]
@@ -3383,7 +3509,7 @@ async fn test_snapshot_covered_history_preserves_exposure_with_native_okx_client
             let submitted_ms = cached(&cache).ts_submitted().unwrap().as_u64() / 1_000_000;
             venue
                 .updates
-                .send(wire_order("live", "0", "0", "", "0", "0", submitted_ms))
+                .send(wire_order("live", "0", "0", "", "0", "0", execution_ms - 1))
                 .unwrap();
             wait_until(|| cached(&cache).status() == OrderStatus::Accepted).await;
             let status = OrderStatusReport::new(
@@ -4877,6 +5003,9 @@ async fn test_unknown_cumulative_fill_requires_fresh_query_through_replay(
             }
 
             if route == "terminal" {
+                // The zero-filled cancellation precedes the subsequently recovered
+                // execution; equal timestamps would contradict its cumulative bound.
+                fills["data"][0]["fillTime"] = json!((timestamp + 2).to_string());
                 venue
                     .updates
                     .send(wire_order("canceled", "0", "0", "", "0", "0", timestamp))
@@ -6143,7 +6272,7 @@ async fn test_cold_order_only_tied_closing_fills_and_restart(
 #[tokio::test]
 async fn test_startup_bulk_observations_precede_scoped_history(
     #[values(false, true)] start_only: bool,
-    #[values("matching", "fee", "tradeId", "fillSz", "fillPx", "fillTime")] conflict_field: &str,
+    #[values("matching", "fee", "tradeId", "fillSz", "fillPx", "fillTime", "zero")] conflict_field: &str,
 ) {
     let conflict = conflict_field != "matching";
     let store = tempfile::TempDir::new().unwrap();
@@ -6190,8 +6319,21 @@ async fn test_startup_bulk_observations_precede_scoped_history(
         "fillSz" => frame["data"][0]["fillSz"] = json!("0.00050000"),
         "fillPx" => frame["data"][0]["fillPx"] = json!("50001.0"),
         "fillTime" => frame["data"][0]["fillTime"] = json!(timestamp.to_string()),
-        "matching" | "fee" => {}
+        "matching" | "fee" | "zero" => {}
         _ => unreachable!(),
+    }
+
+    if conflict_field == "zero" {
+        venue.order_details.lock().await.insert(
+            VID.to_string(),
+            json!({"code":"0", "msg":"", "data":frame["data"]}),
+        );
+        let mut zero = wire_order("live", "0", "0", "", "0", "0", timestamp);
+        zero["data"][0]["uTime"] = json!((timestamp + 2).to_string());
+        frame["data"]
+            .as_array_mut()
+            .unwrap()
+            .push(zero["data"][0].clone());
     }
     *venue.report.lock().await = json!({"code":"0", "msg":"", "data":frame["data"]});
     let first = json!({"instType":"SPOT", "instId":"BTC-USD", "ordId":VID, "clOrdId":CID,
@@ -6240,14 +6382,22 @@ async fn test_startup_bulk_observations_precede_scoped_history(
                 .positions(None, None, None, None, None)
                 .is_empty()
         );
-        assert!(
-            node.kernel()
-                .cache
-                .borrow()
-                .orders(None, None, None, None, None)
-                .iter()
-                .all(|order| order.filled_qty().is_zero())
-        );
+
+        if conflict_field == "zero" {
+            // A contradictory snapshot blocks startup without erasing proven executions.
+            let state = snapshot(&node.kernel().cache);
+            assert_eq!(state["trade_ids"], json!(["90001"]));
+            assert_eq!(state["fills"][0]["commission"], json!("0.05 USD"));
+        } else {
+            assert!(
+                node.kernel()
+                    .cache
+                    .borrow()
+                    .orders(None, None, None, None, None)
+                    .iter()
+                    .all(|order| order.filled_qty().is_zero())
+            );
+        }
         None
     } else {
         result.unwrap();
@@ -6275,9 +6425,11 @@ async fn test_startup_bulk_observations_precede_scoped_history(
     } else {
         let error = restored.unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("Unresolved persisted incomplete fill recovery"),
+            error.to_string().contains(if conflict_field == "zero" {
+                "Unresolved persisted order fill recovery"
+            } else {
+                "Unresolved persisted incomplete fill recovery"
+            }),
             "{error:#}"
         );
     }

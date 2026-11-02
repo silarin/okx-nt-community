@@ -785,7 +785,11 @@ impl OKXWsFeedHandler {
                     },
                     Err(e) => {
                         log::error!("Failed to parse message: {e}: {text}");
-                        None
+                        Some(OKXWsFrame::Error {
+                            arg: None,
+                            code: String::new(),
+                            msg: "Malformed WebSocket message".to_string(),
+                        })
                     }
                 }
             }
@@ -1002,6 +1006,27 @@ mod tests {
             SubscriptionState::new(OKX_WS_TOPIC_DELIMITER),
             get_atomic_clock_realtime(),
         )
+    }
+
+    #[rstest]
+    #[case("{\"arg\":{\"channel\":\"account\"},\"data\":")]
+    #[case(
+        "{\"arg\":{\"channel\":\"account\"},\"data\":[],\"eventType\":\"snapshot\",\"curPage\":\"bad\"}"
+    )]
+    #[tokio::test]
+    async fn malformed_raw_account_frames_forward_an_error(#[case] payload: &str) {
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handler = create_handler();
+        handler.cmd_rx = cmd_rx;
+        handler.raw_rx = raw_rx;
+        raw_tx
+            .send(Message::Text(payload.to_string().into()))
+            .unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(1), handler.next())
+            .await
+            .unwrap();
+        assert!(matches!(output, Some(OKXWsMessage::Error(_))));
     }
 
     #[rstest]

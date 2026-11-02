@@ -4558,12 +4558,10 @@ impl OKXHttpClient {
                             observe(&ExecutionReport::IncompleteFill(Box::new(observation)));
                         }
 
-                        if report.filled_qty.is_positive() {
-                            observe(&ExecutionReport::OrderQueryWithFills(
-                                Box::new(report),
-                                Vec::new(),
-                            ));
-                        }
+                        observe(&ExecutionReport::OrderQueryWithFills(
+                            Box::new(report),
+                            Vec::new(),
+                        ));
                     }
                     Err(_) => observe(&ExecutionReport::IncompleteFill(Box::new(
                         parse_incomplete_order_fill(

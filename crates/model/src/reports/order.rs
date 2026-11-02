@@ -25,7 +25,7 @@ use crate::{
         TriggerType,
     },
     identifiers::{AccountId, ClientOrderId, InstrumentId, OrderListId, PositionId, VenueOrderId},
-    orders::Order,
+    orders::{Order, OrderAny},
     types::{Price, Quantity},
 };
 
@@ -49,6 +49,10 @@ pub struct OrderStatusReport {
     pub client_order_id: Option<ClientOrderId>,
     /// The venue assigned order ID.
     pub venue_order_id: VenueOrderId,
+    /// Authenticated venue parent for a child replacing the current logical order identity.
+    /// This is distinct from a contingent parent client order ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_venue_order_id: Option<VenueOrderId>,
     /// The order side.
     #[serde(with = "crate::enums::serde_option_order_side")]
     pub order_side: Option<OrderSide>,
@@ -138,6 +142,7 @@ impl OrderStatusReport {
             instrument_id,
             client_order_id,
             venue_order_id,
+            parent_venue_order_id: None,
             order_side,
             order_type,
             time_in_force,
@@ -168,6 +173,42 @@ impl OrderStatusReport {
             cancel_reason: None,
             ts_triggered: None,
         }
+    }
+
+    /// Checks reported identity against native current and historical venue bindings.
+    ///
+    /// An unseen child requires an explicit parent equal to the current venue ID,
+    /// exact client/account/side identity and an unfilled parent. Callers must also
+    /// reject venue IDs indexed to another order before applying a transition.
+    #[must_use]
+    pub fn matches_order_identity(&self, order: &OrderAny) -> bool {
+        if self.instrument_id != order.instrument_id()
+            || self
+                .client_order_id
+                .is_some_and(|id| id != order.client_order_id())
+            || self
+                .order_side
+                .is_some_and(|side| side != order.order_side())
+            || order.account_id().is_some_and(|id| id != self.account_id)
+        {
+            return false;
+        }
+        let Some(current) = order.venue_order_id() else {
+            return true;
+        };
+        let known = current == self.venue_order_id
+            || order.venue_order_ids().contains(&&self.venue_order_id);
+
+        if known {
+            return self.parent_venue_order_id.is_none_or(|parent| {
+                parent != self.venue_order_id && order.venue_order_ids().contains(&&parent)
+            });
+        }
+        self.parent_venue_order_id == Some(current)
+            && self.client_order_id == Some(order.client_order_id())
+            && order.account_id() == Some(self.account_id)
+            && self.order_side == Some(order.order_side())
+            && order.filled_qty().is_zero()
     }
 
     /// Sets the client order ID.
@@ -443,6 +484,26 @@ mod tests {
         orders::builder::OrderTestBuilder,
         types::{Price, Quantity},
     };
+
+    #[rstest]
+    fn test_parent_venue_proof_json_round_trip_and_legacy_default() {
+        let mut report = test_order_status_report();
+        report.parent_venue_order_id = Some(VenueOrderId::from("PARENT"));
+        let mut encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            serde_json::from_value::<OrderStatusReport>(encoded.clone()).unwrap(),
+            report
+        );
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("parent_venue_order_id");
+        report.parent_venue_order_id = None;
+        assert_eq!(
+            serde_json::from_value::<OrderStatusReport>(encoded).unwrap(),
+            report
+        );
+    }
 
     fn test_order_status_report() -> OrderStatusReport {
         OrderStatusReport::new(

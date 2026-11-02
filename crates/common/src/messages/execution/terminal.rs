@@ -162,6 +162,10 @@ impl OrderTerminalEvidence {
     /// Checks every supplied identity against the native order.
     #[must_use]
     pub fn matches_order(&self, order: &OrderAny) -> bool {
+        if let Self::Report(report) | Self::StreamReport(report) | Self::Status(report) = self {
+            return report.order_status.is_closed() && report.matches_order_identity(order);
+        }
+
         if self
             .client_order_id()
             .is_some_and(|id| id != order.client_order_id())
