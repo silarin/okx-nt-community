@@ -279,6 +279,165 @@ mod tests {
     use crate::{common::parse::parse_account_state_with_source, http::models::OKXAccount};
 
     #[rstest::rstest]
+    fn reported_balance_preserves_native_money_precision(
+        #[values(AccountType::Cash, AccountType::Margin)] account_type: AccountType,
+    ) {
+        let response: serde_json::Value = serde_json::from_str(include_str!(
+            "../../test_data/http_get_account_balance.json"
+        ))
+        .unwrap();
+        let mut raw: OKXAccount = serde_json::from_value(response["data"][0].clone()).unwrap();
+        raw.details.truncate(1);
+        raw.details[0].ccy = "ETH".into();
+        raw.details[0].cash_bal = "1.234567891".into();
+        raw.details[0].avail_bal = "1.234567889".into();
+        let state = parse_account_state_with_source(
+            &raw,
+            AccountId::from("OKX-001"),
+            account_type,
+            300.into(),
+            OKXAccountUpdate::Rest,
+            Some(200.into()),
+        )
+        .unwrap();
+        let balance = state.balances[0];
+        assert_eq!(balance.total.as_decimal().to_string(), "1.234567891");
+        assert_eq!(balance.free.as_decimal().to_string(), "1.234567889");
+        assert_eq!(balance.locked.as_decimal(), "0.000000002".parse().unwrap());
+        let info: OKXAccountStateInfo =
+            serde_json::from_value(state.info.unwrap()["okx"].clone()).unwrap();
+        assert!(info.exact_balance_currencies.contains("ETH"));
+    }
+
+    #[rstest::rstest]
+    fn reported_balance_native_precision_boundary(#[values(false, true)] beyond_native: bool) {
+        use nautilus_model::types::fixed::FIXED_PRECISION;
+        use rust_decimal::Decimal;
+
+        let response: serde_json::Value = serde_json::from_str(include_str!(
+            "../../test_data/http_get_account_balance.json"
+        ))
+        .unwrap();
+        let mut raw: OKXAccount = serde_json::from_value(response["data"][0].clone()).unwrap();
+        raw.details.truncate(1);
+        raw.details[0].ccy = "ETH".into();
+        let amount =
+            Decimal::ONE + Decimal::new(1, u32::from(FIXED_PRECISION) + u32::from(beyond_native));
+        raw.details[0].cash_bal = amount.to_string();
+        raw.details[0].avail_bal = amount.to_string();
+        let state = parse_account_state_with_source(
+            &raw,
+            AccountId::from("OKX-001"),
+            AccountType::Cash,
+            300.into(),
+            OKXAccountUpdate::Rest,
+            Some(200.into()),
+        )
+        .unwrap();
+        let info: OKXAccountStateInfo =
+            serde_json::from_value(state.info.as_ref().unwrap()["okx"].clone()).unwrap();
+        assert_eq!(
+            info.exact_balance_currencies.contains("ETH"),
+            !beyond_native
+        );
+        assert_eq!(
+            state.balances[0].total.as_decimal(),
+            if beyond_native { Decimal::ONE } else { amount }
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::above_total("1", "1.000000001")]
+    #[case::negative_free("1", "-0.000000001")]
+    #[case::overflow("79228162514264337593543950335", "0")]
+    fn reported_balance_clamping_and_overflow_remain_inexact(
+        #[case] total: &str,
+        #[case] free: &str,
+    ) {
+        let response: serde_json::Value = serde_json::from_str(include_str!(
+            "../../test_data/http_get_account_balance.json"
+        ))
+        .unwrap();
+        let mut raw: OKXAccount = serde_json::from_value(response["data"][0].clone()).unwrap();
+        raw.details.truncate(1);
+        raw.details[0].ccy = "ETH".into();
+        raw.details[0].cash_bal = total.into();
+        raw.details[0].avail_bal = free.into();
+        let state = parse_account_state_with_source(
+            &raw,
+            AccountId::from("OKX-001"),
+            AccountType::Cash,
+            300.into(),
+            OKXAccountUpdate::Rest,
+            Some(200.into()),
+        )
+        .unwrap();
+        let info: OKXAccountStateInfo =
+            serde_json::from_value(state.info.unwrap()["okx"].clone()).unwrap();
+        assert!(!info.exact_balance_currencies.contains("ETH"));
+        for balance in state.balances {
+            assert!(!balance.free.is_negative());
+            assert!(!balance.locked.is_negative());
+            assert_eq!(balance.total, balance.free + balance.locked);
+        }
+    }
+
+    #[rstest::rstest]
+    #[case("-0.000000001")]
+    #[case("-0.00000000000000001")]
+    #[case("-0.00000000000000000000000000001")]
+    #[case("-0.1e-28")]
+    fn reported_cash_balance_rejects_negative_before_rounding(#[case] amount: &str) {
+        let response: serde_json::Value = serde_json::from_str(include_str!(
+            "../../test_data/http_get_account_balance.json"
+        ))
+        .unwrap();
+        let mut raw: OKXAccount = serde_json::from_value(response["data"][0].clone()).unwrap();
+        raw.details.truncate(1);
+        raw.details[0].cash_bal = amount.into();
+        raw.details[0].avail_bal = amount.into();
+        assert!(
+            parse_account_state_with_source(
+                &raw,
+                AccountId::from("OKX-001"),
+                AccountType::Cash,
+                300.into(),
+                OKXAccountUpdate::Rest,
+                Some(200.into()),
+            )
+            .is_err()
+        );
+    }
+
+    #[rstest::rstest]
+    #[case("0")]
+    #[case("-0")]
+    #[case("-0.00000000000000000000000000000")]
+    #[case("-0e-28")]
+    fn reported_cash_balance_accepts_signed_zero(#[case] amount: &str) {
+        let response: serde_json::Value = serde_json::from_str(include_str!(
+            "../../test_data/http_get_account_balance.json"
+        ))
+        .unwrap();
+        let mut raw: OKXAccount = serde_json::from_value(response["data"][0].clone()).unwrap();
+        raw.details.truncate(1);
+        raw.details[0].cash_bal = amount.into();
+        raw.details[0].avail_bal = amount.into();
+        let state = parse_account_state_with_source(
+            &raw,
+            AccountId::from("OKX-001"),
+            AccountType::Cash,
+            300.into(),
+            OKXAccountUpdate::Rest,
+            Some(200.into()),
+        )
+        .unwrap();
+        assert!(state.balances[0].total.is_zero());
+        assert!(state.balances[0].free.is_zero());
+        assert!(state.balances[0].locked.is_zero());
+    }
+
+    #[rstest::rstest]
     fn rest_observation_preserves_currency_time_and_rejects_replayed_snapshot() {
         let response: serde_json::Value = serde_json::from_str(include_str!(
             "../../test_data/http_get_account_balance.json"

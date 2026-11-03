@@ -3088,6 +3088,82 @@ async fn test_account_snapshot_rejects_ambiguous_cardinality(#[case] count: usiz
 }
 
 #[rstest]
+#[case::currency_precision("1.23456789", "1.23456789", true)]
+#[case::native_precision("1.234567891", "1.234567889", true)]
+#[case::excess_precision("1.23456789000000001", "1.23456789000000001", false)]
+#[case::clamped("1.234567891", "1.234567892", false)]
+#[tokio::test]
+async fn test_account_snapshot_native_precision_observation(
+    #[case] total: &str,
+    #[case] free: &str,
+    #[case] exact: bool,
+) {
+    use nautilus_model::{accounts::AccountAny, enums::AccountType, types::Currency};
+    use nautilus_okx::common::account::reported_account_currency_balance_after;
+
+    let mut response = load_test_data("http_get_account_balance.json");
+    let mut detail = response["data"][0]["details"][0].clone();
+    detail["ccy"] = json!("ETH");
+    detail["cashBal"] = json!(total);
+    detail["availBal"] = json!(free);
+    detail["uTime"] = json!("1");
+    response["data"][0]["uTime"] = json!("1");
+    response["data"][0]["details"] = json!([detail]);
+    let router = Router::new().route(
+        "/api/v5/account/balance",
+        get(move || {
+            let response = response.clone();
+            async move { Json(response) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".into()),
+        Some("test_secret".into()),
+        Some("passphrase".into()),
+        Some(format!("http://{addr}")),
+        5,
+        0,
+        1,
+        1,
+        OKXEnvironment::Demo,
+        None,
+    )
+    .unwrap();
+    let id = AccountId::from("OKX-001");
+    let first = client
+        .request_account_state(id, AccountType::Cash)
+        .await
+        .unwrap();
+    let boundary = first.ts_init;
+    let mut account = AccountAny::from(first);
+    let second = client
+        .request_account_state(id, AccountType::Cash)
+        .await
+        .unwrap();
+    account.apply(second).unwrap();
+    let observation =
+        reported_account_currency_balance_after(&account, Currency::ETH(), boundary).unwrap();
+    assert_eq!(observation.is_some(), exact);
+    if let Some((balance, timestamp)) = observation {
+        assert_eq!(
+            balance.total.as_decimal(),
+            Decimal::from_str_exact(total).unwrap()
+        );
+        assert_eq!(
+            balance.free.as_decimal(),
+            Decimal::from_str_exact(free).unwrap()
+        );
+        assert_eq!(timestamp, UnixNanos::from(1_000_000));
+    }
+    server.abort();
+}
+
+#[rstest]
 #[tokio::test]
 async fn test_http_get_instruments_handles_rate_limit_error() {
     let state = Arc::new(TestServerState::default());

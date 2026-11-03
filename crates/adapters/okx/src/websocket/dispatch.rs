@@ -4615,6 +4615,92 @@ mod tests {
     }
 
     #[rstest]
+    #[case::same("1.234567891", true)]
+    #[case::changed("1.234567892", false)]
+    #[case::inexact("1.23456789100000001", false)]
+    fn account_updates_preserve_native_balance_observation(
+        #[case] latest_total: &str,
+        #[case] observed: bool,
+        #[values(AccountType::Cash, AccountType::Margin)] account_type: AccountType,
+    ) {
+        use nautilus_common::cache::Cache;
+
+        use crate::common::{
+            account::{OKXAccountUpdate, reported_account_currency_balance_after},
+            parse::parse_account_state_with_source,
+        };
+
+        let mut payload: serde_json::Value = serde_json::from_str(include_str!(
+            "../../test_data/http_get_account_balance.json"
+        ))
+        .unwrap();
+        let raw = &mut payload["data"][0];
+        let mut detail = raw["details"][0].clone();
+        detail["ccy"] = serde_json::json!("ETH");
+        detail["cashBal"] = serde_json::json!("1.234567891");
+        detail["availBal"] = serde_json::json!("1.234567891");
+        detail["uTime"] = serde_json::json!("1");
+        raw["details"] = serde_json::json!([detail]);
+        raw["uTime"] = serde_json::json!("1");
+        let source: OKXAccount = serde_json::from_value(raw.clone()).unwrap();
+        let id = AccountId::from("OKX-001");
+        let mut cache = Cache::default();
+
+        for (received, update, started) in [
+            (100, OKXAccountUpdate::WebSocketUpdate, None),
+            (300, OKXAccountUpdate::Rest, Some(200.into())),
+        ] {
+            let state = parse_account_state_with_source(
+                &source,
+                id,
+                account_type,
+                received.into(),
+                update,
+                started,
+            )
+            .unwrap();
+            cache.update_account_state(&state).unwrap();
+        }
+        raw["details"][0]["cashBal"] = serde_json::json!(latest_total);
+        raw["details"][0]["availBal"] = serde_json::json!(latest_total);
+        let (emitter, mut receiver) = test_execution_emitter();
+        dispatch_ws_message(
+            OKXWsMessage::Account {
+                data: payload["data"].clone(),
+                update: OKXAccountUpdate::WebSocketUpdate,
+            },
+            &emitter,
+            &WsDispatchState::default(),
+            id,
+            account_type,
+            &AtomicMap::new(),
+            &mut FeeCache::new(),
+            &mut FilledQtyCache::new(),
+            &mut AHashMap::new(),
+            get_atomic_clock_realtime(),
+        );
+        let events = drain_execution_events(&mut receiver);
+        assert_eq!(events.len(), 1);
+        let ExecutionEvent::Account(state) = &events[0] else {
+            panic!("Expected reported account update");
+        };
+        cache.update_account_state(state).unwrap();
+        let observation = reported_account_currency_balance_after(
+            &cache.account_owned(&id).unwrap(),
+            Currency::ETH(),
+            150.into(),
+        )
+        .unwrap();
+        assert_eq!(observation.is_some(), observed);
+        if let Some((balance, timestamp)) = observation {
+            assert_eq!(balance.total.as_decimal(), "1.234567891".parse().unwrap());
+            assert_eq!(balance.free, balance.total);
+            assert!(balance.locked.is_zero());
+            assert_eq!(timestamp.as_u64(), 1_000_000);
+        }
+    }
+
+    #[rstest]
     fn tracked_algo_live_and_pause_emit_one_parent_acceptance() {
         let mut messages = load_algo_order_messages("ws_orders_algo.json");
         let live = messages.remove(0);
