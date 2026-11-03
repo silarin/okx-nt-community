@@ -1817,6 +1817,21 @@ impl ExecutionEngine {
             && fills.is_empty()
             && let Some(order) = order.as_ref()
         {
+            // A regular live update carries a separate native acceptance event,
+            // projecting its companion status first would fabricate recovered acceptance.
+            // Keep valid term updates while leaving acceptance to the live event.
+            let preserve_live_acceptance = matches!(origin, OrderReportOrigin::Stream)
+                && report.order_status == OrderStatus::Accepted
+                && report.filled_qty.is_zero()
+                && order.filled_qty().is_zero()
+                && order.ts_submitted().is_some()
+                && order.ts_accepted().is_none()
+                && report.parent_venue_order_id.is_none()
+                && matches!(
+                    order.order_type(),
+                    OrderType::Market | OrderType::Limit | OrderType::MarketToLimit
+                );
+
             // Status projection supplies no recovery-completeness authority.
             // An unfilled submission can learn its venue identity from authoritative
             // status without inventing executions or replacing a known identity.
@@ -1855,6 +1870,9 @@ impl ExecutionEngine {
                 );
 
                 for mut event in events {
+                    if preserve_live_acceptance && matches!(event, OrderEventAny::Accepted(_)) {
+                        continue;
+                    }
                     // Identity recovery must not release a held terminal observation.
                     if defer_terminal
                         && !matches!(event, OrderEventAny::Accepted(_))

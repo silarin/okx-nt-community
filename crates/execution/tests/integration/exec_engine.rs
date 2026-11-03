@@ -23567,6 +23567,199 @@ fn test_order_query_with_fills_rejects_conflicting_canonical_side(
 }
 
 #[rstest]
+#[case::submitted_limit(OrderType::Limit, OrderStatus::Submitted)]
+#[case::submitted_market(OrderType::Market, OrderStatus::Submitted)]
+#[case::submitted_market_to_limit(OrderType::MarketToLimit, OrderStatus::Submitted)]
+#[case::accepted(OrderType::Limit, OrderStatus::Accepted)]
+#[case::pending_update(OrderType::Limit, OrderStatus::PendingUpdate)]
+#[case::pending_cancel(OrderType::Limit, OrderStatus::PendingCancel)]
+fn test_zero_fill_stream_preserves_regular_lifecycle(
+    mut execution_engine: ExecutionEngine,
+    #[case] order_type: OrderType,
+    #[case] status: OrderStatus,
+) {
+    let (instrument, order) = prepare_initialized_order_with_account(
+        &execution_engine,
+        CashAccount::default().into(),
+        order_type,
+    );
+    let account = AccountId::test_default();
+    let id = order.client_order_id();
+    let venue = VenueOrderId::from("V-LIVE");
+    execution_engine.process(&TestOrderEventStubs::submitted(&order, account));
+    if status != OrderStatus::Submitted {
+        execution_engine.process(&TestOrderEventStubs::accepted(&order, account, venue));
+    }
+
+    if status == OrderStatus::PendingUpdate {
+        execution_engine.process(&OrderEventAny::PendingUpdate(build_order_pending_update(
+            order.trader_id(),
+            order.strategy_id(),
+            instrument.id(),
+            id,
+            account,
+            Some(venue),
+        )));
+    } else if status == OrderStatus::PendingCancel {
+        execution_engine.process(&OrderEventAny::PendingCancel(build_order_pending_cancel(
+            order.trader_id(),
+            order.strategy_id(),
+            instrument.id(),
+            id,
+            account,
+            Some(venue),
+        )));
+    }
+    let before = cached_order_or(&execution_engine, &order);
+    assert_eq!(before.status(), status);
+    let mut report = create_order_status_report(
+        Some(id),
+        venue,
+        instrument.id(),
+        OrderStatus::Accepted,
+        order.quantity(),
+        Quantity::from(0),
+    );
+    report.order_type = order_type;
+    let (handler, observations) = get_any_saving_handler::<OrderStatusReport>(None);
+    let topic = MessagingSwitchboard::reconciliation_raw_order_status_report_topic();
+    msgbus::subscribe_any(topic.into(), handler.clone(), None);
+    execution_engine.reconcile_execution_report(&ExecutionReport::OrderFillEvidence(
+        Box::new(report),
+        Vec::new(),
+    ));
+    msgbus::unsubscribe_any(topic.into(), &handler);
+    assert_eq!(observations.get_messages().len(), 1);
+    assert_eq!(
+        cached_order_or(&execution_engine, &order).events(),
+        before.events()
+    );
+
+    if status == OrderStatus::Submitted {
+        let live = TestOrderEventStubs::accepted(&order, account, venue);
+        execution_engine.process(&live);
+        execution_engine.process(&live);
+        let accepted = cached_order_or(&execution_engine, &order);
+        assert_eq!(accepted.status(), OrderStatus::Accepted);
+        let acceptances: Vec<_> = accepted
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                OrderEventAny::Accepted(event) => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(acceptances.len(), 1);
+        assert!(!acceptances[0].reconciliation);
+    }
+    let cache = execution_engine.cache().borrow();
+    assert!(cache.order(&id).unwrap().filled_qty().is_zero());
+    assert!(cache.positions(None, None, None, None, None).is_empty());
+}
+
+#[rstest]
+fn test_zero_fill_stream_preserves_amended_terms_before_acceptance(
+    mut execution_engine: ExecutionEngine,
+    #[values(false, true)] pending_update: bool,
+) {
+    let (instrument, order) = prepare_initialized_order_with_account(
+        &execution_engine,
+        CashAccount::default().into(),
+        OrderType::Limit,
+    );
+    let account = AccountId::test_default();
+    let id = order.client_order_id();
+    let venue = VenueOrderId::from("V-FIRST-AMENDED");
+    execution_engine.process(&TestOrderEventStubs::submitted(&order, account));
+
+    if pending_update {
+        execution_engine.process(&OrderEventAny::PendingUpdate(build_order_pending_update(
+            order.trader_id(),
+            order.strategy_id(),
+            instrument.id(),
+            id,
+            account,
+            None,
+        )));
+    }
+    let mut report = create_order_status_report(
+        Some(id),
+        venue,
+        instrument.id(),
+        OrderStatus::Accepted,
+        Quantity::from(110_000),
+        Quantity::from(0),
+    );
+    report.price = Some(Price::from("1.10000"));
+    execution_engine.reconcile_execution_report(&ExecutionReport::OrderFillEvidence(
+        Box::new(report.clone()),
+        Vec::new(),
+    ));
+    let updated = cached_order_or(&execution_engine, &order);
+    assert_eq!(updated.quantity(), report.quantity);
+    assert_eq!(updated.price(), report.price);
+    assert!(updated.ts_accepted().is_none());
+    assert!(
+        updated
+            .events()
+            .iter()
+            .any(|event| matches!(event, OrderEventAny::Updated(_)))
+    );
+    assert!(
+        !updated
+            .events()
+            .iter()
+            .any(|event| matches!(event, OrderEventAny::Accepted(_)))
+    );
+    execution_engine.process(&TestOrderEventStubs::accepted(&order, account, venue));
+    let accepted = cached_order_or(&execution_engine, &order);
+    assert_eq!(accepted.status(), OrderStatus::Accepted);
+    assert_eq!(accepted.quantity(), report.quantity);
+    assert_eq!(accepted.price(), report.price);
+    assert!(
+        matches!(accepted.last_event(), OrderEventAny::Accepted(event) if !event.reconciliation)
+    );
+    assert!(accepted.filled_qty().is_zero());
+}
+
+#[rstest]
+fn test_zero_fill_stream_keeps_external_acceptance_reconciliation(
+    mut execution_engine: ExecutionEngine,
+) {
+    let instrument = audusd_sim();
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone().into())
+        .unwrap();
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_account(CashAccount::default().into())
+        .unwrap();
+    let id = ClientOrderId::from("O-EXTERNAL-LIVE");
+    let report = create_order_status_report(
+        Some(id),
+        VenueOrderId::from("V-EXTERNAL-LIVE"),
+        instrument.id(),
+        OrderStatus::Accepted,
+        Quantity::from(100_000),
+        Quantity::from(0),
+    );
+    execution_engine.reconcile_execution_report(&ExecutionReport::OrderFillEvidence(
+        Box::new(report),
+        Vec::new(),
+    ));
+    let cache = execution_engine.cache().borrow();
+    let order = cache.order(&id).unwrap();
+    assert_eq!(order.status(), OrderStatus::Accepted);
+    assert!(order.ts_submitted().is_none());
+    assert!(order.events().iter().any(|event| matches!(event,
+        OrderEventAny::Accepted(event) if event.reconciliation)));
+    assert!(order.filled_qty().is_zero());
+}
+
+#[rstest]
 #[case("matching", Some(OrderStatus::Accepted))]
 #[case("canceled", Some(OrderStatus::Canceled))]
 #[case("expired", Some(OrderStatus::Expired))]

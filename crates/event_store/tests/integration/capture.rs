@@ -53,7 +53,9 @@ use nautilus_model::{
     },
     events::{
         AccountState, OrderEventAny, OrderFilled,
-        order::spec::{OrderFilledSpec, OrderInitializedSpec},
+        order::spec::{
+            OrderCancelDeniedSpec, OrderFilledSpec, OrderInitializedSpec, OrderModifyDeniedSpec,
+        },
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId,
@@ -907,6 +909,239 @@ fn tap_path_writes_headers_from_data_response_correlation_handler() {
     drop(adapter);
     let writer = Arc::try_unwrap(writer).expect("sole writer reference");
     let _ = writer.close(run_ended_draft()).expect("close writer");
+}
+
+#[rstest]
+fn command_denial_capture_preserves_replay_history(
+    #[values(false, true)] cancel: bool,
+    #[values(false, true)] snapshot_after_denial: bool,
+    #[values(false, true)] intermediate_query: bool,
+) {
+    let _bus = MessageBus::new(TraderId::from("TRADER-001"), UUID4::new(), None, None)
+        .register_message_bus();
+    let (writer, backend_arc) = writer_with_open_run("command-denial-history", noop_halt());
+    let submitted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let adapter = Arc::new(
+        BusCaptureAdapter::new(
+            Arc::clone(&writer),
+            Arc::new(default_registry()),
+            noop_halt(),
+        )
+        .with_submit_counter(Arc::clone(&submitted)),
+    );
+    msgbus::set_bus_tap(Rc::new(AdapterTap {
+        adapter: Arc::clone(&adapter),
+    }));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let mut engine = ExecutionEngine::new(
+        Rc::new(RefCell::new(VirtualClock::new())),
+        Rc::clone(&cache),
+        None,
+    );
+    let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_account(CashAccount::default().into())
+        .unwrap();
+    engine.register_oms_type(StrategyId::external(), OmsType::Netting);
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(TraderId::from("TRADER-001"))
+        .strategy_id(StrategyId::external())
+        .instrument_id(instrument.id())
+        .client_order_id(ClientOrderId::from("O-DENIAL-HISTORY"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100_000))
+        .price(Price::from("1.00000"))
+        .build();
+    let account_id = AccountId::from("SIM-001");
+    let venue_order_id = VenueOrderId::from("V-DENIAL-HISTORY");
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, true)
+        .unwrap();
+    msgbus::publish_any(
+        msgbus::switchboard::get_event_order_topic(order.strategy_id()),
+        order.events()[0],
+    );
+    engine.process(&TestOrderEventStubs::submitted(&order, account_id));
+    engine.process(&TestOrderEventStubs::accepted(
+        &order,
+        account_id,
+        venue_order_id,
+    ));
+    let denial = if cancel {
+        OrderEventAny::CancelDenied(
+            OrderCancelDeniedSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(instrument.id())
+                .client_order_id(order.client_order_id())
+                .account_id(account_id)
+                .venue_order_id(venue_order_id)
+                .causation_id(UUID4::new())
+                .build(),
+        )
+    } else {
+        OrderEventAny::ModifyDenied(
+            OrderModifyDeniedSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(instrument.id())
+                .client_order_id(order.client_order_id())
+                .account_id(account_id)
+                .venue_order_id(venue_order_id)
+                .causation_id(UUID4::new())
+                .build(),
+        )
+    };
+    engine.process(&denial);
+    let snapshot_order = cache
+        .borrow()
+        .order_owned(&order.client_order_id())
+        .unwrap();
+    assert_eq!(snapshot_order.last_event(), &denial);
+    let anchor_seq = submitted.load(std::sync::atomic::Ordering::Relaxed);
+    let first = OrderFilledSpec::builder()
+        .trader_id(order.trader_id())
+        .strategy_id(order.strategy_id())
+        .instrument_id(instrument.id())
+        .client_order_id(order.client_order_id())
+        .venue_order_id(venue_order_id)
+        .account_id(account_id)
+        .trade_id(TradeId::from("T-DENIAL-FIRST"))
+        .order_side(order.order_side())
+        .order_type(order.order_type())
+        .last_qty(Quantity::from(40_000))
+        .last_px(Price::from("1.00000"))
+        .currency(Currency::USD())
+        .commission(Money::from("0.01 USD"))
+        .liquidity_side(LiquiditySide::Maker)
+        .ts_event(UnixNanos::from(10))
+        .build();
+    engine.process(&OrderEventAny::Filled(first.clone()));
+
+    if intermediate_query {
+        let position_id = cache
+            .borrow()
+            .order_owned(&order.client_order_id())
+            .unwrap()
+            .position_id();
+        let fill = FillReport::new(
+            account_id,
+            instrument.id(),
+            venue_order_id,
+            first.trade_id,
+            first.order_side,
+            first.last_qty,
+            first.last_px,
+            first.commission.unwrap(),
+            first.liquidity_side,
+            Some(order.client_order_id()),
+            position_id,
+            first.ts_event,
+            first.ts_init,
+            None,
+        );
+        let mut report = OrderStatusReport::new(
+            account_id,
+            instrument.id(),
+            Some(order.client_order_id()),
+            venue_order_id,
+            Some(order.order_side()),
+            order.order_type(),
+            order.time_in_force(),
+            OrderStatus::PartiallyFilled,
+            order.quantity(),
+            first.last_qty,
+            first.ts_event,
+            first.ts_event,
+            first.ts_init,
+            None,
+        )
+        .with_price(first.last_px);
+        report.venue_position_id = position_id;
+        let query = ExecutionReport::OrderQueryWithFills(Box::new(report), vec![fill]);
+        // The host publishes the complete query before invoking engine projection.
+        msgbus::publish_any(
+            MessagingSwitchboard::reconciliation_raw_order_query_topic(),
+            &query,
+        );
+        engine.reconcile_execution_report(&query);
+    }
+    // Equal exchange timestamps require the persisted intermediate state witness.
+    let mut second = first;
+    second.event_id = UUID4::new();
+    second.trade_id = TradeId::from("T-DENIAL-SECOND");
+    second.last_qty = Quantity::from(60_000);
+    second.commission = Some(Money::from("0.02 USD"));
+    engine.process(&OrderEventAny::Filled(second));
+    let final_order = cache
+        .borrow()
+        .order_owned(&order.client_order_id())
+        .unwrap();
+    assert_eq!(final_order.status(), OrderStatus::Filled);
+    let last_seq = submitted.load(std::sync::atomic::Ordering::Relaxed);
+    drain(&writer, last_seq);
+
+    if snapshot_after_denial {
+        backend_arc
+            .lock()
+            .record_snapshot_anchor(SnapshotAnchor::new(anchor_seq, "cache://denial", "fixture"))
+            .unwrap();
+    }
+    msgbus::clear_bus_tap();
+    drop(adapter);
+    Arc::try_unwrap(writer)
+        .unwrap()
+        .close(run_ended_draft())
+        .unwrap();
+    let backend = Arc::try_unwrap(backend_arc).unwrap().into_inner();
+    let denial_type = if cancel {
+        "OrderCancelDenied"
+    } else {
+        "OrderModifyDenied"
+    };
+    let entries = backend
+        .scan_range(1, last_seq, ScanDirection::Forward)
+        .unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.payload_type.as_str() == "OrderQueryWithFills")
+            .count(),
+        usize::from(intermediate_query)
+    );
+    let copies = entries
+        .iter()
+        .filter(|entry| entry.payload_type.as_str() == denial_type)
+        .collect::<Vec<_>>();
+    assert_eq!(copies.len(), 2);
+    assert_ne!(copies[0].topic, copies[1].topic);
+    let reader = EventStoreReader::new(backend);
+    let mut restored = Cache::default();
+    restored.add_instrument(instrument).unwrap();
+    restore_cache_snapshot_and_replay_tail(&mut restored, &reader, |cache, anchor| {
+        assert_eq!(anchor.is_some(), snapshot_after_denial);
+        if anchor.is_some() {
+            cache
+                .add_order(snapshot_order.clone(), None, None, false)
+                .unwrap();
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        restored.order(&order.client_order_id()).unwrap().events(),
+        final_order.events()
+    );
+    let positions = restored.positions(None, None, None, None, None);
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].quantity, Quantity::from(100_000));
+    assert_eq!(positions[0].commissions(), vec![Money::from("0.03 USD")]);
 }
 
 #[rstest]
