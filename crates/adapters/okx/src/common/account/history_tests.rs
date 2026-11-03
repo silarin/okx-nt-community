@@ -376,14 +376,15 @@ fn rest_request_overlapping_an_account_event_cannot_establish_proof(#[case] init
 }
 
 #[rstest]
-#[case("10", "11")]
-#[case("10.0000000001", "10")]
-#[case("10", "9.9999999999")]
-#[case("10.0000000000000000000000000000000001", "10")]
-#[case("10", "9.9999999999999999999999999999999999")]
-fn normalized_source_values_cannot_prove_an_unchanged_balance(
+#[case("10", "11", false)]
+#[case("10.0000000001", "10", cfg!(feature = "high-precision"))]
+#[case("10", "9.9999999999", cfg!(feature = "high-precision"))]
+#[case("10.0000000000000000000000000000000001", "10", false)]
+#[case("10", "9.9999999999999999999999999999999999", false)]
+fn changed_source_values_cannot_prove_an_unchanged_balance(
     #[case] total: &str,
     #[case] free: &str,
+    #[case] exact_change: bool,
 ) {
     use crate::{common::parse::parse_account_state_with_source, http::models::OKXAccount};
     let mut payload: serde_json::Value = serde_json::from_str(include_str!(
@@ -423,11 +424,19 @@ fn normalized_source_values_cannot_prove_an_unchanged_balance(
         None,
     )
     .unwrap();
-    // The ordinary native balance normalization is unchanged, but cannot certify equality.
-    assert_eq!(
-        reported_currency_balance(&websocket, Currency::ETH()).unwrap(),
-        expected
-    );
+    let reported = reported_currency_balance(&websocket, Currency::ETH()).unwrap();
+    let info: OKXAccountStateInfo =
+        serde_json::from_value(websocket.info.as_ref().unwrap()["okx"].clone()).unwrap();
+    assert_eq!(info.exact_balance_currencies.contains("ETH"), exact_change);
+    if exact_change {
+        let (balance, _) = reported.unwrap();
+        assert_eq!(balance.total.as_decimal(), total.parse().unwrap());
+        assert_eq!(balance.free.as_decimal(), free.parse().unwrap());
+        assert_ne!(reported, expected);
+    } else {
+        // Rounded or clamped equality still cannot certify unchanged source balances
+        assert_eq!(reported, expected);
+    }
     account.apply(websocket).unwrap();
     assert!(observed(&account, 200).unwrap().is_none());
 }

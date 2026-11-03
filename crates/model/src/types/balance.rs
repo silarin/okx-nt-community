@@ -152,22 +152,7 @@ impl AccountBalance {
     ) -> CorrectnessResult<Self> {
         let total = Money::from_decimal(total, currency)?;
         let free = Money::from_decimal(free, currency)?;
-
-        let clamped_free = if total.is_negative() {
-            free
-        } else {
-            free.clamp(Money::zero(currency), total)
-        };
-
-        let locked = total.checked_sub(clamped_free).ok_or_else(|| {
-            CorrectnessError::PredicateViolation {
-                message: format!(
-                    "Derived `locked` exceeds Money bounds for `total` {total} and `free` {clamped_free}"
-                ),
-            }
-        })?;
-
-        Ok(Self::new(total, locked, clamped_free))
+        Self::from_money_total_and_free(total, free)
     }
 
     /// Creates a balance from native money amounts and derives `free` without rounding.
@@ -204,6 +189,40 @@ impl AccountBalance {
         })?;
 
         Self::new_checked(total, clamped_locked, free)
+    }
+
+    /// Creates a balance from native money amounts and derives `locked` without rounding.
+    ///
+    /// Applies the same clamping rules as [`Self::from_total_and_free`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if currencies differ or the derived `locked` balance exceeds money bounds.
+    pub fn from_money_total_and_free(total: Money, free: Money) -> CorrectnessResult<Self> {
+        if total.currency != free.currency {
+            return Err(CorrectnessError::PredicateViolation {
+                message: format!(
+                    "`total` currency ({}) != `free` currency ({})",
+                    total.currency, free.currency
+                ),
+            });
+        }
+
+        let clamped_free = if total.is_negative() {
+            free
+        } else {
+            free.clamp(Money::zero(total.currency), total)
+        };
+
+        let locked = total.checked_sub(clamped_free).ok_or_else(|| {
+            CorrectnessError::PredicateViolation {
+                message: format!(
+                    "Derived `locked` exceeds Money bounds for `total` {total} and `free` {clamped_free}"
+                ),
+            }
+        })?;
+
+        Self::new_checked(total, locked, clamped_free)
     }
 }
 
@@ -1097,6 +1116,46 @@ mod tests {
         assert!(
             error.to_string().contains("Money"),
             "unexpected message: {error}"
+        );
+    }
+
+    #[rstest]
+    #[case("1.234567891", "1.234567889", "1.234567889", "0.000000002")]
+    #[case("1.234567891", "2", "1.234567891", "0")]
+    #[case("1.234567891", "-0.000000001", "0", "1.234567891")]
+    #[case("-1.234567891", "0.000000001", "0.000000001", "-1.234567892")]
+    #[case("-1.234567891", "-1.234567892", "-1.234567892", "0.000000001")]
+    fn test_money_total_and_free_preserves_precision_and_clamping(
+        #[case] total: &str,
+        #[case] free: &str,
+        #[case] expected_free: &str,
+        #[case] expected_locked: &str,
+    ) {
+        let currency = Currency::ETH();
+        let total = Money::from_decimal_exact(parse_dec(total), currency).unwrap();
+        let free = Money::from_decimal_exact(parse_dec(free), currency).unwrap();
+        let balance = AccountBalance::from_money_total_and_free(total, free).unwrap();
+        assert_eq!(balance.total, total);
+        assert_eq!(balance.free.as_decimal(), parse_dec(expected_free));
+        assert_eq!(balance.locked.as_decimal(), parse_dec(expected_locked));
+        assert_eq!(balance.total, balance.locked + balance.free);
+        assert_eq!(balance.currency, currency);
+    }
+
+    #[rstest]
+    fn test_money_total_and_free_rejects_currency_mismatch_and_overflow() {
+        use crate::types::money::{MONEY_MAX, MONEY_MIN};
+
+        assert!(
+            AccountBalance::from_money_total_and_free(Money::from("1 ETH"), Money::from("1 BTC"),)
+                .is_err()
+        );
+        assert!(
+            AccountBalance::from_money_total_and_free(
+                Money::new(MONEY_MIN, Currency::ETH()),
+                Money::new(MONEY_MAX, Currency::ETH()),
+            )
+            .is_err()
         );
     }
 

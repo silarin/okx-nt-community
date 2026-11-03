@@ -3110,13 +3110,23 @@ pub(crate) fn parse_account_state_with_source(
             continue;
         };
 
-        match AccountBalance::from_total_and_free(total, free, currency) {
-            Ok(balance) => {
-                anyhow::ensure!(
-                    account_type != AccountType::Cash || !balance.total.is_negative(),
-                    "OKX cash account reports a negative balance"
-                );
+        // Check the validated source coefficient before rounding can erase a negative value
+        let negative_total = b.cash_bal.starts_with('-')
+            && b.cash_bal
+                .split(['e', 'E'])
+                .next()
+                .is_some_and(|coefficient| coefficient.bytes().any(|b| matches!(b, b'1'..=b'9')));
+        anyhow::ensure!(
+            account_type != AccountType::Cash || !negative_total,
+            "OKX cash account reports a negative balance"
+        );
+        let balance = Money::from_decimal_native(total, currency).and_then(|total| {
+            let free = Money::from_decimal_native(free, currency)?;
+            AccountBalance::from_money_total_and_free(total, free)
+        });
 
+        match balance {
+            Ok(balance) => {
                 if Decimal::from_str_exact(&b.cash_bal)
                     .is_ok_and(|value| balance.total.as_decimal() == value)
                     && Decimal::from_str_exact(&b.avail_bal)
@@ -4576,14 +4586,12 @@ mod tests {
 
         // Check the USDT balance details
         let usdt_balance = &account_state.balances[0];
-        assert_eq!(
-            usdt_balance.total,
-            Money::new(94.426_129_903_333_33, Currency::USDT())
-        );
-        assert_eq!(
-            usdt_balance.free,
-            Money::new(94.426_129_903_333_33, Currency::USDT())
-        );
+        #[cfg(feature = "high-precision")]
+        let expected = "94.42612990333333 USDT";
+        #[cfg(not(feature = "high-precision"))]
+        let expected = "94.426129903 USDT";
+        assert_eq!(usdt_balance.total, Money::from_str_exact(expected).unwrap());
+        assert_eq!(usdt_balance.free, Money::from_str_exact(expected).unwrap());
         assert_eq!(usdt_balance.locked, Money::new(0.0, Currency::USDT()));
     }
 
