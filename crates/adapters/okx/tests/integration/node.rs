@@ -46,7 +46,7 @@ use nautilus_live::{
 };
 use nautilus_model::{
     enums::{OrderSide, OrderStatus, OrderType},
-    events::OrderEventAny,
+    events::{OrderEventAny, order::spec::OrderPendingUpdateSpec},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId,
         VenueOrderId,
@@ -331,18 +331,39 @@ fn venue_update(filled: bool, submitted_ms: u64) -> Value {
 }
 
 #[rstest]
-#[case::timeout_50004(Some("50004"))]
-#[case::timeout_51149(Some("51149"))]
-#[case::missing_acknowledgement(None)]
+#[case::timeout_50004(Some("50004"), false)]
+#[case::timeout_51149(Some("51149"), false)]
+#[case::missing_acknowledgement(None, false)]
+#[case::amended_before_first_live(Some("50004"), true)]
 #[tokio::test]
 async fn submission_exhaustion_and_late_evidence(
     #[case] code: Option<&'static str>,
+    #[case] amend_first: bool,
     #[values(false, true)] retain: bool,
 ) {
     let (addr, venue) = start_venue(code).await;
     let events = Rc::new(RefCell::new(Vec::new()));
     let mut node = build_node(addr, retain, Rc::clone(&events));
     let cache = Rc::clone(&node.kernel().cache);
+    let engine = Rc::clone(&node.kernel().exec_engine);
+    let amended = amend_first && retain;
+    let quantity = Quantity::from(if amended { "0.00200000" } else { "0.00100000" });
+    let price = Price::from(if amended { "49000.0" } else { "50000.0" });
+    let update = |filled, submitted_ms| {
+        let mut frame = venue_update(filled, submitted_ms);
+        if amended {
+            let order = &mut frame["data"][0];
+            order["sz"] = json!(quantity.to_string());
+            order["px"] = json!(price.to_string());
+            if filled {
+                order["accFillSz"] = order["sz"].clone();
+                order["fillSz"] = order["sz"].clone();
+                order["avgPx"] = order["px"].clone();
+                order["fillPx"] = order["px"].clone();
+            }
+        }
+        frame
+    };
     let handle = node.handle();
     let (handler, diagnostics) = get_any_saving_handler::<SubmissionRecoveryExhausted>(None);
     let topic = MessagingSwitchboard::submission_recovery_exhausted_topic();
@@ -388,10 +409,23 @@ async fn submission_exhaustion_and_late_evidence(
             / 1_000_000;
 
         if retain && code == Some("50004") {
-            venue
-                .updates
-                .send(venue_update(false, submitted_ms))
-                .unwrap();
+            if amended {
+                // Model an in-flight amend before any live stream snapshot was received.
+                let order = cache
+                    .borrow()
+                    .order_owned(&ClientOrderId::from(CLIENT_ORDER_ID))
+                    .unwrap();
+                engine.borrow_mut().process(&OrderEventAny::PendingUpdate(
+                    OrderPendingUpdateSpec::builder()
+                        .trader_id(order.trader_id())
+                        .strategy_id(order.strategy_id())
+                        .instrument_id(order.instrument_id())
+                        .client_order_id(order.client_order_id())
+                        .account_id(order.account_id().unwrap())
+                        .build(),
+                ));
+            }
+            venue.updates.send(update(false, submitted_ms)).unwrap();
             wait_until_async(
                 || async {
                     events
@@ -403,7 +437,27 @@ async fn submission_exhaustion_and_late_evidence(
             )
             .await;
         }
-        let fill = venue_update(true, submitted_ms);
+
+        if retain && code == Some("50004") {
+            // A live zero-fill update must not be preempted by its companion status
+            let acceptances: Vec<_> = events
+                .borrow()
+                .iter()
+                .filter_map(|event| match event {
+                    OrderEventAny::Accepted(event) => Some(event.reconciliation),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(acceptances, vec![false]);
+            let order = cache
+                .borrow()
+                .order_owned(&ClientOrderId::from(CLIENT_ORDER_ID))
+                .unwrap();
+            assert_eq!(order.quantity(), quantity);
+            assert_eq!(order.price(), Some(price));
+            venue.updates.send(update(false, submitted_ms)).unwrap();
+        }
+        let fill = update(true, submitted_ms);
         venue.updates.send(fill.clone()).unwrap();
 
         if retain {
@@ -508,6 +562,16 @@ async fn submission_exhaustion_and_late_evidence(
             .count(),
         usize::from(retain)
     );
+
+    if retain && code == Some("50004") {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, OrderEventAny::Accepted(_)))
+                .count(),
+            1
+        );
+    }
     let cache = cache.borrow();
     let order = cache.order(&ClientOrderId::from(CLIENT_ORDER_ID)).unwrap();
 
@@ -517,7 +581,7 @@ async fn submission_exhaustion_and_late_evidence(
             order.venue_order_id(),
             Some(VenueOrderId::from(VENUE_ORDER_ID))
         );
-        assert_eq!(order.filled_qty(), Quantity::from("0.00100000"));
+        assert_eq!(order.filled_qty(), quantity);
         assert_eq!(order.trade_ids(), vec![&TradeId::from("1518905531")]);
         assert_eq!(
             order.commissions().get(&Currency::USD()),
@@ -525,7 +589,7 @@ async fn submission_exhaustion_and_late_evidence(
         );
         let positions = cache.positions_open(None, None, None, None, None);
         assert_eq!(positions.len(), 1);
-        assert_eq!(positions[0].quantity, Quantity::from("0.00100000"));
+        assert_eq!(positions[0].quantity, quantity);
     } else {
         assert_eq!(order.status(), OrderStatus::Rejected);
         assert_eq!(order.filled_qty(), Quantity::from("0.00000000"));
