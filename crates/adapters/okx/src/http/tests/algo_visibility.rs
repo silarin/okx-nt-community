@@ -131,13 +131,23 @@ pub(super) fn spawn_pages(
     mpsc::Receiver<(String, Instant)>,
     thread::JoinHandle<()>,
 ) {
+    spawn_responses(bodies.into_iter().map(|body| ("200 OK", body)).collect())
+}
+
+fn spawn_responses(
+    responses: Vec<(&'static str, String)>,
+) -> (
+    String,
+    mpsc::Receiver<(String, Instant)>,
+    thread::JoinHandle<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
     let (tx, rx) = mpsc::channel();
 
     let handle = thread::spawn(move || {
-        for body in bodies {
+        for (status, body) in responses {
             let deadline = Instant::now() + ALGO_RECONCILIATION_TIMEOUT;
             let mut stream = loop {
                 match listener.accept() {
@@ -162,7 +172,7 @@ pub(super) fn spawn_pages(
             }
             tx.send((String::from_utf8(request).unwrap(), Instant::now()))
                 .unwrap();
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         }
     });
     (format!("http://{address}"), rx, handle)
@@ -508,7 +518,14 @@ async fn all_algo_types_reject_invalid_response_provenance_and_schema_before_pag
                 .unwrap_err();
                 server.join().unwrap();
                 assert_eq!(rx.try_iter().count(), 1);
-                assert_eq!(error.chain().count(), 1);
+                let native_failure = error.downcast_ref::<OKXHttpError>().is_some();
+                assert_eq!(error.chain().count(), if native_failure { 2 } else { 1 });
+                assert_eq!(
+                    error
+                        .downcast_ref::<OKXAlgoVisibilityRequestContext>()
+                        .is_some(),
+                    native_failure
+                );
 
                 if field == "side" {
                     assert!(matches!(
@@ -677,4 +694,249 @@ async fn visibility_rejects_unsupported_or_duplicate_scopes_before_network(
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
     );
+}
+
+#[rstest::rstest]
+#[case(OKXInstrumentType::Margin, OKXAlgoOrderType::Oco, None, 2)]
+#[case(
+    OKXInstrumentType::Margin,
+    OKXAlgoOrderType::Trigger,
+    Some(OKXAlgoOrderStatus::Effective),
+    1
+)]
+#[case(OKXInstrumentType::Spot, OKXAlgoOrderType::Oco, None, 1)]
+#[case(
+    OKXInstrumentType::Spot,
+    OKXAlgoOrderType::SmartIceberg,
+    Some(OKXAlgoOrderStatus::Canceled),
+    2
+)]
+#[tokio::test]
+async fn contextual_visibility_identifies_failed_page_without_retry_or_partial_result(
+    #[case] instrument_type: OKXInstrumentType,
+    #[case] order_type: OKXAlgoOrderType,
+    #[case] state: Option<OKXAlgoOrderStatus>,
+    #[case] page_number: usize,
+) {
+    let type_index = TYPED_ALGO_ORDER_TYPES
+        .iter()
+        .position(|t| *t == order_type)
+        .unwrap();
+    let state_index = match state {
+        None => 0,
+        Some(OKXAlgoOrderStatus::Effective) => 1,
+        Some(OKXAlgoOrderStatus::Canceled) => 2,
+        _ => unreachable!(),
+    };
+    let route_index = if instrument_type == OKXInstrumentType::Spot {
+        28
+    } else {
+        0
+    } + type_index * 4
+        + state_index;
+    let wire_instrument = serde_json::to_value(instrument_type).unwrap();
+    let wire_type = serde_json::to_value(order_type).unwrap();
+    let wire_state = state.map(|state| serde_json::to_value(state).unwrap());
+
+    for status in ["200 OK", "500 Internal Server Error"] {
+        let mut responses = vec![("200 OK", response(vec![])); route_index];
+
+        if page_number == 2 {
+            let page = (9_000_000_000_000_101..=9_000_000_000_000_200)
+                .rev()
+                .map(|id| {
+                    order(
+                        wire_instrument.as_str().unwrap(),
+                        wire_type.as_str().unwrap(),
+                        wire_state
+                            .as_ref()
+                            .map_or("live", |state| state.as_str().unwrap()),
+                        id,
+                    )
+                })
+                .collect();
+            responses.push(("200 OK", response(page)));
+        }
+        let private = "PRIVATE_RESPONSE_CANARY\u{1b}[31m";
+        responses.push((
+            status,
+            json!({"code":"51054", "msg":private, "data":[]}).to_string(),
+        ));
+        let (url, rx, server) = spawn_responses(responses);
+        let started = Instant::now();
+        let error = client_at(url)
+            .get_algo_order_visibility_with_context(&APPROVED_ALGO_INSTRUMENT_TYPES)
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+        let captured: Vec<_> = rx.try_iter().collect();
+        assert_eq!(captured.len(), route_index + page_number);
+        let context = error.context().unwrap();
+        assert_eq!(
+            context.route,
+            if state.is_some() {
+                OKXAlgoVisibilityRoute::History
+            } else {
+                OKXAlgoVisibilityRoute::Pending
+            }
+        );
+        assert_eq!(context.instrument_type, instrument_type);
+        assert_eq!(context.order_type, order_type);
+        assert_eq!(context.state, state);
+        assert_eq!(context.page_number, page_number);
+        assert!(context.elapsed > Duration::ZERO && context.elapsed <= elapsed);
+        for formatted in [
+            format!("{error}"),
+            format!("{error:#}"),
+            format!("{error:?}"),
+            format!("{error:#?}"),
+        ] {
+            assert!(
+                !formatted.contains("PRIVATE_RESPONSE_CANARY") && !formatted.contains('\u{1b}')
+            );
+            assert!(!formatted.contains("9000000000000101"));
+            assert!(!formatted.contains("test-secret") && !formatted.contains("test-key"));
+        }
+        assert!(std::error::Error::source(&error).is_none());
+        let inner = error.into_inner();
+        assert!(!inner.is_retryable());
+        assert_eq!(inner.retry_after(), None);
+        assert!(
+            matches!(inner, OKXHttpError::OkxError { error_code, message } if error_code == "51054" && message == private)
+        );
+        let endpoint = if state.is_some() {
+            "history"
+        } else {
+            "pending"
+        };
+        let mut path = format!(
+            "/api/v5/trade/orders-algo-{endpoint}?instType={}&ordType={}",
+            wire_instrument.as_str().unwrap(),
+            wire_type.as_str().unwrap()
+        );
+
+        if let Some(state) = &wire_state {
+            write!(path, "&state={}", state.as_str().unwrap()).unwrap();
+        }
+
+        if page_number == 2 {
+            path.push_str("&after=9000000000000101");
+        }
+        path.push_str("&limit=100");
+        assert_signed_get(&captured.last().unwrap().0, &path);
+    }
+}
+
+#[tokio::test]
+async fn contextual_visibility_preserves_complete_success_and_unscoped_validation() {
+    let (url, rx, server) = spawn_pages(vec![response(vec![]); 56]);
+    let result = client_at(url)
+        .get_algo_order_visibility_with_context(&APPROVED_ALGO_INSTRUMENT_TYPES)
+        .await
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(rx.try_iter().count(), 56);
+    assert_eq!(result.queried_routes, 56);
+    assert!(result.pending_orders.is_empty() && result.terminal_orders.is_empty());
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let client = client_at(format!("http://{}", listener.local_addr().unwrap()));
+    for scopes in [
+        vec![],
+        vec![OKXInstrumentType::Spot, OKXInstrumentType::Spot],
+        vec![OKXInstrumentType::Swap],
+    ] {
+        let error = client
+            .get_algo_order_visibility_with_context(&scopes)
+            .await
+            .unwrap_err();
+        assert!(error.context().is_none());
+        assert!(matches!(
+            error.into_inner(),
+            OKXHttpError::ValidationError(_)
+        ));
+    }
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+
+    let bad_scope = order("SWAP", "oco", "live", 123);
+    let (url, rx, server) = spawn_pages(vec![response(vec![bad_scope])]);
+    let error = client_at(url)
+        .get_algo_order_visibility_with_context(&APPROVED_ALGO_INSTRUMENT_TYPES)
+        .await
+        .unwrap_err();
+    server.join().unwrap();
+    assert_eq!(rx.try_iter().count(), 1);
+    assert!(error.context().is_none());
+    assert!(matches!(
+        error.into_inner(),
+        OKXHttpError::ValidationError(_)
+    ));
+}
+
+#[tokio::test]
+async fn contextual_visibility_preserves_cancellation_and_releases_native_pacer() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = client_at(format!("http://{}", listener.local_addr().unwrap()));
+    let cancellation = client.cancellation_token().clone();
+    let request = tokio::spawn(async move {
+        client
+            .get_algo_order_visibility_with_context(&APPROVED_ALGO_INSTRUMENT_TYPES)
+            .await
+    });
+    let (_stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    cancellation.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        error.context().unwrap().route,
+        OKXAlgoVisibilityRoute::Pending
+    );
+    assert_eq!(error.context().unwrap().page_number, 1);
+    assert!(matches!(error.into_inner(), OKXHttpError::Canceled(_)));
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        pace_algo_visibility_request(|| async {}),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn contextual_visibility_keeps_http_status_and_decoding_errors_typed() {
+    for (status, body, is_status) in [
+        ("403 Forbidden", "PRIVATE_BODY_CANARY".to_owned(), true),
+        ("200 OK", "PRIVATE_BODY_CANARY".to_owned(), false),
+    ] {
+        let (url, rx, server) = spawn_responses(vec![(status, body)]);
+        let error = client_at(url)
+            .get_algo_order_visibility_with_context(&APPROVED_ALGO_INSTRUMENT_TYPES)
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(rx.try_iter().count(), 1);
+        assert_eq!(error.context().unwrap().page_number, 1);
+        assert!(!format!("{error:#?}").contains("PRIVATE_BODY_CANARY"));
+        assert!(!format!("{error:#}").contains("PRIVATE_BODY_CANARY"));
+        assert!(std::error::Error::source(&error).is_none());
+        let inner = error.into_inner();
+
+        if is_status {
+            assert!(
+                matches!(inner, OKXHttpError::UnexpectedStatus { status, .. } if status.as_u16() == 403)
+            );
+        } else {
+            assert!(matches!(inner, OKXHttpError::MalformedResponse(_)));
+        }
+    }
 }
