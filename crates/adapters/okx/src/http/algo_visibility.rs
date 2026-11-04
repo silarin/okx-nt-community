@@ -17,10 +17,13 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt::{Debug, Display},
     future::Future,
     sync::OnceLock,
     time::{Duration, Instant},
 };
+
+use anyhow::Context;
 
 use super::{
     client::OKXRawHttpClient,
@@ -73,6 +76,94 @@ pub struct OKXAlgoOrderVisibility {
     pub terminal_orders: Vec<OKXAlgoOrderIdentity>,
 }
 
+/// Native endpoint used by an algo visibility page read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OKXAlgoVisibilityRoute {
+    /// Untriggered algo orders.
+    Pending,
+    /// Terminal algo order history.
+    History,
+}
+
+/// Safe request metadata, excluding account, order and pagination cursor identities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OKXAlgoVisibilityRequestContext {
+    /// Native endpoint selected for the read.
+    pub route: OKXAlgoVisibilityRoute,
+    /// Requested account-wide instrument scope.
+    pub instrument_type: OKXInstrumentType,
+    /// Requested algo order type.
+    pub order_type: OKXAlgoOrderType,
+    /// Requested history state; absent for pending reads.
+    pub state: Option<OKXAlgoOrderStatus>,
+    /// One-based page number within the bounded route.
+    pub page_number: usize,
+    /// Time spent awaiting this page, including native pacing and retries.
+    pub elapsed: Duration,
+}
+
+impl Display for OKXAlgoVisibilityRequestContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "route={:?} instrument_type={:?} order_type={:?} state={:?} page={} elapsed={:?}",
+            self.route,
+            self.instrument_type,
+            self.order_type,
+            self.state,
+            self.page_number,
+            self.elapsed
+        )
+    }
+}
+
+/// Algo visibility failure with optional context for a failed native page request.
+///
+/// Display, Debug and the error source chain omit the original native error, which
+/// may contain untrusted response text. Explicit extraction retains its original
+/// variant, code and retry classification for existing typed error handling.
+pub struct OKXAlgoVisibilityError {
+    context: Option<OKXAlgoVisibilityRequestContext>,
+    inner: OKXHttpError,
+}
+
+impl OKXAlgoVisibilityError {
+    /// Returns context only when a native page request failed.
+    ///
+    /// Scope and collection validation failures have no request context. An outer
+    /// timeout cancels the future instead of returning a completed page failure.
+    #[must_use]
+    pub const fn context(&self) -> Option<&OKXAlgoVisibilityRequestContext> {
+        self.context.as_ref()
+    }
+
+    /// Returns the original native error, which may contain untrusted response text.
+    #[must_use]
+    pub fn into_inner(self) -> OKXHttpError {
+        self.inner
+    }
+}
+
+impl Display for OKXAlgoVisibilityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OKX algo visibility failed")?;
+        if let Some(context) = &self.context {
+            write!(f, ": {context}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Debug for OKXAlgoVisibilityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(OKXAlgoVisibilityError))
+            .field("context", &self.context)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::error::Error for OKXAlgoVisibilityError {}
+
 impl OKXRawHttpClient {
     /// Collects all seven cash algo types across pending and terminal SPOT/MARGIN routes.
     ///
@@ -88,6 +179,24 @@ impl OKXRawHttpClient {
         &self,
         instrument_types: &[OKXInstrumentType],
     ) -> anyhow::Result<OKXAlgoOrderVisibility, OKXHttpError> {
+        self.get_algo_order_visibility_with_context(instrument_types)
+            .await
+            .map_err(OKXAlgoVisibilityError::into_inner)
+    }
+
+    /// Collects complete algo visibility with safe context for failed page requests.
+    ///
+    /// Uses the same collection, validation, pacing and retry policy as
+    /// [`Self::get_algo_order_visibility`]. It never returns partial evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if transport fails or evidence is invalid or incomplete.
+    /// Failed page requests include context alongside the original native error.
+    pub async fn get_algo_order_visibility_with_context(
+        &self,
+        instrument_types: &[OKXInstrumentType],
+    ) -> Result<OKXAlgoOrderVisibility, OKXAlgoVisibilityError> {
         let mut seen = std::collections::HashSet::new();
 
         if instrument_types.is_empty()
@@ -96,16 +205,23 @@ impl OKXRawHttpClient {
                     || !seen.insert(*t)
             })
         {
-            return Err(OKXHttpError::ValidationError(
-                "Algo visibility requires distinct SPOT/MARGIN instrument types".into(),
-            ));
+            return Err(OKXAlgoVisibilityError {
+                context: None,
+                inner: OKXHttpError::ValidationError(
+                    "Algo visibility requires distinct SPOT/MARGIN instrument types".into(),
+                ),
+            });
         }
 
         self.collect_algo_order_visibility(instrument_types)
             .await
-            .map_err(|e| match e.downcast::<OKXHttpError>() {
-                Ok(e) => e,
-                Err(e) => OKXHttpError::ValidationError(e.to_string()),
+            .map_err(|e| {
+                let context = e.downcast_ref::<OKXAlgoVisibilityRequestContext>().copied();
+                let inner = match e.downcast::<OKXHttpError>() {
+                    Ok(e) => e,
+                    Err(e) => OKXHttpError::ValidationError(e.to_string()),
+                };
+                OKXAlgoVisibilityError { context, inner }
             })
     }
 
@@ -163,7 +279,19 @@ impl OKXRawHttpClient {
             let mut params = base.clone();
             params.after = cursor.take();
             params.limit = Some(PAGE_SIZE as u32);
-            let page = self.get_order_algo_pending(params).await?;
+            let started = Instant::now();
+            let page = self.get_order_algo_pending(params).await.with_context(|| {
+                OKXAlgoVisibilityRequestContext {
+                    route: OKXAlgoVisibilityRoute::Pending,
+                    instrument_type: base.inst_type,
+                    order_type: base
+                        .ord_type
+                        .expect("Algo visibility selects an order type"),
+                    state: base.state,
+                    page_number: page_index + 1,
+                    elapsed: started.elapsed(),
+                }
+            })?;
             validate_algo_page(&page, base, &mut seen)?;
             let page_len = page.len();
             cursor = page.last().map(|order| order.algo_id.clone());
@@ -191,7 +319,19 @@ impl OKXRawHttpClient {
             let mut params = base.clone();
             params.after = cursor.take();
             params.limit = Some(PAGE_SIZE as u32);
-            let page = self.get_order_algo_history(params).await?;
+            let started = Instant::now();
+            let page = self.get_order_algo_history(params).await.with_context(|| {
+                OKXAlgoVisibilityRequestContext {
+                    route: OKXAlgoVisibilityRoute::History,
+                    instrument_type: base.inst_type,
+                    order_type: base
+                        .ord_type
+                        .expect("Algo visibility selects an order type"),
+                    state: base.state,
+                    page_number: page_index + 1,
+                    elapsed: started.elapsed(),
+                }
+            })?;
             validate_algo_page(&page, base, &mut seen)?;
             let page_len = page.len();
             cursor = page.last().map(|order| order.algo_id.clone());
