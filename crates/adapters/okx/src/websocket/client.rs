@@ -62,7 +62,7 @@ use nautilus_network::{
     ratelimiter::quota::Quota,
     websocket::{
         AUTHENTICATION_TIMEOUT_SECS, AuthTracker, SubscriptionState, TEXT_PING, TransportBackend,
-        WebSocketClient, WebSocketConfig, channel_message_handler,
+        WebSocketClient, WebSocketConfig, channel_epoch_message_handler,
     },
 };
 use parking_lot::Mutex;
@@ -227,6 +227,7 @@ pub struct OKXWebSocketClient {
     auth_tracker: AuthTracker,
     signal: Arc<AtomicBool>,
     connection_mode: Arc<ArcSwap<AtomicU8>>,
+    connection_epoch: Arc<ArcSwap<AtomicU64>>,
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
     out_rx: Option<Arc<tokio::sync::mpsc::UnboundedReceiver<OKXWsMessage>>>,
     handler_tasks: Arc<TaskGroup>,
@@ -372,6 +373,7 @@ impl OKXWebSocketClient {
             connection_mode: Arc::new(ArcSwap::from_pointee(AtomicU8::new(
                 ConnectionMode::Closed.as_u8(),
             ))),
+            connection_epoch: Arc::new(ArcSwap::from_pointee(AtomicU64::new(0))),
             cmd_tx: {
                 // Placeholder channel until connect() creates the real handler and replays queued instruments
                 let (tx, _) = tokio::sync::mpsc::unbounded_channel();
@@ -678,7 +680,8 @@ impl OKXWebSocketClient {
         // Reset signal so is_active()/is_closed() work after a previous close()
         self.signal.store(false, Ordering::Release);
 
-        let (message_handler, raw_rx) = channel_message_handler();
+        self.subscriptions_state.reset_after_reconnect();
+        let (message_handler, raw_rx) = channel_epoch_message_handler();
 
         // No-op ping handler: handler owns the WebSocketClient and responds to pings directly
         // in the message loop for minimal latency (see handler.rs TEXT_PONG response)
@@ -767,9 +770,9 @@ impl OKXWebSocketClient {
             SocketStateSink::new(on_state)
         };
 
-        let client = WebSocketClient::builder()
+        let client = WebSocketClient::epoch_builder()
             .config(config)
-            .message_handler(message_handler)
+            .epoch_handler(message_handler)
             .keyed_quotas(keyed_quotas)
             .default_quota(*OKX_WS_CONNECTION_QUOTA)
             .maybe_state_sink(Some(state_sink))
@@ -781,6 +784,8 @@ impl OKXWebSocketClient {
         let connection_epoch = ws_client.connection_epoch();
 
         let connection_mode = ws_client.connection_mode_atomic();
+        self.connection_epoch
+            .store(ws_client.connection_epoch_atomic());
         let reconnect_handle = ws_client.reconnect_handle();
 
         self.out_rx = Some(Arc::new(rx));
@@ -868,8 +873,6 @@ impl OKXWebSocketClient {
 
                             auth_tracker.invalidate();
                             has_reconnected = true;
-
-                            subscriptions_state.reset_after_reconnect();
 
                             if let Some(credential) = credential.clone() {
                                 log::debug!("Re-authenticating after reconnection");
@@ -2073,6 +2076,40 @@ impl OKXWebSocketClient {
             inst_id: None,
         };
         self.subscribe(vec![arg]).await
+    }
+
+    /// Waits within the native connection timeout for current-session order subscriptions.
+    pub(crate) async fn wait_for_order_subscriptions(
+        &self,
+        instrument_types: &[OKXInstrumentType],
+    ) -> Result<(), OKXWsError> {
+        let connection_epoch = self.connection_epoch.load().load(Ordering::Acquire);
+        let (completion, response) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .read()
+            .await
+            .send(HandlerCommand::WaitForOrderSubscriptions {
+                instrument_types: instrument_types.to_vec(),
+                connection_epoch,
+                completion,
+            })
+            .map_err(|_| OKXWsError::ClientError("Orders subscription handler is closed".into()))?;
+        time::timeout(Duration::from_secs(self.auth_timeout_secs), response)
+            .await
+            .map_err(|_| {
+                OKXWsError::ClientError(
+                    "Timed out waiting for required orders subscriptions".into(),
+                )
+            })?
+            .map_err(|_| OKXWsError::ClientError("Orders subscription handler stopped".into()))??;
+        if self.connection_epoch.load().load(Ordering::Acquire) != connection_epoch
+            || !self.is_active()
+        {
+            return Err(OKXWsError::ClientError(
+                "Connection changed while awaiting orders subscriptions".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Unsubscribes from order updates for the given instrument type.
@@ -4632,6 +4669,100 @@ mod tests {
             received,
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn orders_subscription_readiness_preserves_queued_unsubscribe() {
+        let (transport, mut frames, server) = connect_auth_socket().await;
+        let client = OKXWebSocketClient::default();
+        let (commands, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        *client.cmd_tx.write().await = commands.clone();
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handler = OKXWsFeedHandler::new(
+            Arc::clone(&client.signal),
+            cmd_rx,
+            raw_rx,
+            out_tx,
+            AuthTracker::new(),
+            false,
+            client.subscriptions_state.clone(),
+            get_atomic_clock_realtime(),
+        );
+        commands
+            .send(HandlerCommand::SetClient(Arc::clone(&transport)))
+            .unwrap();
+
+        client
+            .subscribe_orders(OKXInstrumentType::Spot)
+            .await
+            .unwrap();
+        client
+            .unsubscribe_orders(OKXInstrumentType::Spot)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                message = handler.next() => panic!("unexpected handler output: {message:?}"),
+                () = async {
+                    for operation in ["subscribe", "unsubscribe"] {
+                        let frame = frames.recv().await.unwrap();
+                        let payload: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                        assert_eq!(payload["op"], operation);
+                    }
+                } => {}
+            }
+        }).await.unwrap();
+        let argument = serde_json::json!({"channel":"orders","instType":"SPOT"});
+
+        for event in ["subscribe", "unsubscribe"] {
+            raw_tx
+                .send((
+                    0,
+                    Message::Text(
+                        serde_json::json!({"event":event,"arg":argument,"connId":"test"})
+                            .to_string()
+                            .into(),
+                    ),
+                ))
+                .unwrap();
+        }
+        let sentinel =
+            serde_json::json!({"event":"error","code":"60000","msg":"sentinel"}).to_string();
+        raw_tx
+            .send((0, Message::Text(sentinel.clone().into())))
+            .unwrap();
+        assert!(matches!(handler.next().await, Some(OKXWsMessage::Error(_))));
+        assert!(
+            client.subscriptions_state.is_empty(),
+            "older subscribe command restored canceled intent"
+        );
+        assert!(client.subscriptions_inst_type.is_empty());
+
+        client
+            .subscribe_orders(OKXInstrumentType::Spot)
+            .await
+            .unwrap();
+        raw_tx
+            .send((0, Message::Text(sentinel.clone().into())))
+            .unwrap();
+        assert!(matches!(handler.next().await, Some(OKXWsMessage::Error(_))));
+        assert!(client.subscriptions_state.confirmed().is_empty());
+        raw_tx
+            .send((
+                0,
+                Message::Text(
+                    serde_json::json!({"event":"subscribe","arg":argument,"connId":"test"})
+                        .to_string()
+                        .into(),
+                ),
+            ))
+            .unwrap();
+        raw_tx.send((0, Message::Text(sentinel.into()))).unwrap();
+        assert!(matches!(handler.next().await, Some(OKXWsMessage::Error(_))));
+        assert_eq!(client.subscriptions_state.len(), 1);
+        transport.disconnect().await;
+        server.abort();
     }
 
     async fn connect_auth_socket() -> (

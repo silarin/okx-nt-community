@@ -111,6 +111,19 @@ struct VenueState {
     submissions: tokio::sync::Mutex<Vec<Value>>,
     queries: tokio::sync::Mutex<Vec<HashMap<String, String>>>,
     updates: tokio::sync::broadcast::Sender<Value>,
+    orders_ack: OrdersAck,
+    orders_requested: std::sync::atomic::AtomicBool,
+    release_orders_ack: tokio::sync::Notify,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum OrdersAck {
+    #[default]
+    Immediate,
+    Delayed,
+    Missing,
+    Rejected,
+    WrongProduct,
 }
 
 fn spot_instruments() -> Value {
@@ -130,9 +143,16 @@ async fn websocket(ws: WebSocketUpgrade, State(state): State<Arc<VenueState>>) -
 async fn serve_socket(mut socket: WebSocket, state: Arc<VenueState>) {
     let mut updates = state.updates.subscribe();
     let mut orders_subscribed = false;
+    let mut pending_ack = None;
 
     loop {
         let message = tokio::select! {
+            () = state.release_orders_ack.notified(), if pending_ack.is_some() => {
+                let arg = pending_ack.take().unwrap();
+                socket.send(Message::Text(json!({"event":"subscribe", "arg":arg, "connId":"test"}).to_string().into())).await.unwrap();
+                orders_subscribed = true;
+                continue;
+            }
             message = socket.next() => match message {
                 Some(Ok(Message::Text(text))) => text,
                 Some(Ok(Message::Ping(data))) => {
@@ -158,6 +178,28 @@ async fn serve_socket(mut socket: WebSocket, state: Arc<VenueState>) {
             "login" => json!({"event": "login", "code": "0", "msg": "", "connId": "test"}),
             "subscribe" => {
                 for arg in request["args"].as_array().unwrap() {
+                    if arg["channel"] == "orders" {
+                        state
+                            .orders_requested
+                            .store(true, std::sync::atomic::Ordering::Release);
+
+                        match state.orders_ack {
+                            OrdersAck::Delayed => {
+                                pending_ack = Some(arg.clone());
+                                continue;
+                            }
+                            OrdersAck::Missing => continue,
+                            OrdersAck::Rejected => {
+                                socket.send(Message::Text(json!({"event":"error", "arg":arg, "code":"60012", "msg":"test rejection"}).to_string().into())).await.unwrap();
+                                continue;
+                            }
+                            OrdersAck::WrongProduct => {
+                                socket.send(Message::Text(json!({"event":"subscribe", "arg":{"channel":"orders","instType":"SWAP"}, "connId":"test"}).to_string().into())).await.unwrap();
+                                continue;
+                            }
+                            OrdersAck::Immediate => {}
+                        }
+                    }
                     orders_subscribed |= arg["channel"] == "orders";
                     socket
                         .send(Message::Text(
@@ -194,12 +236,22 @@ async fn serve_socket(mut socket: WebSocket, state: Arc<VenueState>) {
 }
 
 async fn start_venue(code: Option<&'static str>) -> (SocketAddr, Arc<VenueState>) {
+    start_venue_with_orders_ack(code, OrdersAck::Immediate).await
+}
+
+async fn start_venue_with_orders_ack(
+    code: Option<&'static str>,
+    orders_ack: OrdersAck,
+) -> (SocketAddr, Arc<VenueState>) {
     let (updates, _) = tokio::sync::broadcast::channel(16);
     let state = Arc::new(VenueState {
         submit_code: code,
         submissions: tokio::sync::Mutex::new(Vec::new()),
         queries: tokio::sync::Mutex::new(Vec::new()),
         updates,
+        orders_ack,
+        orders_requested: std::sync::atomic::AtomicBool::new(false),
+        release_orders_ack: tokio::sync::Notify::new(),
     });
     let router = Router::new()
         .route("/ws/private", get(websocket))
@@ -259,6 +311,7 @@ fn build_node(addr: SocketAddr, retain: bool, events: Rc<RefCell<Vec<OrderEventA
         trader_id: TraderId::from("TESTER-001"),
         exec_engine,
         delay_post_stop: Duration::from_millis(20),
+        timeout_connection: Duration::from_secs(3),
         ..Default::default()
     })
     .unwrap()
@@ -276,6 +329,7 @@ fn build_node(addr: SocketAddr, retain: bool, events: Rc<RefCell<Vec<OrderEventA
             base_url_ws_private: Some(format!("ws://{addr}/ws/private")),
             base_url_ws_business: Some(format!("ws://{addr}/ws/business")),
             max_retries: 0,
+            auth_timeout_secs: Some(1),
             ..Default::default()
         }),
     )
@@ -328,6 +382,64 @@ fn venue_update(filled: bool, submitted_ms: u64) -> Value {
     order["tradeId"] = json!(if filled { "1518905531" } else { "" });
     order["fee"] = json!(if filled { "-0.05" } else { "0" });
     frame
+}
+
+#[rstest]
+#[case::delayed(OrdersAck::Delayed)]
+#[case::missing(OrdersAck::Missing)]
+#[case::rejected(OrdersAck::Rejected)]
+#[case::wrong_product(OrdersAck::WrongProduct)]
+#[tokio::test]
+async fn orders_subscription_readiness_precedes_strategy_start(#[case] acknowledgement: OrdersAck) {
+    let (addr, venue) = start_venue_with_orders_ack(Some("51008"), acknowledgement).await;
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut node = build_node(addr, true, Rc::clone(&events));
+    let handle = node.handle();
+    let driver = async {
+        wait_until_async(
+            || async {
+                venue
+                    .orders_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
+            },
+            DEADLINE,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            events.borrow().is_empty(),
+            "strategy started before orders subscription confirmation"
+        );
+        assert!(venue.submissions.lock().await.is_empty());
+        if acknowledgement == OrdersAck::Delayed {
+            venue.release_orders_ack.notify_one();
+            wait_until_async(
+                || async {
+                    events
+                        .borrow()
+                        .iter()
+                        .any(|event| matches!(event, OrderEventAny::Rejected(_)))
+                },
+                DEADLINE,
+            )
+            .await;
+            handle.stop();
+        }
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(node.run(), driver)
+    })
+    .await
+    .unwrap();
+    if acknowledgement == OrdersAck::Delayed {
+        result.unwrap();
+        assert_eq!(venue.submissions.lock().await.len(), 1);
+    } else {
+        assert!(result.is_err());
+        assert!(node.kernel().exec_engine.borrow().check_disconnected());
+        assert!(events.borrow().is_empty());
+        assert!(venue.submissions.lock().await.is_empty());
+    }
 }
 
 #[rstest]

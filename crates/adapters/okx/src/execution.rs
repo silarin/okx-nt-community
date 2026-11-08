@@ -1620,6 +1620,10 @@ impl OKXExecutionClient {
         // Wait for account to be registered in cache before completing connect
         self.await_account_registered(30.0).await?;
 
+        self.ws_private
+            .wait_for_order_subscriptions(&order_routing_types)
+            .await?;
+
         Ok(())
     }
 

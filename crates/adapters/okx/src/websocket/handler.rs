@@ -32,6 +32,7 @@ use std::{
     },
 };
 
+use ahash::AHashSet;
 use nautilus_common::live::dst::time;
 use nautilus_core::{AtomicTime, string::secret::REDACTED};
 pub use nautilus_live::book::snapshot::SnapshotGate;
@@ -60,7 +61,7 @@ use crate::{
     common::{
         account::OKXAccountUpdate,
         consts::{OKX_FIELD_SMSG, OKX_SUCCESS_CODE, should_retry_error_code},
-        enums::{OKXOrderStatus, OKXOrderType},
+        enums::{OKXInstrumentType, OKXOrderStatus, OKXOrderType},
         parse::prefer_rpi_response_fields,
     },
     websocket::client::OKX_RATE_LIMIT_KEY_SUBSCRIPTION,
@@ -74,6 +75,12 @@ pub enum HandlerCommand {
     Disconnect,
     /// Subscribe to the given channels.
     Subscribe { args: Vec<OKXSubscriptionArg> },
+    /// Waits for orders subscriptions on the specified connection.
+    WaitForOrderSubscriptions {
+        instrument_types: Vec<OKXInstrumentType>,
+        connection_epoch: u64,
+        completion: tokio::sync::oneshot::Sender<Result<(), OKXWsError>>,
+    },
     /// Subscribes to a book and reports completion of the transport send.
     SubscribeBook {
         subscription: OKXSubscriptionArg,
@@ -105,6 +112,15 @@ impl Debug for HandlerCommand {
         match self {
             Self::SetClient(_) => f.write_str("SetClient"),
             Self::Disconnect => f.write_str("Disconnect"),
+            Self::WaitForOrderSubscriptions {
+                instrument_types,
+                connection_epoch,
+                ..
+            } => f
+                .debug_struct(stringify!(WaitForOrderSubscriptions))
+                .field("instrument_types", instrument_types)
+                .field("connection_epoch", connection_epoch)
+                .finish(),
             Self::Subscribe { args } => f
                 .debug_struct(stringify!(Subscribe))
                 .field("args", args)
@@ -137,12 +153,18 @@ impl Debug for HandlerCommand {
     }
 }
 
+struct OrderSubscriptionWaiter {
+    instrument_types: Vec<OKXInstrumentType>,
+    connection_epoch: u64,
+    completion: tokio::sync::oneshot::Sender<Result<(), OKXWsError>>,
+}
+
 pub(super) struct OKXWsFeedHandler {
     clock: &'static AtomicTime,
     signal: Arc<AtomicBool>,
     inner: Option<Arc<WebSocketClient>>,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
-    raw_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
+    raw_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Message)>,
     out_tx: tokio::sync::mpsc::UnboundedSender<OKXWsMessage>,
     auth_tracker: AuthTracker,
     requires_auth: bool,
@@ -150,6 +172,9 @@ pub(super) struct OKXWsFeedHandler {
     retry_manager: RetryManager<OKXWsError>,
     pending_messages: VecDeque<OKXWsMessage>,
     pending_sends: VecDeque<PendingSend>,
+    connection_epoch: u64,
+    failed_subscriptions: AHashSet<String>,
+    order_subscription_waiters: VecDeque<OrderSubscriptionWaiter>,
 }
 
 impl OKXWsFeedHandler {
@@ -161,7 +186,7 @@ impl OKXWsFeedHandler {
     pub(super) fn new(
         signal: Arc<AtomicBool>,
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
-        raw_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
+        raw_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Message)>,
         out_tx: tokio::sync::mpsc::UnboundedSender<OKXWsMessage>,
         auth_tracker: AuthTracker,
         requires_auth: bool,
@@ -181,6 +206,9 @@ impl OKXWsFeedHandler {
             retry_manager: create_websocket_retry_manager(),
             pending_messages: VecDeque::new(),
             pending_sends: VecDeque::new(),
+            connection_epoch: 0,
+            failed_subscriptions: AHashSet::new(),
+            order_subscription_waiters: VecDeque::new(),
         }
     }
 
@@ -258,6 +286,8 @@ impl OKXWsFeedHandler {
         let mut poll_raw_next = false;
 
         loop {
+            self.complete_order_subscription_waiters();
+
             if self.signal.load(Ordering::Acquire) {
                 log::debug!("Stop signal received");
                 return None;
@@ -273,7 +303,13 @@ impl OKXWsFeedHandler {
                     match cmd {
                         HandlerCommand::SetClient(client) => {
                             log::debug!("Handler received WebSocket client");
+                            self.connection_epoch = client.connection_epoch();
                             self.inner = Some(client);
+                        }
+                        HandlerCommand::WaitForOrderSubscriptions { instrument_types, connection_epoch, completion } => {
+                            self.order_subscription_waiters.push_back(OrderSubscriptionWaiter {
+                                instrument_types, connection_epoch, completion,
+                            });
                         }
                         HandlerCommand::Disconnect => {
                             log::debug!("Handler disconnecting WebSocket client");
@@ -371,9 +407,9 @@ impl OKXWsFeedHandler {
                 }
 
                 msg = self.raw_rx.recv() => {
-                    let event = match msg {
-                        Some(msg) => match Self::parse_raw_message(msg) {
-                            Some(event) => event,
+                    let (epoch, event) = match msg {
+                        Some((epoch, msg)) => match Self::parse_raw_message(msg) {
+                            Some(event) => (epoch, event),
                             None => continue,
                         },
                         None => {
@@ -431,6 +467,7 @@ impl OKXWsFeedHandler {
                         OKXWsFrame::Error { arg, code, msg } => {
                             let arg = arg.or_else(|| subscription_arg_from_error_message(&msg));
                             if let Some(arg) = arg
+                                && self.is_current_subscription_epoch(epoch)
                                 && self.handle_subscription_error(&arg, &code, &msg)
                             {
                                 return Some(OKXWsMessage::SubscriptionFailed {
@@ -450,12 +487,22 @@ impl OKXWsFeedHandler {
                             return Some(OKXWsMessage::Error(error));
                         }
                         OKXWsFrame::Reconnected => {
+                            if epoch <= self.connection_epoch
+                                || self.inner.as_ref().is_none_or(|client| client.connection_epoch() != epoch) {
+                                continue;
+                            }
+                            self.subscriptions_state.reset_after_reconnect();
+                            self.failed_subscriptions.clear();
+                            self.connection_epoch = epoch;
                             return Some(OKXWsMessage::Reconnected);
                         }
                         OKXWsFrame::Subscription {
                             event, arg, code, msg,
                             ..
                         } => {
+                            if !self.is_current_subscription_epoch(epoch) {
+                                continue;
+                            }
                             let rejected = self
                                 .handle_subscription_ack(&event, &arg, code.as_deref(), msg.as_deref());
 
@@ -584,8 +631,61 @@ impl OKXWsFeedHandler {
         }
     }
 
+    fn is_current_subscription_epoch(&self, epoch: u64) -> bool {
+        epoch == self.connection_epoch
+            && self
+                .inner
+                .as_ref()
+                .is_some_and(|client| client.connection_epoch() == epoch)
+    }
+
+    fn complete_order_subscription_waiters(&mut self) {
+        if self.order_subscription_waiters.is_empty() {
+            return;
+        }
+        let confirmed = self.subscriptions_state.confirmed();
+
+        for _ in 0..self.order_subscription_waiters.len() {
+            let waiter = self.order_subscription_waiters.pop_front().unwrap();
+            if waiter.completion.is_closed() {
+                continue;
+            }
+            let result = if !self.is_current_subscription_epoch(waiter.connection_epoch)
+                || self.inner.as_ref().is_none_or(|client| !client.is_active())
+            {
+                Some(Err(OKXWsError::ClientError(
+                    "Connection changed while awaiting orders subscriptions".into(),
+                )))
+            } else if waiter.instrument_types.iter().any(|kind| {
+                self.failed_subscriptions.contains(&format!(
+                    "{}:{}",
+                    OKXWsChannel::Orders.as_ref(),
+                    kind.as_ref()
+                ))
+            }) {
+                Some(Err(OKXWsError::ClientError(
+                    "Required orders subscription rejected".into(),
+                )))
+            } else if waiter.instrument_types.iter().all(|kind| {
+                confirmed
+                    .get(&Ustr::from(OKXWsChannel::Orders.as_ref()))
+                    .is_some_and(|types| types.contains(&Ustr::from(kind.as_ref())))
+            }) {
+                Some(Ok(()))
+            } else {
+                None
+            };
+
+            if let Some(result) = result {
+                let _ = waiter.completion.send(result);
+            } else {
+                self.order_subscription_waiters.push_back(waiter);
+            }
+        }
+    }
+
     fn handle_subscription_ack(
-        &self,
+        &mut self,
         event: &OKXSubscriptionEvent,
         arg: &OKXWebSocketArg,
         code: Option<&str>,
@@ -598,12 +698,14 @@ impl OKXWsFeedHandler {
             OKXSubscriptionEvent::Subscribe => {
                 if success {
                     self.subscriptions_state.confirm_subscribe(&topic);
+                    self.failed_subscriptions.remove(&topic);
                     false
                 } else {
                     log::warn!(
                         "Subscription failed: topic={topic:?}, error={msg:?}, code={code:?}"
                     );
                     self.subscriptions_state.mark_failure(&topic);
+                    self.failed_subscriptions.insert(topic);
                     true
                 }
             }
@@ -624,7 +726,7 @@ impl OKXWsFeedHandler {
         }
     }
 
-    fn handle_subscription_error(&self, arg: &OKXWebSocketArg, code: &str, msg: &str) -> bool {
+    fn handle_subscription_error(&mut self, arg: &OKXWebSocketArg, code: &str, msg: &str) -> bool {
         let topic = topic_from_websocket_arg(arg);
         let event = if self
             .subscriptions_state
@@ -677,8 +779,10 @@ impl OKXWsFeedHandler {
             .map_err(OKXWsError::TransportSend)
     }
 
-    async fn handle_subscribe(&self, args: Vec<OKXSubscriptionArg>) -> anyhow::Result<()> {
+    async fn handle_subscribe(&mut self, args: Vec<OKXSubscriptionArg>) -> anyhow::Result<()> {
         for arg in &args {
+            let topic = topic_from_subscription_arg(arg);
+            self.failed_subscriptions.remove(&topic);
             log::debug!(
                 "Subscribing to channel: channel={:?}, inst_id={:?}",
                 arg.channel,
@@ -1073,7 +1177,7 @@ mod tests {
         ratelimiter::{RateLimiter, quota::Quota},
         websocket::{
             AuthTracker, SubscriptionState, TransportBackend, WebSocketConfig,
-            channel_message_handler,
+            channel_epoch_message_handler,
         },
     };
     use rstest::rstest;
@@ -1120,7 +1224,7 @@ mod tests {
         handler.cmd_rx = cmd_rx;
         handler.raw_rx = raw_rx;
         raw_tx
-            .send(Message::Text(payload.to_string().into()))
+            .send((0, Message::Text(payload.to_string().into())))
             .unwrap();
         let output = tokio::time::timeout(Duration::from_secs(1), handler.next())
             .await
@@ -1232,11 +1336,25 @@ mod tests {
         }
 
         raw_tx
-            .send(Message::Text(RECONNECTED.to_string().into()))
+            .send((
+                0,
+                Message::Text(
+                    json!({"event":"error","code":"60000","msg":"sentinel"})
+                        .to_string()
+                        .into(),
+                ),
+            ))
             .unwrap();
 
         raw_tx
-            .send(Message::Text(RECONNECTED.to_string().into()))
+            .send((
+                0,
+                Message::Text(
+                    json!({"event":"error","code":"60000","msg":"sentinel"})
+                        .to_string()
+                        .into(),
+                ),
+            ))
             .unwrap();
 
         let messages = tokio::time::timeout(Duration::from_secs(1), async {
@@ -1253,18 +1371,18 @@ mod tests {
             ]
         })
         .await
-        .expect("failures and reconnect must arrive without more input");
+        .expect("failures and raw frames must arrive without more input");
 
         assert!(
             matches!(&messages[0], Some(OKXWsMessage::SendFailed { request_id, .. })
             if request_id == "first-cancel")
         );
-        assert!(matches!(messages[1], Some(OKXWsMessage::Reconnected)));
+        assert!(matches!(messages[1], Some(OKXWsMessage::Error(_))));
         assert!(
             matches!(&messages[2], Some(OKXWsMessage::SendFailed { request_id, .. })
             if request_id == "second-cancel")
         );
-        assert!(matches!(messages[3], Some(OKXWsMessage::Reconnected)));
+        assert!(matches!(messages[3], Some(OKXWsMessage::Error(_))));
         assert!(handler.pending_messages.is_empty());
         assert!(handler.cmd_rx.is_empty());
     }
@@ -1292,12 +1410,19 @@ mod tests {
                 .unwrap();
         }
         raw_tx
-            .send(Message::Text(RECONNECTED.to_string().into()))
+            .send((
+                0,
+                Message::Text(
+                    json!({"event":"error","code":"60000","msg":"sentinel"})
+                        .to_string()
+                        .into(),
+                ),
+            ))
             .unwrap();
 
         let message = handler.next().await;
 
-        assert!(matches!(message, Some(OKXWsMessage::Reconnected)));
+        assert!(matches!(message, Some(OKXWsMessage::Error(_))));
         assert_eq!(handler.cmd_rx.len(), 2);
     }
 
@@ -1318,10 +1443,10 @@ mod tests {
             }
         });
 
-        let (message_handler, raw_rx) = channel_message_handler();
-        let client = WebSocketClient::builder()
+        let (message_handler, raw_rx) = channel_epoch_message_handler();
+        let client = WebSocketClient::epoch_builder()
             .config(WebSocketConfig::builder().url(url).build().unwrap())
-            .message_handler(message_handler)
+            .epoch_handler(message_handler)
             .default_quota(Quota::with_period(Duration::from_secs(10)).unwrap())
             .connect()
             .await
@@ -1424,10 +1549,10 @@ mod tests {
             }
         });
 
-        let (message_handler, raw_rx) = channel_message_handler();
-        let client = WebSocketClient::builder()
+        let (message_handler, raw_rx) = channel_epoch_message_handler();
+        let client = WebSocketClient::epoch_builder()
             .config(WebSocketConfig::builder().url(url).build().unwrap())
-            .message_handler(message_handler)
+            .epoch_handler(message_handler)
             .connect()
             .await
             .unwrap();
@@ -1486,10 +1611,10 @@ mod tests {
             while socket.next().await.is_some() {}
         });
 
-        let (message_handler, raw_rx) = channel_message_handler();
-        let client = WebSocketClient::builder()
+        let (message_handler, raw_rx) = channel_epoch_message_handler();
+        let client = WebSocketClient::epoch_builder()
             .config(WebSocketConfig::builder().url(url).build().unwrap())
-            .message_handler(message_handler)
+            .epoch_handler(message_handler)
             .default_quota(Quota::per_hour(NonZeroU32::new(1).unwrap()))
             .connect()
             .await
@@ -1607,10 +1732,10 @@ mod tests {
             ),
             Vec::new(),
         ));
-        let (message_handler, raw_rx) = channel_message_handler();
-        let client = WebSocketClient::builder()
+        let (message_handler, raw_rx) = channel_epoch_message_handler();
+        let client = WebSocketClient::epoch_builder()
             .config(WebSocketConfig::builder().url(url).build().unwrap())
-            .message_handler(message_handler)
+            .epoch_handler(message_handler)
             .rate_limiter(Arc::clone(&limiter))
             .connect()
             .await
@@ -1813,7 +1938,7 @@ mod tests {
 
     #[rstest]
     fn test_subscription_error_restores_failed_unsubscribe() {
-        let handler = create_handler();
+        let mut handler = create_handler();
         let arg = OKXWebSocketArg {
             channel: OKXWsChannel::Books,
             inst_id: Some(Ustr::from("BTC-USD")),
@@ -1911,7 +2036,7 @@ mod tests {
 
     #[rstest]
     fn test_subscription_error_ignores_non_pending_topic() {
-        let handler = create_handler();
+        let mut handler = create_handler();
         let arg = OKXWebSocketArg {
             channel: OKXWsChannel::Books,
             inst_id: Some(Ustr::from("BTC-USDT-SWAP")),
@@ -2061,10 +2186,10 @@ mod tests {
             frames
         });
 
-        let (message_handler, raw_rx) = channel_message_handler();
-        let client = WebSocketClient::builder()
+        let (message_handler, raw_rx) = channel_epoch_message_handler();
+        let client = WebSocketClient::epoch_builder()
             .config(WebSocketConfig::builder().url(url).build().unwrap())
-            .message_handler(message_handler)
+            .epoch_handler(message_handler)
             .connect()
             .await
             .unwrap();
@@ -2400,6 +2525,245 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orders_subscription_readiness_requires_every_topic() {
+        let mut peer = handler_peer().await;
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        peer.handler.raw_rx = raw_rx;
+        let instrument_types = vec![OKXInstrumentType::Spot, OKXInstrumentType::Swap];
+        for kind in &instrument_types {
+            peer.handler.subscriptions_state.mark_subscribe(&format!(
+                "{}:{}",
+                OKXWsChannel::Orders.as_ref(),
+                kind.as_ref()
+            ));
+        }
+        peer.handler
+            .handle_subscribe(
+                instrument_types
+                    .iter()
+                    .map(|kind| OKXSubscriptionArg {
+                        channel: OKXWsChannel::Orders,
+                        inst_type: Some(*kind),
+                        inst_family: None,
+                        inst_id: None,
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        let (completion, mut response) = tokio::sync::oneshot::channel();
+        peer.commands
+            .send(HandlerCommand::WaitForOrderSubscriptions {
+                instrument_types,
+                connection_epoch: 0,
+                completion,
+            })
+            .unwrap();
+
+        for (index, kind) in ["SPOT", "SWAP"].into_iter().enumerate() {
+            raw_tx.send((0, Message::Text(json!({
+                "event":"subscribe", "arg":{"channel":"orders","instType":kind}, "connId":"test"
+            }).to_string().into()))).unwrap();
+            raw_tx
+                .send((0, Message::Text(load_test_json("ws_orders.json").into())))
+                .unwrap();
+            assert!(matches!(
+                peer.handler.next().await,
+                Some(OKXWsMessage::Orders(_))
+            ));
+
+            if index == 0 {
+                assert!(matches!(
+                    response.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(1), response)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(peer.handler.order_subscription_waiters.is_empty());
+        peer.handler.inner.as_ref().unwrap().disconnect().await;
+        peer.server.abort();
+    }
+
+    #[tokio::test]
+    async fn orders_subscription_readiness_rejects_reconnect_and_stale_acknowledgements() {
+        let mut peer = handler_peer().await;
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        peer.handler.raw_rx = raw_rx;
+        peer.handler.subscriptions_state.mark_subscribe(&format!(
+            "{}:{}",
+            OKXWsChannel::Orders.as_ref(),
+            OKXInstrumentType::Spot.as_ref()
+        ));
+        peer.handler
+            .handle_subscribe(vec![OKXSubscriptionArg {
+                channel: OKXWsChannel::Orders,
+                inst_type: Some(OKXInstrumentType::Spot),
+                inst_family: None,
+                inst_id: None,
+            }])
+            .await
+            .unwrap();
+        let (completion, response) = tokio::sync::oneshot::channel();
+        peer.commands
+            .send(HandlerCommand::WaitForOrderSubscriptions {
+                instrument_types: vec![OKXInstrumentType::Spot],
+                connection_epoch: 0,
+                completion,
+            })
+            .unwrap();
+        raw_tx
+            .send((0, Message::Text(load_test_json("ws_orders.json").into())))
+            .unwrap();
+        assert!(matches!(
+            peer.handler.next().await,
+            Some(OKXWsMessage::Orders(_))
+        ));
+        let client = peer.handler.inner.as_ref().unwrap();
+        assert!(client.request_reconnect());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.connection_epoch() != 1 || !client.is_active() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        raw_tx
+            .send((1, Message::Text(RECONNECTED.to_string().into())))
+            .unwrap();
+        assert!(matches!(
+            peer.handler.next().await,
+            Some(OKXWsMessage::Reconnected)
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), response)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(OKXWsError::ClientError(_))
+        ));
+
+        let (completion, mut response) = tokio::sync::oneshot::channel();
+        peer.commands
+            .send(HandlerCommand::WaitForOrderSubscriptions {
+                instrument_types: vec![OKXInstrumentType::Spot],
+                connection_epoch: 1,
+                completion,
+            })
+            .unwrap();
+        let acknowledgement = json!({
+            "event":"subscribe", "arg":{"channel":"orders","instType":"SPOT"}, "connId":"test"
+        })
+        .to_string();
+        raw_tx
+            .send((0, Message::Text(acknowledgement.clone().into())))
+            .unwrap();
+        raw_tx
+            .send((0, Message::Text(load_test_json("ws_orders.json").into())))
+            .unwrap();
+        assert!(matches!(
+            peer.handler.next().await,
+            Some(OKXWsMessage::Orders(_))
+        ));
+        assert!(matches!(
+            response.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(peer.handler.subscriptions_state.confirmed().is_empty());
+
+        // A stale rejection cannot poison the replacement session either
+        raw_tx.send((0, Message::Text(json!({
+            "event":"error", "arg":{"channel":"orders","instType":"SPOT"}, "code":"60012", "msg":"old rejection"
+        }).to_string().into()))).unwrap();
+        assert!(matches!(
+            peer.handler.next().await,
+            Some(OKXWsMessage::Error(_))
+        ));
+        raw_tx
+            .send((1, Message::Text(acknowledgement.into())))
+            .unwrap();
+        raw_tx
+            .send((1, Message::Text(load_test_json("ws_orders.json").into())))
+            .unwrap();
+        assert!(matches!(
+            peer.handler.next().await,
+            Some(OKXWsMessage::Orders(_))
+        ));
+        tokio::time::timeout(Duration::from_secs(1), response)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        raw_tx
+            .send((1, Message::Text(RECONNECTED.to_string().into())))
+            .unwrap();
+        raw_tx
+            .send((1, Message::Text(load_test_json("ws_orders.json").into())))
+            .unwrap();
+        assert!(matches!(
+            peer.handler.next().await,
+            Some(OKXWsMessage::Orders(_))
+        ));
+        assert!(!peer.handler.subscriptions_state.confirmed().is_empty());
+        peer.handler.inner.as_ref().unwrap().disconnect().await;
+        peer.server.abort();
+    }
+
+    #[rstest]
+    #[case::canceled(true)]
+    #[case::disconnected(false)]
+    #[tokio::test]
+    async fn orders_subscription_readiness_releases_abandoned_waiters(#[case] canceled: bool) {
+        let mut peer = handler_peer().await;
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        peer.handler.raw_rx = raw_rx;
+        let (completion, response) = tokio::sync::oneshot::channel();
+        peer.commands
+            .send(HandlerCommand::WaitForOrderSubscriptions {
+                instrument_types: vec![OKXInstrumentType::Spot],
+                connection_epoch: 0,
+                completion,
+            })
+            .unwrap();
+        raw_tx
+            .send((0, Message::Text(load_test_json("ws_orders.json").into())))
+            .unwrap();
+        assert!(matches!(
+            peer.handler.next().await,
+            Some(OKXWsMessage::Orders(_))
+        ));
+
+        if canceled {
+            drop(response);
+            raw_tx
+                .send((0, Message::Text(load_test_json("ws_orders.json").into())))
+                .unwrap();
+            assert!(matches!(
+                peer.handler.next().await,
+                Some(OKXWsMessage::Orders(_))
+            ));
+            assert!(peer.handler.order_subscription_waiters.is_empty());
+            peer.handler.inner.as_ref().unwrap().disconnect().await;
+        } else {
+            peer.handler.inner.as_ref().unwrap().disconnect().await;
+            peer.commands.send(HandlerCommand::Disconnect).unwrap();
+            assert!(peer.handler.next().await.is_none());
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), response)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Err(OKXWsError::ClientError(_))
+            ));
+        }
+        peer.server.abort();
+    }
+
+    #[tokio::test]
     async fn reconnect_preserves_buffered_order_events() {
         let mut peer = handler_peer().await;
         let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2411,9 +2775,9 @@ mod tests {
         let expected_orders: Vec<OKXOrderMsg> =
             serde_json::from_value(orders_frame["data"].clone()).unwrap();
 
-        raw_tx.send(Message::Text(orders.into())).unwrap();
+        raw_tx.send((0, Message::Text(orders.into()))).unwrap();
         raw_tx
-            .send(Message::Text(fixture["response"].to_string().into()))
+            .send((0, Message::Text(fixture["response"].to_string().into())))
             .unwrap();
 
         let ws_client = peer.handler.inner.as_ref().unwrap();
@@ -2472,10 +2836,13 @@ mod tests {
         let fixture: Value =
             serde_json::from_str(&load_test_json("ws_reconnect_queued_frames.json")).unwrap();
         raw_tx
-            .send(Message::Text(fixture["login_failure"].to_string().into()))
+            .send((
+                0,
+                Message::Text(fixture["login_failure"].to_string().into()),
+            ))
             .unwrap();
         raw_tx
-            .send(Message::Text(load_test_json("ws_orders.json").into()))
+            .send((0, Message::Text(load_test_json("ws_orders.json").into())))
             .unwrap();
         assert!(matches!(
             peer.handler.next().await,
@@ -2520,8 +2887,8 @@ mod tests {
             }
         });
 
-        let (message_handler, raw_rx) = channel_message_handler();
-        let client = WebSocketClient::builder()
+        let (message_handler, raw_rx) = channel_epoch_message_handler();
+        let client = WebSocketClient::epoch_builder()
             .config(
                 WebSocketConfig::builder()
                     .url(url)
@@ -2529,7 +2896,7 @@ mod tests {
                     .build()
                     .unwrap(),
             )
-            .message_handler(message_handler)
+            .epoch_handler(message_handler)
             .connect()
             .await
             .unwrap();
@@ -2649,10 +3016,10 @@ mod tests {
             }
         });
 
-        let (message_handler, raw_rx) = channel_message_handler();
-        let client = WebSocketClient::builder()
+        let (message_handler, raw_rx) = channel_epoch_message_handler();
+        let client = WebSocketClient::epoch_builder()
             .config(WebSocketConfig::builder().url(url).build().unwrap())
-            .message_handler(message_handler)
+            .epoch_handler(message_handler)
             .keyed_quotas(vec![(
                 SEND_RATE_KEY.to_string(),
                 Quota::per_second(NonZeroU32::new(1).unwrap()).unwrap(),
