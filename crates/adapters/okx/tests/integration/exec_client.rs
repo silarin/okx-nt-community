@@ -3310,18 +3310,32 @@ async fn handle_exec_ws_socket(mut socket: WebSocket, state: Arc<WsTeardownState
             }
         };
 
-        if let Message::Text(text) = message
-            && text.contains("\"op\":\"login\"")
-            && socket
-                .send(Message::Text(
-                    "{\"event\":\"login\",\"code\":\"0\",\"msg\":\"\",\"connId\":\"test\"}"
-                        .to_string()
-                        .into(),
-                ))
+        let Message::Text(text) = message else {
+            continue;
+        };
+        let Ok(request) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let responses = match request["op"].as_str() {
+            Some("login") => vec![json!({"event":"login","code":"0","msg":"","connId":"test"})],
+            Some("subscribe") => request["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|arg| json!({"event":"subscribe","arg":arg,"connId":"test"}))
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        for response in responses {
+            if socket
+                .send(Message::Text(response.to_string().into()))
                 .await
                 .is_err()
-        {
-            break;
+            {
+                state.closed.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         }
     }
     state.closed.fetch_add(1, Ordering::Relaxed);
