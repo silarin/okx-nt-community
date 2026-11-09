@@ -116,9 +116,9 @@ use super::{
         PositionReportShape, ReconciliationFillQueue, RetainedFillState,
         create_orphan_fill_order_report, create_position_reconciliation_report,
         create_reconciliation_canceled, distinct_position_reports, has_active_inferred_fill,
-        is_exact_order_match, position_avg_px, position_qty_aggregates,
-        resolve_inferred_fill_commission, responsible_client_ids, should_project_fill,
-        sort_reconciliation_events, terminal_report_has_missing_fills,
+        is_exact_order_match, order_report_has_missing_fills, position_avg_px,
+        position_qty_aggregates, resolve_inferred_fill_commission, responsible_client_ids,
+        should_project_fill, sort_reconciliation_events,
     },
     submission::{SubmissionRecoveryExhausted, SubmissionRecoveryPolicy, SubmissionRecoverySource},
 };
@@ -3479,7 +3479,11 @@ impl ExecutionManager {
 
             let instrument = self.get_instrument(&report.instrument_id);
 
-            if terminal_report_has_missing_fills(&report, order.filled_qty()) {
+            if order_report_has_missing_fills(
+                &report,
+                order.filled_qty(),
+                commission_client.is_some_and(ExecutionClient::requires_authoritative_fills),
+            ) {
                 targeted_candidates.push((
                     order,
                     IndexSet::from([sourced.client_id]),
@@ -6729,10 +6733,27 @@ impl ExecutionManager {
         instrument: Option<&InstrumentAny>,
         commission_client: Option<&dyn ExecutionClient>,
     ) -> anyhow::Result<Vec<OrderEventAny>> {
-        let has_missing_fills = terminal_report_has_missing_fills(report, order.filled_qty());
+        let requires_authoritative_fills =
+            commission_client.is_some_and(ExecutionClient::requires_authoritative_fills);
+        let has_missing_fills = order_report_has_missing_fills(
+            report,
+            order.filled_qty(),
+            requires_authoritative_fills,
+        );
+
+        if has_missing_fills
+            && requires_authoritative_fills
+            && order.status() == OrderStatus::Submitted
+        {
+            let ts_now = self.clock.borrow().timestamp_ns();
+            return Ok(generate_reconciliation_order_pre_fill_events(
+                order, report, ts_now,
+            ));
+        }
+
         anyhow::ensure!(
             !has_missing_fills,
-            "terminal report for {} has unaccounted fills; waiting for fill reports",
+            "order report for {} has unaccounted fills; waiting for fill reports",
             order.client_order_id(),
         );
         let ts_now = self.clock.borrow().timestamp_ns();
@@ -6900,7 +6921,11 @@ impl ExecutionManager {
             return events;
         }
 
-        if terminal_report_has_missing_fills(report, working.filled_qty()) {
+        if order_report_has_missing_fills(
+            report,
+            working.filled_qty(),
+            commission_client.is_some_and(ExecutionClient::requires_authoritative_fills),
+        ) {
             log::warn!(
                 "Deferring terminal reconciliation for {}: fill reports are incomplete",
                 order.client_order_id(),
@@ -7158,22 +7183,28 @@ impl ExecutionManager {
             None
         };
 
+        let requires_authoritative_fills =
+            commission_client.is_some_and(ExecutionClient::requires_authoritative_fills);
         let defer_terminal = !is_synthetic
-            && claimed_strategy.is_some()
-            && matches!(
-                report.order_status,
-                OrderStatus::Canceled | OrderStatus::Expired
-            )
-            && inferred_qty.is_some();
+            && inferred_qty.is_some()
+            && (requires_authoritative_fills
+                || claimed_strategy.is_some()
+                    && matches!(
+                        report.order_status,
+                        OrderStatus::Canceled | OrderStatus::Expired
+                    ));
 
-        if defer_terminal {
+        if defer_terminal && !requires_authoritative_fills && prepared_fills.is_empty() {
             log::warn!(
                 "Deferring terminal reconciliation for claimed order {client_order_id}: fill reports are incomplete"
             );
+            return (Vec::new(), None);
+        }
 
-            if prepared_fills.is_empty() {
-                return (Vec::new(), None);
-            }
+        if defer_terminal {
+            log::warn!(
+                "Deferring external order status for {client_order_id}: fill reports are incomplete"
+            );
         }
 
         let inferred_commission = if is_synthetic || defer_terminal {
@@ -7262,6 +7293,10 @@ impl ExecutionManager {
             ts_now,
             inferred_commission,
         );
+
+        if defer_terminal && requires_authoritative_fills {
+            order_events.retain(|event| matches!(event, OrderEventAny::Accepted(_)));
+        }
 
         if replace_inferred_fill {
             let terminal_event = if order_events.last().is_some_and(|event| {
@@ -8000,6 +8035,158 @@ mod tests {
         let inferred = inferred_fills(&events);
         assert_eq!(inferred.len(), 1, "one inferred fill covers the 6.0 gap");
         assert_eq!(inferred[0].commission, Some(expected));
+    }
+
+    #[rstest]
+    fn test_submitted_order_accepts_status_without_authoritative_fills(
+        #[values(false, true)] is_snapshot: bool,
+    ) {
+        let (mut manager, _cache, order, report, instrument) = cached_commission_fixtures();
+        let mut submitted =
+            OrderAny::from_events(order.events().into_iter().take(2).cloned().collect()).unwrap();
+        assert_eq!(submitted.status(), OrderStatus::Submitted);
+        let mut client = CommissionStubClient::new(CommissionOutcome::Failure);
+        client.requires_authoritative_fills = true;
+        let mut queue = ReconciliationFillQueue::default();
+
+        let events = manager.reconcile_order_with_fills(
+            is_snapshot,
+            &submitted,
+            &report,
+            &[],
+            Some(&instrument),
+            &mut queue,
+            Some(&client),
+        );
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], OrderEventAny::Accepted(_)));
+        submitted.apply(events[0].clone()).unwrap();
+        assert_eq!(submitted.status(), OrderStatus::Accepted);
+        assert_eq!(submitted.quantity(), report.quantity);
+        assert_eq!(submitted.filled_qty(), Quantity::from("0.0"));
+        assert_eq!(submitted.venue_order_id(), Some(report.venue_order_id));
+        assert!(submitted.trade_ids().is_empty());
+        assert!(submitted.commissions().is_empty());
+        assert_eq!(client.seen(), None);
+    }
+
+    #[rstest]
+    fn test_external_order_defers_missing_authoritative_fills(
+        #[values(0, 4, 10)] recovered_qty: u32,
+        #[values(
+            OrderStatus::PartiallyFilled,
+            OrderStatus::Filled,
+            OrderStatus::Canceled
+        )]
+        status: OrderStatus,
+    ) {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        let manager = ExecutionManager::new(
+            Rc::new(RefCell::new(VirtualClock::new())),
+            Rc::clone(&cache),
+            ExecutionManagerConfig::default(),
+        )
+        .unwrap();
+        let (mut report, mut fill) = external_report_with_partial_fill(&instrument);
+        report.order_status = status;
+        if status != OrderStatus::Filled {
+            report.quantity = Quantity::from("20.0");
+        }
+
+        fill.last_qty = Quantity::from_decimal_dp(Decimal::from(recovered_qty), 1).unwrap();
+
+        let reports = if recovered_qty == 0 {
+            vec![]
+        } else {
+            vec![&fill]
+        };
+
+        let mut client =
+            CommissionStubClient::new(CommissionOutcome::Value(Money::from("2.5 USDT")));
+        client.requires_authoritative_fills = true;
+        let mut queue = ReconciliationFillQueue::default();
+        let (events, metadata) = manager.handle_external_order(
+            &report,
+            report.account_id,
+            &instrument,
+            &reports,
+            false,
+            Some(&mut queue),
+            Some(&client),
+        );
+
+        let fills = events
+            .iter()
+            .filter_map(|event| {
+                if let OrderEventAny::Filled(fill) = event {
+                    Some(fill)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(client.seen(), None);
+
+        assert_eq!(fills.len(), usize::from(recovered_qty != 0));
+
+        if recovered_qty != 0 {
+            assert_eq!(fills[0].trade_id, fill.trade_id);
+            assert_eq!(fills[0].last_qty, fill.last_qty);
+            assert_eq!(fills[0].last_px, fill.last_px);
+            assert_eq!(fills[0].commission, Some(fill.commission));
+        }
+
+        let metadata = metadata.unwrap();
+        assert_eq!(metadata.venue_order_id, report.venue_order_id);
+        assert_eq!(events[0].client_order_id(), metadata.client_order_id);
+        assert!(matches!(events[0], OrderEventAny::Accepted(_)));
+
+        for event in &events {
+            cache.borrow_mut().update_order(event).unwrap();
+        }
+
+        let cache = cache.borrow();
+        let order = cache.order(&metadata.client_order_id).unwrap();
+        assert_eq!(order.quantity(), report.quantity);
+        assert_eq!(order.filled_qty(), fill.last_qty);
+        assert_eq!(order.order_side(), report.order_side.unwrap());
+        assert_eq!(order.order_type(), report.order_type);
+        assert_eq!(order.price(), report.price);
+        assert_eq!(order.venue_order_id(), Some(report.venue_order_id));
+        assert_eq!(order.account_id(), Some(report.account_id));
+        assert_eq!(
+            order.status(),
+            if recovered_qty == 0 {
+                OrderStatus::Accepted
+            } else if recovered_qty == 10 {
+                status
+            } else {
+                OrderStatus::PartiallyFilled
+            },
+        );
+        assert_eq!(
+            order.commissions().get(&fill.commission.currency),
+            if recovered_qty == 0 {
+                None
+            } else {
+                Some(&fill.commission)
+            },
+        );
+        assert_eq!(
+            order.trade_ids(),
+            if recovered_qty == 0 {
+                vec![]
+            } else {
+                vec![&fill.trade_id]
+            },
+        );
     }
 
     #[rstest]

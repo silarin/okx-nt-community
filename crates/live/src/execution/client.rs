@@ -640,6 +640,10 @@ impl ExecutionClient for LiveExecutionClient {
             .calculate_commission(instrument, last_qty, last_px, liquidity_side)
     }
 
+    fn requires_authoritative_fills(&self) -> bool {
+        self.client.borrow().requires_authoritative_fills()
+    }
+
     fn allows_reconciliation_overfill(&self, order: &OrderAny, report: &FillReport) -> bool {
         self.client
             .borrow()

@@ -346,7 +346,11 @@ pub(crate) async fn request_targeted_order_reports(
                 targeted_report_response(&query, client_id, response, &mut coverage_complete)
             {
                 if !client.requires_order_query_fills(candidate.instrument_id)
-                    && terminal_report_has_missing_fills(&candidate, query.filled_qty)
+                    && order_report_has_missing_fills(
+                        &candidate,
+                        query.filled_qty,
+                        client.requires_authoritative_fills(),
+                    )
                 {
                     let command = targeted_fill_command(&query, &candidate);
 
@@ -411,15 +415,24 @@ pub(crate) async fn collect_targeted_order_reports(
             return false;
         };
 
+        let requires_authoritative_fills = result.client_id.is_some_and(|client_id| {
+            clients.iter().any(|client| {
+                client.client_id() == client_id && client.requires_authoritative_fills()
+            })
+        });
+
         let fill_query = result
             .report
             .as_ref()
             .filter(|report| {
-                terminal_report_has_missing_fills(report, query.filled_qty)
-                    && !clients.iter().any(|client| {
-                        Some(client.client_id()) == result.client_id
-                            && client.requires_order_query_fills(report.instrument_id)
-                    })
+                order_report_has_missing_fills(
+                    report,
+                    query.filled_qty,
+                    requires_authoritative_fills,
+                ) && !clients.iter().any(|client| {
+                    Some(client.client_id()) == result.client_id
+                        && client.requires_order_query_fills(report.instrument_id)
+                })
             })
             .map(|report| (targeted_fill_command(&query, report), report.clone()));
         let client_id = result.client_id;
@@ -615,15 +628,18 @@ fn targeted_report_matches(query: &TargetedOrderQuery, report: &OrderStatusRepor
     instrument_matches && order_matches
 }
 
-/// Checks whether a canceled or expired report has more fills than the cached order.
-pub(super) fn terminal_report_has_missing_fills(
+/// Checks whether a report needs authoritative fills before status reconciliation.
+pub(super) fn order_report_has_missing_fills(
     report: &OrderStatusReport,
     cached_filled_qty: Quantity,
+    requires_authoritative_fills: bool,
 ) -> bool {
-    matches!(
-        report.order_status,
-        OrderStatus::Canceled | OrderStatus::Expired
-    ) && report.filled_qty > cached_filled_qty
+    report.filled_qty > cached_filled_qty
+        && (requires_authoritative_fills
+            || matches!(
+                report.order_status,
+                OrderStatus::Canceled | OrderStatus::Expired
+            ))
 }
 
 /// Builds an order report from fills sharing the same order and venue position.
@@ -1084,6 +1100,7 @@ pub(super) mod tests {
             state: CollectionState,
             worker: bool,
             native_fills: bool,
+            authoritative_fills: bool,
             release_at: usize,
             release: Arc<tokio::sync::Notify>,
         }
@@ -1145,6 +1162,10 @@ pub(super) mod tests {
 
         #[async_trait::async_trait(?Send)]
         impl ExecutionClient for CollectionClient {
+            fn requires_authoritative_fills(&self) -> bool {
+                self.authoritative_fills
+            }
+
             fn requires_order_query_fills(&self, _instrument_id: InstrumentId) -> bool {
                 self.native_fills
             }
@@ -1293,6 +1314,7 @@ pub(super) mod tests {
                 state: state.clone(),
                 worker,
                 native_fills: false,
+                authoritative_fills: false,
                 release_at,
                 release: Arc::new(tokio::sync::Notify::new()),
             }
@@ -1416,10 +1438,25 @@ pub(super) mod tests {
             #[case] deferred: bool,
             #[case] worker: bool,
             #[values(false, true)] native_fills: bool,
+            #[values(false, true)] authoritative_fills: bool,
+            #[values(
+                OrderStatus::Canceled,
+                OrderStatus::Expired,
+                OrderStatus::PartiallyFilled,
+                OrderStatus::Filled
+            )]
+            status: OrderStatus,
         ) {
             let state = CollectionState::default();
             let mut c = client(&state, worker, 0);
             c.native_fills = native_fills;
+            c.authoritative_fills = authoritative_fills;
+            let mut expected_report = report();
+            expected_report.order_status = status;
+            if status == OrderStatus::Filled {
+                expected_report.quantity = expected_report.filled_qty;
+            }
+            c.report = Some(expected_report.clone());
 
             let results = if deferred {
                 let results = Rc::new(RefCell::new(Vec::new()));
@@ -1439,17 +1476,23 @@ pub(super) mod tests {
             };
 
             assert_eq!(results.len(), 1);
-            assert_eq!(results[0].report, Some(report()));
+            assert_eq!(results[0].report, Some(expected_report));
             assert!(results[0].coverage_complete);
             assert_eq!(state.status_finished.get(), 1);
-            assert_eq!(state.commands.borrow().len(), usize::from(!native_fills));
-            assert_eq!(state.fill_finished.get(), usize::from(!native_fills));
+            let expects_fill_query = !native_fills
+                && (authoritative_fills
+                    || matches!(status, OrderStatus::Canceled | OrderStatus::Expired));
+            assert_eq!(
+                state.commands.borrow().len(),
+                usize::from(expects_fill_query)
+            );
+            assert_eq!(state.fill_finished.get(), usize::from(expects_fill_query));
             assert_eq!(
                 results[0].fills,
-                if native_fills {
-                    Vec::new()
-                } else {
+                if expects_fill_query {
                     vec![fill()]
+                } else {
+                    Vec::new()
                 }
             );
         }
@@ -1624,6 +1667,7 @@ pub(super) mod tests {
     pub(crate) struct CommissionStubClient {
         outcome: CommissionOutcome,
         seen: RefCell<Option<(Quantity, Price, LiquiditySide)>>,
+        pub(crate) requires_authoritative_fills: bool,
     }
 
     impl CommissionStubClient {
@@ -1632,6 +1676,7 @@ pub(super) mod tests {
             Self {
                 outcome,
                 seen: RefCell::new(None),
+                requires_authoritative_fills: false,
             }
         }
 
@@ -1648,6 +1693,10 @@ pub(super) mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl ExecutionClient for CommissionStubClient {
+        fn requires_authoritative_fills(&self) -> bool {
+            self.requires_authoritative_fills
+        }
+
         fn is_connected(&self) -> bool {
             true
         }
