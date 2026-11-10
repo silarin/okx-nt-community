@@ -31,6 +31,7 @@
 //! more will cause a panic.
 
 pub mod config;
+pub mod execution_timing;
 pub mod headers;
 pub mod logger;
 pub mod macros;

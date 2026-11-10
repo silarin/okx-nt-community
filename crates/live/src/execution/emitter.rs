@@ -562,6 +562,10 @@ impl ExecutionEventEmitter {
     ///
     /// Returns an error if the sender is uninitialized or its receiver is closed.
     pub fn try_send_order_event(&self, event: OrderEventAny) -> anyhow::Result<()> {
+        nautilus_common::logging::execution_timing::record_order_event(
+            "execution_enqueue_attempt",
+            &event,
+        );
         self.try_send(ExecutionEvent::Order(event), "order event")
     }
 

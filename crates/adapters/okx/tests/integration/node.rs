@@ -32,6 +32,10 @@ use futures_util::StreamExt;
 use nautilus_common::{
     actor::DataActor,
     enums::Environment,
+    logging::{
+        execution_timing::set_execution_timing_enabled, logger::LoggerConfig, logging_sync_to_disk,
+        writer::FileWriterConfig,
+    },
     msgbus::{self, MessagingSwitchboard, stubs::get_any_saving_handler},
     testing::wait_until_async,
 };
@@ -295,6 +299,15 @@ async fn start_venue_with_orders_ack(
 }
 
 fn build_node(addr: SocketAddr, retain: bool, events: Rc<RefCell<Vec<OrderEventAny>>>) -> LiveNode {
+    build_node_with_logging(addr, retain, events, LoggerConfig::default())
+}
+
+fn build_node_with_logging(
+    addr: SocketAddr,
+    retain: bool,
+    events: Rc<RefCell<Vec<OrderEventAny>>>,
+    logging: LoggerConfig,
+) -> LiveNode {
     let mut exec_engine = LiveExecutionEngineConfig {
         reconciliation: false,
         inflight_check_interval_ms: 10,
@@ -307,6 +320,7 @@ fn build_node(addr: SocketAddr, retain: bool, events: Rc<RefCell<Vec<OrderEventA
         exec_engine.submission_recovery_policy = SubmissionRecoveryPolicy::RetainUnresolved;
     }
     let mut node = LiveNodeBuilder::from_config(LiveNodeConfig {
+        logging,
         environment: Environment::Live,
         trader_id: TraderId::from("TESTER-001"),
         exec_engine,
@@ -826,6 +840,101 @@ async fn authoritative_submit_rejection(#[values(false, true)] retain: bool) {
     let cache = node.kernel().cache.borrow();
     assert_eq!(
         cache
+            .order(&ClientOrderId::from(CLIENT_ORDER_ID))
+            .unwrap()
+            .status(),
+        OrderStatus::Rejected
+    );
+}
+
+#[tokio::test]
+async fn execution_timing_observes_live_node_run_delivery() {
+    let directory = tempfile::tempdir().unwrap();
+    let logging = LoggerConfig {
+        stdout_level: log::LevelFilter::Off,
+        fileout_level: log::LevelFilter::Info,
+        is_colored: false,
+        file_config: Some(FileWriterConfig {
+            directory: Some(directory.path().to_string_lossy().into_owned()),
+            file_name: Some("timing".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (addr, venue) = start_venue(Some("51008")).await;
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut node = build_node_with_logging(addr, true, Rc::clone(&events), logging);
+    let handle = node.handle();
+    set_execution_timing_enabled(true);
+    let driver = async {
+        wait_until_async(
+            || async {
+                events
+                    .borrow()
+                    .iter()
+                    .any(|event| matches!(event, OrderEventAny::Rejected(_)))
+            },
+            DEADLINE,
+        )
+        .await;
+        handle.stop();
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(node.run(), driver)
+    })
+    .await
+    .unwrap();
+    set_execution_timing_enabled(false);
+    result.unwrap();
+    logging_sync_to_disk().unwrap();
+    assert_eq!(venue.submissions.lock().await.len(), 1);
+    assert!(venue.queries.lock().await.is_empty());
+    let events = events.borrow();
+    let rejected: Vec<_> = events
+        .iter()
+        .filter_map(|event| {
+            if let OrderEventAny::Rejected(event) = event {
+                Some(event)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(rejected.len(), 1);
+    let identity = format!("event_id={}", rejected[0].event_id);
+    let logs = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let delivery: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("ExecutionTiming") && line.contains(&identity))
+        .collect();
+    let expected = [
+        "execution_enqueue_attempt",
+        "execution_dequeued",
+        "execution_engine_dispatch",
+        "strategy_received",
+    ];
+    assert_eq!(delivery.len(), expected.len(), "{logs}");
+    let mut previous = 0;
+
+    for (line, stage) in delivery.iter().zip(expected) {
+        assert!(line.contains(&format!("stage={stage}")), "{line}");
+        let stamp: u128 = line
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("host_mono_ns="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(stamp >= previous);
+        previous = stamp;
+    }
+    assert_eq!(
+        node.kernel()
+            .cache
+            .borrow()
             .order(&ClientOrderId::from(CLIENT_ORDER_ID))
             .unwrap()
             .status(),
