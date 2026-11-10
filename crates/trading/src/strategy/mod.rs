@@ -1735,16 +1735,6 @@ pub trait Strategy: DataActor {
     /// Override this method to implement custom logic after a market exit completes.
     fn post_market_exit(&mut self) {}
 
-    /// Returns whether strategy-specific evidence permits market-exit completion.
-    ///
-    /// Called by the native exit timer after orders and executable positions are clear.
-    /// Return `false` while awaiting external evidence. Native timer ownership and the
-    /// attempt budget are unchanged: if readiness is still false at the budget, the
-    /// strategy faults rather than reporting a completed exit. A panic also fails closed.
-    fn market_exit_ready(&self) -> bool {
-        true
-    }
-
     /// Returns whether the strategy is currently executing a market exit.
     ///
     /// Strategies can check this to avoid submitting new orders during exit.
@@ -1980,18 +1970,7 @@ pub trait Strategy: DataActor {
                 open positions: {open_positions_count}"
             );
 
-            let ready =
-                catch_unwind(AssertUnwindSafe(|| self.market_exit_ready())).unwrap_or(false);
-
-            if ready {
-                self.finalize_market_exit();
-            } else {
-                self.cancel_market_exit();
-                log::error!("{strategy_id} Market exit readiness incomplete at attempt limit");
-                if let Err(e) = Component::fault(self) {
-                    log::error!("{strategy_id} Failed to fault incomplete market exit: {e}");
-                }
-            }
+            self.finalize_market_exit();
             return;
         }
 
@@ -2038,9 +2017,7 @@ pub trait Strategy: DataActor {
         drop(cache);
 
         if instrument_ids.is_empty() {
-            if catch_unwind(AssertUnwindSafe(|| self.market_exit_ready())).unwrap_or(false) {
-                self.finalize_market_exit();
-            }
+            self.finalize_market_exit();
             return;
         }
 
