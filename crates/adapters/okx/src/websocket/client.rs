@@ -35,8 +35,8 @@ use std::{
 use ahash::{AHashMap, AHashSet};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use futures_util::Stream;
-use nautilus_common::live::dst::time;
+use futures_util::{Stream, StreamExt};
+use nautilus_common::{live::dst::time, logging::execution_timing::ExecutionTiming};
 use nautilus_core::{
     AtomicMap, AtomicTime, UUID4, UnixNanos,
     env::{get_env_var, get_or_env_var},
@@ -62,7 +62,7 @@ use nautilus_network::{
     ratelimiter::quota::Quota,
     websocket::{
         AUTHENTICATION_TIMEOUT_SECS, AuthTracker, SubscriptionState, TEXT_PING, TransportBackend,
-        WebSocketClient, WebSocketConfig, channel_epoch_message_handler,
+        WebSocketClient, WebSocketConfig,
     },
 };
 use parking_lot::Mutex;
@@ -81,6 +81,7 @@ use super::{
         WsMassCancelParams, WsPostOrderParamsBuilder,
     },
     subscription::topic_from_subscription_arg,
+    timing::{TimingEnvelope, channel_timing_message_handler},
 };
 use crate::common::{
     consts::{
@@ -229,7 +230,7 @@ pub struct OKXWebSocketClient {
     connection_mode: Arc<ArcSwap<AtomicU8>>,
     connection_epoch: Arc<ArcSwap<AtomicU64>>,
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
-    out_rx: Option<Arc<tokio::sync::mpsc::UnboundedReceiver<OKXWsMessage>>>,
+    out_rx: Option<Arc<tokio::sync::mpsc::UnboundedReceiver<TimingEnvelope<OKXWsMessage>>>>,
     handler_tasks: Arc<TaskGroup>,
     connect_lock: Arc<tokio::sync::Mutex<()>>,
     handler_abort: Arc<Mutex<CancellationToken>>,
@@ -681,7 +682,7 @@ impl OKXWebSocketClient {
         self.signal.store(false, Ordering::Release);
 
         self.subscriptions_state.reset_after_reconnect();
-        let (message_handler, raw_rx) = channel_epoch_message_handler();
+        let (message_handler, raw_rx) = channel_timing_message_handler();
 
         // No-op ping handler: handler owns the WebSocketClient and responds to pings directly
         // in the message loop for minimal latency (see handler.rs TEXT_PONG response)
@@ -750,18 +751,20 @@ impl OKXWebSocketClient {
             ),
         ];
 
-        let (msg_tx, rx) = tokio::sync::mpsc::unbounded_channel::<OKXWsMessage>();
+        let (msg_tx, rx) = tokio::sync::mpsc::unbounded_channel::<TimingEnvelope<OKXWsMessage>>();
         let disconnect_tx = msg_tx.clone();
         let signal = Arc::clone(&self.signal);
         let on_state = move |state| {
             if state == SocketState::Disconnected && !signal.load(Ordering::Acquire) {
-                let _ =
-                    disconnect_tx.send(OKXWsMessage::Error(super::messages::OKXWebSocketError {
+                let _ = disconnect_tx.send(
+                    OKXWsMessage::Error(super::messages::OKXWebSocketError {
                         code: String::new(),
                         message: "WebSocket transport disconnected unexpectedly".to_string(),
                         conn_id: None,
                         timestamp: get_atomic_clock_realtime().get_time_ns().as_u64(),
-                    }));
+                    })
+                    .into(),
+                );
             }
         };
         let state_sink = if let Some(control) = &self.socket_control {
@@ -1023,6 +1026,12 @@ impl OKXWebSocketClient {
     /// - The websocket is not connected.
     /// - `stream_data` has already been called somewhere else (stream receiver is then taken).
     pub fn stream(&mut self) -> impl Stream<Item = OKXWsMessage> + 'static {
+        self.stream_with_timing().map(|envelope| envelope.message)
+    }
+
+    pub(crate) fn stream_with_timing(
+        &mut self,
+    ) -> impl Stream<Item = TimingEnvelope<OKXWsMessage>> + 'static {
         let rx = self
             .out_rx
             .take()
@@ -1030,6 +1039,9 @@ impl OKXWebSocketClient {
         let mut rx = Arc::try_unwrap(rx).expect("Cannot take ownership - other references exist");
         async_stream::stream! {
             while let Some(data) = rx.recv().await {
+                if let Some(stamp) = ExecutionTiming::capture() {
+                    stamp.record("ws_output_received", data.timing, data.epoch);
+                }
                 yield data;
             }
         }
@@ -4717,20 +4729,23 @@ mod tests {
 
         for event in ["subscribe", "unsubscribe"] {
             raw_tx
-                .send((
-                    0,
-                    Message::Text(
-                        serde_json::json!({"event":event,"arg":argument,"connId":"test"})
-                            .to_string()
-                            .into(),
-                    ),
-                ))
+                .send(
+                    (
+                        0,
+                        Message::Text(
+                            serde_json::json!({"event":event,"arg":argument,"connId":"test"})
+                                .to_string()
+                                .into(),
+                        ),
+                    )
+                        .into(),
+                )
                 .unwrap();
         }
         let sentinel =
             serde_json::json!({"event":"error","code":"60000","msg":"sentinel"}).to_string();
         raw_tx
-            .send((0, Message::Text(sentinel.clone().into())))
+            .send((0, Message::Text(sentinel.clone().into())).into())
             .unwrap();
         assert!(matches!(handler.next().await, Some(OKXWsMessage::Error(_))));
         assert!(
@@ -4744,21 +4759,26 @@ mod tests {
             .await
             .unwrap();
         raw_tx
-            .send((0, Message::Text(sentinel.clone().into())))
+            .send((0, Message::Text(sentinel.clone().into())).into())
             .unwrap();
         assert!(matches!(handler.next().await, Some(OKXWsMessage::Error(_))));
         assert!(client.subscriptions_state.confirmed().is_empty());
         raw_tx
-            .send((
-                0,
-                Message::Text(
-                    serde_json::json!({"event":"subscribe","arg":argument,"connId":"test"})
-                        .to_string()
-                        .into(),
-                ),
-            ))
+            .send(
+                (
+                    0,
+                    Message::Text(
+                        serde_json::json!({"event":"subscribe","arg":argument,"connId":"test"})
+                            .to_string()
+                            .into(),
+                    ),
+                )
+                    .into(),
+            )
             .unwrap();
-        raw_tx.send((0, Message::Text(sentinel.into()))).unwrap();
+        raw_tx
+            .send((0, Message::Text(sentinel.into())).into())
+            .unwrap();
         assert!(matches!(handler.next().await, Some(OKXWsMessage::Error(_))));
         assert_eq!(client.subscriptions_state.len(), 1);
         transport.disconnect().await;

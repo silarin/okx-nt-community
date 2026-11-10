@@ -1441,7 +1441,7 @@ impl OKXExecutionClient {
         log::info!("Connected to private WebSocket");
 
         {
-            let stream = self.ws_private.stream();
+            let stream = self.ws_private.stream_with_timing();
             let emitter = self.emitter.clone();
             let state = Arc::clone(&self.ws_dispatch_state);
             let account_id = self.core.account_id;
@@ -1471,7 +1471,7 @@ impl OKXExecutionClient {
                                 break;
                             };
                             dispatch_ws_message(
-                                message,
+                                message.into_execution_message(),
                                 &emitter,
                                 &state,
                                 account_id,
@@ -1507,7 +1507,7 @@ impl OKXExecutionClient {
         log::info!("Connected to business WebSocket");
 
         {
-            let stream = self.ws_business.stream();
+            let stream = self.ws_business.stream_with_timing();
             let emitter = self.emitter.clone();
             let state = Arc::clone(&self.ws_dispatch_state);
             let account_id = self.core.account_id;
@@ -1537,7 +1537,7 @@ impl OKXExecutionClient {
                                 break;
                             };
                             dispatch_ws_message(
-                                message,
+                                message.into_execution_message(),
                                 &emitter,
                                 &state,
                                 account_id,

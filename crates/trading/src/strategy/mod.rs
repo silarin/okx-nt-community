@@ -1375,6 +1375,7 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
+        nautilus_common::logging::execution_timing::record_order_event("strategy_received", &event);
         let state = {
             let core = StrategyNative::strategy_core_mut(self);
             let id = &core.actor.actor_id;
@@ -3566,6 +3567,43 @@ mod tests {
         assert_eq!(*LOG_CAPTURE.0.lock().unwrap(), expected_records);
         assert!(strategy.on_order_rejected_called);
         assert!(strategy.on_order_event_called);
+    }
+
+    #[rstest]
+    fn test_execution_timing_records_real_strategy_delivery_without_changing_callbacks() {
+        use nautilus_common::logging::execution_timing::set_execution_timing_enabled;
+
+        struct Capture(Mutex<Vec<String>>);
+        impl log::Log for Capture {
+            fn enabled(&self, metadata: &log::Metadata) -> bool {
+                metadata.target() == "ExecutionTiming"
+            }
+            fn log(&self, record: &log::Record) {
+                if self.enabled(record.metadata()) {
+                    self.0.lock().unwrap().push(record.args().to_string());
+                }
+            }
+            fn flush(&self) {}
+        }
+        static LOGS: Capture = Capture(Mutex::new(Vec::new()));
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+        start_strategy(&mut strategy);
+        log::set_logger(&LOGS).unwrap();
+        log::set_max_level(log::LevelFilter::Info);
+        set_execution_timing_enabled(true);
+        let accepted = OrderAcceptedSpec::builder()
+            .strategy_id(StrategyId::from("TEST-001"))
+            .build();
+        let event_id = accepted.event_id;
+        strategy.handle_order_event(OrderEventAny::Accepted(accepted));
+        set_execution_timing_enabled(false);
+        assert!(strategy.on_order_accepted_called);
+        assert!(strategy.on_order_event_called);
+        let records = LOGS.0.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].contains("stage=strategy_received"));
+        assert!(records[0].contains(&format!("event_id={event_id}")));
     }
 
     struct OrderEventLogCapture(Mutex<Vec<(log::Level, String)>>);

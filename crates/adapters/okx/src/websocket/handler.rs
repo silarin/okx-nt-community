@@ -33,7 +33,7 @@ use std::{
 };
 
 use ahash::AHashSet;
-use nautilus_common::live::dst::time;
+use nautilus_common::{live::dst::time, logging::execution_timing::ExecutionTiming};
 use nautilus_core::{AtomicTime, string::secret::REDACTED};
 pub use nautilus_live::book::snapshot::SnapshotGate;
 use nautilus_model::identifiers::ClientOrderId;
@@ -56,6 +56,7 @@ use super::{
         OKXWsFrame, OKXWsMessage,
     },
     subscription::{topic_from_subscription_arg, topic_from_websocket_arg},
+    timing::TimingEnvelope,
 };
 use crate::{
     common::{
@@ -161,11 +162,13 @@ struct OrderSubscriptionWaiter {
 
 pub(super) struct OKXWsFeedHandler {
     clock: &'static AtomicTime,
+    message_timing: Option<ExecutionTiming>,
+    message_epoch: Option<u64>,
     signal: Arc<AtomicBool>,
     inner: Option<Arc<WebSocketClient>>,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
-    raw_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Message)>,
-    out_tx: tokio::sync::mpsc::UnboundedSender<OKXWsMessage>,
+    raw_rx: tokio::sync::mpsc::UnboundedReceiver<TimingEnvelope<(u64, Message)>>,
+    out_tx: tokio::sync::mpsc::UnboundedSender<TimingEnvelope<OKXWsMessage>>,
     auth_tracker: AuthTracker,
     requires_auth: bool,
     subscriptions_state: SubscriptionState,
@@ -186,8 +189,8 @@ impl OKXWsFeedHandler {
     pub(super) fn new(
         signal: Arc<AtomicBool>,
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
-        raw_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Message)>,
-        out_tx: tokio::sync::mpsc::UnboundedSender<OKXWsMessage>,
+        raw_rx: tokio::sync::mpsc::UnboundedReceiver<TimingEnvelope<(u64, Message)>>,
+        out_tx: tokio::sync::mpsc::UnboundedSender<TimingEnvelope<OKXWsMessage>>,
         auth_tracker: AuthTracker,
         requires_auth: bool,
         subscriptions_state: SubscriptionState,
@@ -195,6 +198,8 @@ impl OKXWsFeedHandler {
     ) -> Self {
         Self {
             clock,
+            message_timing: None,
+            message_epoch: None,
             signal,
             inner: None,
             cmd_rx,
@@ -217,7 +222,22 @@ impl OKXWsFeedHandler {
     }
 
     pub(super) fn send(&self, msg: OKXWsMessage) -> Result<(), ()> {
-        self.out_tx.send(msg).map_err(|_| ())
+        let timing = ExecutionTiming::capture();
+        if let Some(stamp) = timing {
+            stamp.record(
+                "ws_output_enqueue_attempt",
+                self.message_timing,
+                self.message_epoch,
+            );
+        }
+        super::timing::record_message("ws_parsed", &msg, self.message_timing, self.message_epoch);
+        self.out_tx
+            .send(TimingEnvelope {
+                message: msg,
+                timing,
+                epoch: self.message_epoch,
+            })
+            .map_err(|_| ())
     }
 
     async fn send_with_retry(
@@ -279,6 +299,9 @@ impl OKXWsFeedHandler {
     }
 
     pub(super) async fn next(&mut self) -> Option<OKXWsMessage> {
+        self.message_timing = None;
+        self.message_epoch = None;
+
         if let Some(message) = self.pending_messages.pop_front() {
             return Some(message);
         }
@@ -286,6 +309,8 @@ impl OKXWsFeedHandler {
         let mut poll_raw_next = false;
 
         loop {
+            self.message_timing = None;
+            self.message_epoch = None;
             self.complete_order_subscription_waiters();
 
             if self.signal.load(Ordering::Acquire) {
@@ -408,9 +433,15 @@ impl OKXWsFeedHandler {
 
                 msg = self.raw_rx.recv() => {
                     let (epoch, event) = match msg {
-                        Some((epoch, msg)) => match Self::parse_raw_message(msg) {
-                            Some(event) => (epoch, event),
-                            None => continue,
+                        Some(envelope) => {
+                            self.message_timing = envelope.timing;
+                            self.message_epoch = envelope.epoch;
+                            let (epoch, msg) = envelope.received("ws_handler_dequeued");
+                            super::timing::record_gateway_timing(&msg, self.message_timing, epoch);
+                            match Self::parse_raw_message(msg) {
+                                Some(event) => (epoch, event),
+                                None => continue,
+                            }
                         },
                         None => {
                             log::debug!("WebSocket stream closed");
@@ -552,6 +583,16 @@ impl OKXWsFeedHandler {
 
         let pending = self.pending_sends.front_mut().expect("pending send exists");
         pending.attempted = true;
+        let send_timing = ExecutionTiming::capture();
+        if let Some(stamp) = send_timing {
+            stamp.record("ws_send_start", None, Some(epoch));
+            super::timing::record_command(
+                stamp,
+                pending.request_id.as_deref(),
+                &pending.client_order_ids,
+                pending.op.as_ref(),
+            );
+        }
         let result = client
             .send_text_on_connection(
                 pending.payload.clone(),
@@ -559,6 +600,12 @@ impl OKXWsFeedHandler {
                 epoch,
             )
             .await;
+
+        if let Some(stamp) = ExecutionTiming::capture() {
+            stamp.record("ws_send_completed", send_timing, Some(epoch));
+            log::info!(target: "ExecutionTiming", "stage=ws_send_result trace={} success={} connection_changed={} timeout={}",
+                stamp.id, result.is_ok(), matches!(result, Err(SendError::ConnectionChanged)), matches!(result, Err(SendError::Timeout)));
+        }
 
         if matches!(result, Err(SendError::ConnectionChanged)) {
             pending.attempted = false;
@@ -1086,6 +1133,8 @@ struct PendingSend {
 
 impl Drop for OKXWsFeedHandler {
     fn drop(&mut self) {
+        self.message_timing = None;
+        self.message_epoch = None;
         self.cmd_rx.close();
 
         while let Some(pending) = self.pending_sends.pop_front() {
@@ -1175,15 +1224,12 @@ mod tests {
     use nautilus_network::{
         mode::{ConnectionMode, ReconnectRequestOutcome},
         ratelimiter::{RateLimiter, quota::Quota},
-        websocket::{
-            AuthTracker, SubscriptionState, TransportBackend, WebSocketConfig,
-            channel_epoch_message_handler,
-        },
+        websocket::{AuthTracker, SubscriptionState, TransportBackend, WebSocketConfig},
     };
     use rstest::rstest;
     use serde_json::json;
 
-    use super::*;
+    use super::{super::timing::channel_timing_message_handler, *};
     use crate::{
         book::{BookChannelScope, BookSequenceOutcome, sync::BookSyncTracker},
         common::{
@@ -1224,7 +1270,7 @@ mod tests {
         handler.cmd_rx = cmd_rx;
         handler.raw_rx = raw_rx;
         raw_tx
-            .send((0, Message::Text(payload.to_string().into())))
+            .send((0, Message::Text(payload.to_string().into())).into())
             .unwrap();
         let output = tokio::time::timeout(Duration::from_secs(1), handler.next())
             .await
@@ -1283,7 +1329,7 @@ mod tests {
 
         let message = tokio::time::timeout(Duration::from_secs(1), async {
             tokio::select! {
-                message = out_rx.recv() => message,
+                message = out_rx.recv() => message.map(|envelope| envelope.message),
                 message = handler.next() => panic!("Unexpected handler return: {message:?}"),
             }
         })
@@ -1336,25 +1382,31 @@ mod tests {
         }
 
         raw_tx
-            .send((
-                0,
-                Message::Text(
-                    json!({"event":"error","code":"60000","msg":"sentinel"})
-                        .to_string()
-                        .into(),
-                ),
-            ))
+            .send(
+                (
+                    0,
+                    Message::Text(
+                        json!({"event":"error","code":"60000","msg":"sentinel"})
+                            .to_string()
+                            .into(),
+                    ),
+                )
+                    .into(),
+            )
             .unwrap();
 
         raw_tx
-            .send((
-                0,
-                Message::Text(
-                    json!({"event":"error","code":"60000","msg":"sentinel"})
-                        .to_string()
-                        .into(),
-                ),
-            ))
+            .send(
+                (
+                    0,
+                    Message::Text(
+                        json!({"event":"error","code":"60000","msg":"sentinel"})
+                            .to_string()
+                            .into(),
+                    ),
+                )
+                    .into(),
+            )
             .unwrap();
 
         let messages = tokio::time::timeout(Duration::from_secs(1), async {
@@ -1364,10 +1416,10 @@ mod tests {
             }
 
             [
-                out_rx.recv().await,
-                out_rx.recv().await,
-                out_rx.recv().await,
-                out_rx.recv().await,
+                out_rx.recv().await.map(|envelope| envelope.message),
+                out_rx.recv().await.map(|envelope| envelope.message),
+                out_rx.recv().await.map(|envelope| envelope.message),
+                out_rx.recv().await.map(|envelope| envelope.message),
             ]
         })
         .await
@@ -1410,14 +1462,17 @@ mod tests {
                 .unwrap();
         }
         raw_tx
-            .send((
-                0,
-                Message::Text(
-                    json!({"event":"error","code":"60000","msg":"sentinel"})
-                        .to_string()
-                        .into(),
-                ),
-            ))
+            .send(
+                (
+                    0,
+                    Message::Text(
+                        json!({"event":"error","code":"60000","msg":"sentinel"})
+                            .to_string()
+                            .into(),
+                    ),
+                )
+                    .into(),
+            )
             .unwrap();
 
         let message = handler.next().await;
@@ -1443,7 +1498,7 @@ mod tests {
             }
         });
 
-        let (message_handler, raw_rx) = channel_epoch_message_handler();
+        let (message_handler, raw_rx) = channel_timing_message_handler();
         let client = WebSocketClient::epoch_builder()
             .config(WebSocketConfig::builder().url(url).build().unwrap())
             .epoch_handler(message_handler)
@@ -1549,7 +1604,7 @@ mod tests {
             }
         });
 
-        let (message_handler, raw_rx) = channel_epoch_message_handler();
+        let (message_handler, raw_rx) = channel_timing_message_handler();
         let client = WebSocketClient::epoch_builder()
             .config(WebSocketConfig::builder().url(url).build().unwrap())
             .epoch_handler(message_handler)
@@ -1611,7 +1666,7 @@ mod tests {
             while socket.next().await.is_some() {}
         });
 
-        let (message_handler, raw_rx) = channel_epoch_message_handler();
+        let (message_handler, raw_rx) = channel_timing_message_handler();
         let client = WebSocketClient::epoch_builder()
             .config(WebSocketConfig::builder().url(url).build().unwrap())
             .epoch_handler(message_handler)
@@ -1732,7 +1787,7 @@ mod tests {
             ),
             Vec::new(),
         ));
-        let (message_handler, raw_rx) = channel_epoch_message_handler();
+        let (message_handler, raw_rx) = channel_timing_message_handler();
         let client = WebSocketClient::epoch_builder()
             .config(WebSocketConfig::builder().url(url).build().unwrap())
             .epoch_handler(message_handler)
@@ -2186,7 +2241,7 @@ mod tests {
             frames
         });
 
-        let (message_handler, raw_rx) = channel_epoch_message_handler();
+        let (message_handler, raw_rx) = channel_timing_message_handler();
         let client = WebSocketClient::epoch_builder()
             .config(WebSocketConfig::builder().url(url).build().unwrap())
             .epoch_handler(message_handler)
@@ -2413,7 +2468,7 @@ mod tests {
         send.await;
         tokio::time::resume();
 
-        let failure = peer.messages.try_recv().unwrap();
+        let failure = peer.messages.try_recv().unwrap().message;
         assert!(matches!(failure, OKXWsMessage::SendFailed {
             request_id, client_order_ids, op: Some(OKXWsOperation::CancelOrder),
             error: OKXWsError::TransportSend(SendError::Timeout),
@@ -2457,7 +2512,7 @@ mod tests {
         let mut next = Box::pin(peer.handler.next());
         assert!(futures_util::poll!(next.as_mut()).is_pending());
         drop(next);
-        let overflow = peer.messages.try_recv().unwrap();
+        let overflow = peer.messages.try_recv().unwrap().message;
         assert!(
             matches!(overflow, OKXWsMessage::SendFailed { request_id, client_order_ids, op: Some(OKXWsOperation::AmendOrder), error: OKXWsError::TransportSend(SendError::BufferFull) }
             if request_id == "overflow" && client_order_ids == vec![ClientOrderId::from("OOVERFLOW")])
@@ -2485,7 +2540,7 @@ mod tests {
         peer.handler.inner.as_ref().unwrap().disconnect().await;
         drop(peer.handler);
         for index in 0..PENDING_SENDS_CAPACITY {
-            let message = peer.messages.try_recv().unwrap();
+            let message = peer.messages.try_recv().unwrap().message;
 
             let OKXWsMessage::SendFailed {
                 request_id,
@@ -2514,7 +2569,7 @@ mod tests {
             }
         }
 
-        let unread = peer.messages.try_recv().unwrap();
+        let unread = peer.messages.try_recv().unwrap().message;
         assert!(
             matches!(unread, OKXWsMessage::SendFailed { request_id, client_order_ids, op: Some(OKXWsOperation::Order), error: OKXWsError::TransportSend(SendError::Closed) }
             if request_id == "unread" && client_order_ids == vec![ClientOrderId::from("OUNREAD")])
@@ -2563,9 +2618,9 @@ mod tests {
         for (index, kind) in ["SPOT", "SWAP"].into_iter().enumerate() {
             raw_tx.send((0, Message::Text(json!({
                 "event":"subscribe", "arg":{"channel":"orders","instType":kind}, "connId":"test"
-            }).to_string().into()))).unwrap();
+            }).to_string().into())).into()).unwrap();
             raw_tx
-                .send((0, Message::Text(load_test_json("ws_orders.json").into())))
+                .send((0, Message::Text(load_test_json("ws_orders.json").into())).into())
                 .unwrap();
             assert!(matches!(
                 peer.handler.next().await,
@@ -2617,7 +2672,7 @@ mod tests {
             })
             .unwrap();
         raw_tx
-            .send((0, Message::Text(load_test_json("ws_orders.json").into())))
+            .send((0, Message::Text(load_test_json("ws_orders.json").into())).into())
             .unwrap();
         assert!(matches!(
             peer.handler.next().await,
@@ -2633,7 +2688,7 @@ mod tests {
         .await
         .unwrap();
         raw_tx
-            .send((1, Message::Text(RECONNECTED.to_string().into())))
+            .send((1, Message::Text(RECONNECTED.to_string().into())).into())
             .unwrap();
         assert!(matches!(
             peer.handler.next().await,
@@ -2660,10 +2715,10 @@ mod tests {
         })
         .to_string();
         raw_tx
-            .send((0, Message::Text(acknowledgement.clone().into())))
+            .send((0, Message::Text(acknowledgement.clone().into())).into())
             .unwrap();
         raw_tx
-            .send((0, Message::Text(load_test_json("ws_orders.json").into())))
+            .send((0, Message::Text(load_test_json("ws_orders.json").into())).into())
             .unwrap();
         assert!(matches!(
             peer.handler.next().await,
@@ -2678,16 +2733,16 @@ mod tests {
         // A stale rejection cannot poison the replacement session either
         raw_tx.send((0, Message::Text(json!({
             "event":"error", "arg":{"channel":"orders","instType":"SPOT"}, "code":"60012", "msg":"old rejection"
-        }).to_string().into()))).unwrap();
+        }).to_string().into())).into()).unwrap();
         assert!(matches!(
             peer.handler.next().await,
             Some(OKXWsMessage::Error(_))
         ));
         raw_tx
-            .send((1, Message::Text(acknowledgement.into())))
+            .send((1, Message::Text(acknowledgement.into())).into())
             .unwrap();
         raw_tx
-            .send((1, Message::Text(load_test_json("ws_orders.json").into())))
+            .send((1, Message::Text(load_test_json("ws_orders.json").into())).into())
             .unwrap();
         assert!(matches!(
             peer.handler.next().await,
@@ -2699,10 +2754,10 @@ mod tests {
             .unwrap()
             .unwrap();
         raw_tx
-            .send((1, Message::Text(RECONNECTED.to_string().into())))
+            .send((1, Message::Text(RECONNECTED.to_string().into())).into())
             .unwrap();
         raw_tx
-            .send((1, Message::Text(load_test_json("ws_orders.json").into())))
+            .send((1, Message::Text(load_test_json("ws_orders.json").into())).into())
             .unwrap();
         assert!(matches!(
             peer.handler.next().await,
@@ -2730,7 +2785,7 @@ mod tests {
             })
             .unwrap();
         raw_tx
-            .send((0, Message::Text(load_test_json("ws_orders.json").into())))
+            .send((0, Message::Text(load_test_json("ws_orders.json").into())).into())
             .unwrap();
         assert!(matches!(
             peer.handler.next().await,
@@ -2740,7 +2795,7 @@ mod tests {
         if canceled {
             drop(response);
             raw_tx
-                .send((0, Message::Text(load_test_json("ws_orders.json").into())))
+                .send((0, Message::Text(load_test_json("ws_orders.json").into())).into())
                 .unwrap();
             assert!(matches!(
                 peer.handler.next().await,
@@ -2775,9 +2830,11 @@ mod tests {
         let expected_orders: Vec<OKXOrderMsg> =
             serde_json::from_value(orders_frame["data"].clone()).unwrap();
 
-        raw_tx.send((0, Message::Text(orders.into()))).unwrap();
         raw_tx
-            .send((0, Message::Text(fixture["response"].to_string().into())))
+            .send((0, Message::Text(orders.into())).into())
+            .unwrap();
+        raw_tx
+            .send((0, Message::Text(fixture["response"].to_string().into())).into())
             .unwrap();
 
         let ws_client = peer.handler.inner.as_ref().unwrap();
@@ -2836,13 +2893,16 @@ mod tests {
         let fixture: Value =
             serde_json::from_str(&load_test_json("ws_reconnect_queued_frames.json")).unwrap();
         raw_tx
-            .send((
-                0,
-                Message::Text(fixture["login_failure"].to_string().into()),
-            ))
+            .send(
+                (
+                    0,
+                    Message::Text(fixture["login_failure"].to_string().into()),
+                )
+                    .into(),
+            )
             .unwrap();
         raw_tx
-            .send((0, Message::Text(load_test_json("ws_orders.json").into())))
+            .send((0, Message::Text(load_test_json("ws_orders.json").into())).into())
             .unwrap();
         assert!(matches!(
             peer.handler.next().await,
@@ -2887,7 +2947,7 @@ mod tests {
             }
         });
 
-        let (message_handler, raw_rx) = channel_epoch_message_handler();
+        let (message_handler, raw_rx) = channel_timing_message_handler();
         let client = WebSocketClient::epoch_builder()
             .config(
                 WebSocketConfig::builder()
@@ -2919,7 +2979,7 @@ mod tests {
             .pending_sends
             .push_back(order_send("x".repeat(64 * 1024 * 1024), 17));
         handler.send_pending().await;
-        let failure = messages.try_recv().unwrap();
+        let failure = messages.try_recv().unwrap().message;
 
         let OKXWsMessage::SendFailed {
             request_id,
@@ -2989,7 +3049,7 @@ mod tests {
         handler: OKXWsFeedHandler,
         commands: tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
         frames: tokio::sync::mpsc::UnboundedReceiver<String>,
-        messages: tokio::sync::mpsc::UnboundedReceiver<OKXWsMessage>,
+        messages: tokio::sync::mpsc::UnboundedReceiver<TimingEnvelope<OKXWsMessage>>,
         server: tokio::task::JoinHandle<()>,
     }
 
@@ -3016,7 +3076,7 @@ mod tests {
             }
         });
 
-        let (message_handler, raw_rx) = channel_epoch_message_handler();
+        let (message_handler, raw_rx) = channel_timing_message_handler();
         let client = WebSocketClient::epoch_builder()
             .config(WebSocketConfig::builder().url(url).build().unwrap())
             .epoch_handler(message_handler)

@@ -33,5 +33,7 @@ pub mod messages;
 pub mod parse;
 pub mod subscription;
 
+pub(crate) mod timing;
+
 // Re-exports
 pub use crate::websocket::client::OKXWebSocketClient;

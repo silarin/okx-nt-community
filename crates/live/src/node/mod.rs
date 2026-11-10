@@ -136,7 +136,7 @@ use crate::{
         client::LiveExecutionClient,
         manager::{ExecutionManager, ExecutionManagerConfig, TargetedOrderQuery},
     },
-    runner::{AsyncRunner, AsyncRunnerChannels, PendingRunnerEvent},
+    runner::{AsyncRunner, AsyncRunnerChannels, PendingRunnerEvent, record_exec_dequeue},
     socket::{SocketReconnectLookup, SocketReconnectRegistry},
 };
 
@@ -1880,6 +1880,7 @@ impl LiveNode {
                     command.dispatch(|command| self.process_system_command(command));
                 }
                 Some(evt) = channels.exec_evt.recv() => {
+                    record_exec_dequeue(&evt);
                     skip_time = false;
                     let dispatch_start = dst::time::Instant::now();
 
@@ -2241,6 +2242,7 @@ impl LiveNode {
             let count = receivers.exec_evt.len();
             (0..count)
                 .filter_map(|_| receivers.exec_evt.try_recv().ok())
+                .inspect(record_exec_dequeue)
                 .collect()
         } else {
             self.runner
@@ -2959,6 +2961,7 @@ impl LiveNode {
                     processed += 1;
                 }
                 Some(event) = receivers.exec_evt.recv() => {
+                    record_exec_dequeue(&event);
                     self.process_exec_event(event);
                     processed += 1;
                 }
@@ -3154,6 +3157,7 @@ impl LiveNode {
         }
 
         while let Ok(evt) = receivers.exec_evt.try_recv() {
+            record_exec_dequeue(&evt);
             self.process_runner_event(PendingRunnerEvent::ExecEvent(evt));
             drained += 1;
         }
@@ -3952,6 +3956,7 @@ fn flush_all_pending(
     }
 
     while let Ok(evt) = exec_evt_rx.try_recv() {
+        record_exec_dequeue(&evt);
         pending.push_exec_event(evt);
     }
 
@@ -4000,6 +4005,7 @@ async fn drive_with_event_buffering<F: std::future::Future>(
                 pending.system_commands.push(command);
             }
             Some(evt) = exec_evt_rx.recv() => {
+                record_exec_dequeue(&evt);
                 pending.push_exec_event(evt);
             }
             Some(cmd) = exec_cmd_rx.recv() => {

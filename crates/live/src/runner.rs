@@ -474,6 +474,7 @@ impl AsyncRunner {
                     log::error!("System command {command} requires the LiveNode runner");
                 },
                 Some(evt) = self.channels.exec_evt_rx.recv() => {
+                    record_exec_dequeue(&evt);
                     self.skip_time = false;
                     Self::dispatch_exec_event(evt);
                 },
@@ -596,6 +597,10 @@ impl AsyncRunner {
     pub fn handle_exec_event(event: ExecutionEvent) {
         match event {
             ExecutionEvent::Order(order_event) => {
+                nautilus_common::logging::execution_timing::record_order_event(
+                    "execution_engine_dispatch",
+                    &order_event,
+                );
                 msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), order_event);
             }
             ExecutionEvent::OrderSubmittedBatch(batch) => {
@@ -647,6 +652,7 @@ impl AsyncRunner {
         let count = self.channels.exec_evt_rx.len();
         (0..count)
             .filter_map(|_| self.channels.exec_evt_rx.try_recv().ok())
+            .inspect(record_exec_dequeue)
             .collect()
     }
 
@@ -685,7 +691,10 @@ impl AsyncRunner {
         processed += poll_channel(
             &mut self.channels.exec_evt_rx,
             pending.3,
-            PendingRunnerEvent::ExecEvent,
+            |event| {
+                record_exec_dequeue(&event);
+                PendingRunnerEvent::ExecEvent(event)
+            },
             &mut process,
         );
         processed += poll_channel(
@@ -729,6 +738,7 @@ impl AsyncRunner {
                 Some(PendingRunnerEvent::SystemCommand(command))
             }
             Some(event) = self.channels.exec_evt_rx.recv() => {
+                record_exec_dequeue(&event);
                 self.skip_time = false;
                 Some(PendingRunnerEvent::ExecEvent(event))
             }
@@ -754,6 +764,12 @@ impl AsyncRunner {
 #[cfg(feature = "node")]
 fn node_stopped(handle: Option<&LiveNodeHandle>) -> bool {
     handle.is_some_and(|handle| handle.state() == NodeState::Stopped)
+}
+
+pub(crate) fn record_exec_dequeue(event: &DispatchMessage<ExecutionEvent>) {
+    if let ExecutionEvent::Order(order) = event.as_ref() {
+        nautilus_common::logging::execution_timing::record_order_event("execution_dequeued", order);
+    }
 }
 
 #[cfg(feature = "node")]
@@ -834,6 +850,102 @@ mod tests {
     use ustr::Ustr;
 
     use super::*;
+
+    #[cfg(feature = "node")]
+    #[tokio::test]
+    async fn test_execution_timing_observes_real_queue_before_engine_dispatch() {
+        use nautilus_common::logging::execution_timing::{
+            ExecutionTiming, set_execution_timing_enabled,
+        };
+
+        use crate::execution::emitter::ExecutionEventEmitter;
+
+        struct Capture(std::sync::Mutex<Vec<String>>);
+        impl log::Log for Capture {
+            fn enabled(&self, metadata: &log::Metadata) -> bool {
+                metadata.target() == "ExecutionTiming"
+            }
+            fn log(&self, record: &log::Record) {
+                if self.enabled(record.metadata()) {
+                    self.0.lock().unwrap().push(record.args().to_string());
+                }
+            }
+            fn flush(&self) {}
+        }
+        static LOGS: Capture = Capture(std::sync::Mutex::new(Vec::new()));
+        log::set_logger(&LOGS).unwrap();
+        log::set_max_level(log::LevelFilter::Info);
+        set_execution_timing_enabled(true);
+
+        let mut runner = AsyncRunner::new();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let saved = received.clone();
+        msgbus::register_order_event_endpoint(
+            MessagingSwitchboard::exec_engine_process(),
+            TypedIntoHandler::from(move |event| saved.borrow_mut().push(event)),
+        );
+        let mut emitter = ExecutionEventEmitter::new(
+            get_atomic_clock_realtime(),
+            TraderId::from("TRADER-001"),
+            AccountId::from("SIM-001"),
+            AccountType::Cash,
+            None,
+        );
+        emitter.set_sender(EventSender::new(runner.exec_evt_tx.clone()));
+        let event = OrderEventAny::Submitted(OrderSubmittedSpec::builder().build());
+
+        for mode in 0..3 {
+            LOGS.0.lock().unwrap().clear();
+            emitter.try_send_order_event(event.clone()).unwrap();
+            let held = ExecutionTiming::capture().unwrap();
+            assert_eq!(LOGS.0.lock().unwrap().len(), 1);
+            assert!(LOGS.0.lock().unwrap()[0].contains("stage=execution_enqueue_attempt"));
+            let message = match mode {
+                0 => {
+                    let Some(PendingRunnerEvent::ExecEvent(message)) = runner.recv().await else {
+                        panic!("Expected execution event");
+                    };
+                    message
+                }
+                1 => {
+                    let mut pending = None;
+                    assert_eq!(
+                        runner.poll_pending(|event| {
+                            let PendingRunnerEvent::ExecEvent(message) = event else {
+                                panic!("Expected execution event");
+                            };
+                            pending = Some(message);
+                        }),
+                        1
+                    );
+                    pending.unwrap()
+                }
+                _ => runner.drain_pending_exec_events().pop().unwrap(),
+            };
+            assert_eq!(LOGS.0.lock().unwrap().len(), 2);
+            assert!(LOGS.0.lock().unwrap()[1].contains("stage=execution_dequeued"));
+            AsyncRunner::dispatch_exec_event(message);
+            let lines = LOGS.0.lock().unwrap();
+            assert_eq!(lines.len(), 3);
+            assert!(lines[2].contains("stage=execution_engine_dispatch"));
+            let stamps: Vec<u128> = lines
+                .iter()
+                .map(|line| {
+                    line.split_whitespace()
+                        .find_map(|field| field.strip_prefix("host_mono_ns="))
+                        .unwrap()
+                        .parse()
+                        .unwrap()
+                })
+                .collect();
+            assert!(stamps[0] <= held.monotonic_ns);
+            assert!(held.monotonic_ns <= stamps[1]);
+            assert!(stamps[1] <= stamps[2]);
+            assert_eq!(received.borrow().last(), Some(&event));
+        }
+        set_execution_timing_enabled(false);
+        assert_eq!(received.borrow().len(), 3);
+    }
 
     #[rstest]
     fn test_runner_dispatches_typed_data_once_in_order() {

@@ -107,6 +107,12 @@ impl<T: std::fmt::Display> std::fmt::Display for DispatchMessage<T> {
     }
 }
 
+impl<T> AsRef<T> for DispatchMessage<T> {
+    fn as_ref(&self) -> &T {
+        self.message.as_ref().expect("message is present")
+    }
+}
+
 impl<T> From<T> for DispatchMessage<T> {
     fn from(message: T) -> Self {
         Self {
