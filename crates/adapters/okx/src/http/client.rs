@@ -1443,6 +1443,23 @@ impl OKXRawHttpClient {
                 | "/api/v5/trade/cancel-batch-orders"
         );
 
+        let is_algo_list_read = method == Method::GET
+            && matches!(
+                path,
+                "/api/v5/trade/orders-algo-pending" | "/api/v5/trade/orders-algo-history"
+            );
+        let venue_error = |error_code: String, message: String, retry_after| {
+            if is_algo_list_read && error_code == "51054" {
+                OKXHttpError::RetryableOkxError {
+                    error_code,
+                    message,
+                    retry_after,
+                }
+            } else {
+                OKXHttpError::from_venue_response(error_code, message, retry_after)
+            }
+        };
+
         // Pre-compute rate limit keys once outside the retry closure
         let rate_keys: Vec<String> = Self::rate_limit_keys(path)
             .into_iter()
@@ -1456,7 +1473,7 @@ impl OKXRawHttpClient {
             let rate_keys = rate_keys.clone();
             let full_path = full_path.clone();
 
-            async move {
+            let request = || async move {
                 let mut headers = if authenticate {
                     let now = self.clock.get_time_ns().to_datetime_utc();
                     self.sign_request(&method, &full_path, body.as_deref(), now)?
@@ -1495,11 +1512,7 @@ impl OKXRawHttpClient {
                     {
                         let error_code = resolve_okx_error_code(&resp.body, &okx_response.code);
                         let message = resolve_okx_error_message(&resp.body, &okx_response.msg);
-                        return Err(OKXHttpError::from_venue_response(
-                            error_code,
-                            message,
-                            retry_after,
-                        ));
+                        return Err(venue_error(error_code, message, retry_after));
                     }
 
                     Ok(okx_response.data)
@@ -1519,11 +1532,7 @@ impl OKXRawHttpClient {
                     if let Ok(envelope) = serde_json::from_slice::<OKXErrorEnvelope>(&resp.body) {
                         let error_code = resolve_okx_error_code(&resp.body, &envelope.code);
                         let message = resolve_okx_error_message(&resp.body, &envelope.msg);
-                        return Err(OKXHttpError::from_venue_response(
-                            error_code,
-                            message,
-                            retry_after,
-                        ));
+                        return Err(venue_error(error_code, message, retry_after));
                     }
 
                     if status.as_u16() >= 500 || status == StatusCode::TOO_MANY_REQUESTS {
@@ -1538,6 +1547,13 @@ impl OKXRawHttpClient {
                             body: error_body.to_string(),
                         })
                     }
+                }
+            };
+            async move {
+                if is_algo_list_read {
+                    super::algo_visibility::pace_algo_visibility_request(request).await
+                } else {
+                    request().await
                 }
             }
         };
@@ -2450,15 +2466,13 @@ impl OKXRawHttpClient {
         &self,
         params: GetAlgoOrdersParams,
     ) -> Result<Vec<OKXOrderAlgo>, OKXHttpError> {
-        super::algo_visibility::pace_algo_visibility_request(|| {
-            self.send_request(
-                Method::GET,
-                "/api/v5/trade/orders-algo-pending",
-                Some(&params),
-                None,
-                true,
-            )
-        })
+        self.send_request(
+            Method::GET,
+            "/api/v5/trade/orders-algo-pending",
+            Some(&params),
+            None,
+            true,
+        )
         .await
     }
 
@@ -2471,15 +2485,13 @@ impl OKXRawHttpClient {
         &self,
         params: GetAlgoOrdersParams,
     ) -> Result<Vec<OKXOrderAlgo>, OKXHttpError> {
-        super::algo_visibility::pace_algo_visibility_request(|| {
-            self.send_request(
-                Method::GET,
-                "/api/v5/trade/orders-algo-history",
-                Some(&params),
-                None,
-                true,
-            )
-        })
+        self.send_request(
+            Method::GET,
+            "/api/v5/trade/orders-algo-history",
+            Some(&params),
+            None,
+            true,
+        )
         .await
     }
 
@@ -8375,3 +8387,7 @@ fn reconciliation_history_page_limit(max_pages: Option<u32>) -> usize {
         (pages as usize).min(MAX_RECONCILIATION_PAGES)
     })
 }
+
+#[cfg(test)]
+#[path = "tests/algo_read_retry.rs"]
+mod algo_read_retry_tests;

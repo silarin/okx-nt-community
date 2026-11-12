@@ -712,7 +712,7 @@ async fn visibility_rejects_unsupported_or_duplicate_scopes_before_network(
     2
 )]
 #[tokio::test]
-async fn contextual_visibility_identifies_failed_page_without_retry_or_partial_result(
+async fn contextual_visibility_identifies_failed_page_with_retries_disabled(
     #[case] instrument_type: OKXInstrumentType,
     #[case] order_type: OKXAlgoOrderType,
     #[case] state: Option<OKXAlgoOrderStatus>,
@@ -800,10 +800,10 @@ async fn contextual_visibility_identifies_failed_page_without_retry_or_partial_r
         }
         assert!(std::error::Error::source(&error).is_none());
         let inner = error.into_inner();
-        assert!(!inner.is_retryable());
+        assert!(inner.is_retryable());
         assert_eq!(inner.retry_after(), None);
         assert!(
-            matches!(inner, OKXHttpError::OkxError { error_code, message } if error_code == "51054" && message == private)
+            matches!(inner, OKXHttpError::RetryableOkxError { error_code, message, retry_after: None } if error_code == "51054" && message == private)
         );
         let endpoint = if state.is_some() {
             "history"
